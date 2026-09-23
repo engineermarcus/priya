@@ -24,6 +24,11 @@ lifecycle above was manually verified against the local runner.
 
 - `bash {command, timeout_s?}` → `{exit_code, stdout, stderr}`.
 - `timeout_s` defaults to 60 seconds.
+- `bash {command, background: true}` → starts a long-running process without
+  waiting and returns its PID plus stdout/stderr log paths under
+  `.priya/processes/`. Use this for servers and watchers; inspect its logs or
+  process with a later `bash` call and stop it with its process-group PID when
+  it is no longer needed.
 - Stdout and stderr are streamed to the UI while the command runs, then the
   final result is returned (stdout is capped at 8,000 characters and stderr at
   4,000 characters).

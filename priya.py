@@ -189,6 +189,10 @@ class PriyaApp(App):
         color: #555555;
         background: transparent;
     }
+    .interrupted {
+        color: #666666;
+        background: transparent;
+    }
 
     .ask-question {
         width: 72%;
@@ -300,6 +304,7 @@ class PriyaApp(App):
         self._all_tool_nodes = []
         self._node_registry = {}
         self._question_state = None
+        self._interrupted = False
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="convo")
@@ -370,6 +375,12 @@ class PriyaApp(App):
             pass
 
     def _handle_msg(self, msg):
+        # Esc has already shown a terminal interruption state. Drop delayed
+        # worker output rather than letting queued logs/text revive the turn.
+        if self._interrupted and isinstance(
+            msg, (AddToolNode, FinishToolNode, AppendToolLog, AppendText, AskUserQuestion)
+        ):
+            return
         if isinstance(msg, MountTurn):
             self._do_mount_turn(msg.user_text)
         elif isinstance(msg, AddToolNode):
@@ -392,6 +403,7 @@ class PriyaApp(App):
     # ── UI operations (UI thread only, called from _drain_ui_q) ─────────────
 
     def _do_mount_turn(self, user_text):
+        self._interrupted = False
         self.busy = True
         convo = self.query_one("#convo", VerticalScroll)
         turn = Vertical(classes="turn")
@@ -532,13 +544,37 @@ class PriyaApp(App):
 
     def _do_end_turn(self):
         self.busy = False
-        self._set_status(f"  {CHECK}  {MODEL_NAME}  \u00b7  ready", "#4ade80")
+        if self._interrupted:
+            self._set_status("  ⊘  Interrupted", "#666666")
+        else:
+            self._set_status(f"  {CHECK}  {MODEL_NAME}  \u00b7  ready", "#4ade80")
         self._do_hide_thinking()
         self._cur_tree = None
         self._cur_turn = None
         self._cur_ai_bubble = None
         self._cur_tool_node = None
         self._question_state = None
+
+    def _do_interrupted(self):
+        """Immediately reflect Esc, before the worker finishes cancelling."""
+        if self._interrupted:
+            return
+        self._interrupted = True
+        self.busy = False
+        self._set_status("  ⊘  Interrupted", "#666666")
+        self._do_hide_thinking()
+        if self._cur_tool_node is not None and not self._cur_tool_node.data.done:
+            data = self._cur_tool_node.data
+            data.done = True
+            data.result = "interrupted"
+            self._cur_tool_node.set_label(tool_label(data))
+            self._cur_tool_node.add_leaf(Text("interrupted", style="bold #fbbf24"))
+            self._cur_tool_node = None
+        if self._cur_ai_bubble is not None:
+            if not self._cur_ai_text.strip():
+                self._cur_ai_bubble.remove()
+            if self._cur_turn is not None:
+                self._cur_turn.mount(Static("Interrupted", classes="bubble ai-bubble interrupted"))
 
     def _do_worker_closed(self):
         self.busy = False
@@ -564,7 +600,7 @@ class PriyaApp(App):
 
     def action_interrupt(self):
         """Ask the persistent Live worker to interrupt its current response."""
-        if self.proc is None or self.proc.stdin is None:
+        if not self.busy or self.proc is None or self.proc.stdin is None:
             return
         try:
             if self._question_state is not None:
@@ -575,6 +611,7 @@ class PriyaApp(App):
                 if card is not None:
                     card.mount(Static("Question cancelled", classes="ask-answer"))
                 self._question_state = None
+            self._do_interrupted()
             with self._stdin_lock:
                 self.proc.stdin.write("<<PRIYA_INTERRUPT>>\n")
                 self.proc.stdin.flush()

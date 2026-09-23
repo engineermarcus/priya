@@ -52,6 +52,16 @@ stdout and stderr; the final result is appended after the live log. `agentjob`
 uses the repository-local runner at `tools/job_runner.py`. Its transient job
 state and logs live under `.priya/jobs/` (ignored by Git).
 
+For a development server, watcher, or other long-running local command, Priya
+can run `bash` in background mode. It immediately returns the process ID and
+stdout/stderr log paths under `.priya/processes/`, so the conversation remains
+available while the process runs.
+
+Press Escape to interrupt the active response. Priya immediately shows
+`Interrupted`, suppresses late streamed output, and kills any foreground shell
+command it was running. Intentionally backgrounded processes continue until
+they are stopped by their returned process-group PID.
+
 The model can also publish a self-contained interactive HTML artifact. Artifact
 revisions are saved under `.priya/artifacts/`, and its local server refreshes
 an open artifact page automatically when a newer revision is published. Use
