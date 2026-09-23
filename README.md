@@ -62,6 +62,10 @@ Press Escape to interrupt the active response. Priya immediately shows
 command it was running. Intentionally backgrounded processes continue until
 they are stopped by their returned process-group PID.
 
+Priya can also schedule session-scoped prompts through its cron tools. Schedules
+use local-time numeric five-field cron expressions, wait for an idle model turn
+before running, expire after three days, and disappear when Priya exits.
+
 The model can also publish a self-contained interactive HTML artifact. Artifact
 revisions are saved under `.priya/artifacts/`, and its local server refreshes
 an open artifact page automatically when a newer revision is published. Use

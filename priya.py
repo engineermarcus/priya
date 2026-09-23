@@ -16,6 +16,7 @@ Protocol (same as original):
   <<TOOL_START>>{"name": ..., "detail": ...}
   <<TOOL_END>>{"name": ..., "result": ...}
   <<ASK_USER_QUESTION>>{"id": ..., "questions": [...]}
+  <<SCHEDULED_TASK>>{"job_id": ..., "prompt": ...}
   <<END>>
   (any other line = streamed model text)
 """
@@ -683,6 +684,19 @@ class PriyaApp(App):
                 return
 
             line = item.strip()
+
+            if line.startswith("<<SCHEDULED_TASK>>"):
+                try:
+                    payload = json.loads(line[len("<<SCHEDULED_TASK>>"):])
+                    text = payload["prompt"].strip()
+                except (json.JSONDecodeError, KeyError, AttributeError):
+                    continue
+                if text:
+                    self.ui_q.put(MountTurn(f"⏰ Scheduled: {text}"))
+                    pending_tool_ids.clear()
+                    thinking_hidden = False
+                    deferred_tool_finishes.clear()
+                continue
 
             if line.startswith("<<USER_SPEECH>>"):
                 text = line[len("<<USER_SPEECH>>"):].strip()

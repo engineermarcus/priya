@@ -9,6 +9,8 @@ import threading
 import time
 import signal
 import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from google import genai
 from google.genai import types
@@ -38,6 +40,101 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 AGENTJOB_BIN = os.path.join(DIR, "tools", "job_runner.py")
 ARTIFACT_BIN = os.path.join(DIR, "tools", "artifact.py")
 INTERRUPT_COMMAND = "<<PRIYA_INTERRUPT>>"
+CRON_MAX_LIFETIME = timedelta(days=3)
+
+
+@dataclass(frozen=True)
+class CronSchedule:
+    """A validated numeric five-field cron schedule in the local timezone."""
+    minute: frozenset
+    hour: frozenset
+    day_of_month: frozenset
+    month: frozenset
+    day_of_week: frozenset
+    day_of_month_wildcard: bool
+    day_of_week_wildcard: bool
+
+    def matches(self, moment):
+        cron_weekday = (moment.weekday() + 1) % 7  # Sunday is 0, as in cron.
+        day_match = moment.day in self.day_of_month
+        weekday_match = cron_weekday in self.day_of_week
+        if not self.day_of_month_wildcard and not self.day_of_week_wildcard:
+            day_ok = day_match or weekday_match  # Standard cron's DOM/DOW rule.
+        elif not self.day_of_month_wildcard:
+            day_ok = day_match
+        elif not self.day_of_week_wildcard:
+            day_ok = weekday_match
+        else:
+            day_ok = True
+        return (
+            moment.minute in self.minute and moment.hour in self.hour
+            and moment.month in self.month and day_ok
+        )
+
+
+def _parse_cron_field(text, minimum, maximum, field_name, *, allow_sunday_seven=False):
+    """Parse `*`, lists, ranges, and steps into a set of permitted integers."""
+    if not isinstance(text, str) or not text:
+        raise ValueError(f"{field_name} is empty")
+    values = set()
+    for part in text.split(","):
+        if not part:
+            raise ValueError(f"{field_name} has an empty list item")
+        base, separator, step_text = part.partition("/")
+        if separator:
+            if not step_text.isdigit() or int(step_text) < 1:
+                raise ValueError(f"{field_name} has an invalid step")
+            step = int(step_text)
+        else:
+            step = 1
+        if base == "*":
+            start, end = minimum, maximum
+        elif "-" in base:
+            endpoints = base.split("-")
+            if len(endpoints) != 2 or not all(item.isdigit() for item in endpoints):
+                raise ValueError(f"{field_name} has an invalid range")
+            start, end = map(int, endpoints)
+        elif base.isdigit():
+            start = int(base)
+            end = maximum if separator else start
+        else:
+            raise ValueError(f"{field_name} has an invalid value")
+        allowed_maximum = 7 if allow_sunday_seven else maximum
+        if start < minimum or end > allowed_maximum or start > end:
+            raise ValueError(f"{field_name} is outside {minimum}-{allowed_maximum}")
+        values.update(range(start, end + 1, step))
+    if allow_sunday_seven:
+        values = {0 if value == 7 else value for value in values}
+    return frozenset(values)
+
+
+def parse_cron(expression):
+    """Parse the standard numeric minute hour DOM month DOW cron expression."""
+    if not isinstance(expression, str):
+        raise ValueError("cron must be a five-field expression")
+    fields = expression.split()
+    if len(fields) != 5:
+        raise ValueError("cron must have exactly five fields: minute hour day month weekday")
+    minute, hour, day_of_month, month, day_of_week = fields
+    return CronSchedule(
+        _parse_cron_field(minute, 0, 59, "minute"),
+        _parse_cron_field(hour, 0, 23, "hour"),
+        _parse_cron_field(day_of_month, 1, 31, "day of month"),
+        _parse_cron_field(month, 1, 12, "month"),
+        _parse_cron_field(day_of_week, 0, 6, "day of week", allow_sunday_seven=True),
+        day_of_month == "*",
+        day_of_week == "*",
+    )
+
+
+def next_cron_run(schedule, after, expires_at):
+    """Find the next minute matching a schedule, bounded by its session expiry."""
+    candidate = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    while candidate <= expires_at:
+        if schedule.matches(candidate):
+            return candidate
+        candidate += timedelta(minutes=1)
+    return None
 
 agentjob_declaration = types.FunctionDeclaration(
     name="agentjob",
@@ -167,6 +264,47 @@ ask_user_question_declaration = types.FunctionDeclaration(
         },
         "required": ["questions"],
     },
+)
+
+
+cron_create_declaration = types.FunctionDeclaration(
+    name="CronCreate",
+    description=(
+        "Create a session-scoped scheduled prompt in the user's local timezone. "
+        "cron is a standard numeric five-field expression: minute hour day-of-month "
+        "month day-of-week. Use recurring=true for a repeating job, or recurring=false "
+        "for the next matching occurrence only. Jobs expire when this Priya session ends "
+        "or after three days, whichever comes first."
+    ),
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "cron": {"type": "STRING", "description": "Numeric five-field local-time cron expression."},
+            "prompt": {"type": "STRING", "description": "Prompt Priya should run at the scheduled time."},
+            "recurring": {"type": "BOOLEAN", "description": "True to repeat; false to run once and delete."},
+        },
+        "required": ["cron", "prompt"],
+    },
+)
+
+
+cron_delete_declaration = types.FunctionDeclaration(
+    name="CronDelete",
+    description="Delete one session-scoped scheduled prompt by its job_id.",
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "job_id": {"type": "STRING", "description": "ID returned by CronCreate or CronList."},
+        },
+        "required": ["job_id"],
+    },
+)
+
+
+cron_list_declaration = types.FunctionDeclaration(
+    name="CronList",
+    description="List active session-scoped scheduled prompts and their next local run time.",
+    parameters={"type": "OBJECT", "properties": {}},
 )
 
 
@@ -372,6 +510,12 @@ Tool-use policy:
   decision would materially affect the result. Offer concise, distinct options
   with useful descriptions. The user may choose an option or type a custom
   answer. Do not ask it for routine confirmation or facts you can inspect.
+- `CronCreate`, `CronList`, and `CronDelete` manage scheduled prompts only for
+  this active Priya session. Use CronCreate for a clearly requested reminder or
+  recurring local-time task; its `cron` must be a five-field numeric local-time
+  expression and jobs expire within three days. Use `recurring: false` for the
+  next matching occurrence only. Use CronList before changing or deleting an
+  existing schedule, and CronDelete with the returned job ID to cancel it.
 
 Working style:
 - Prefer doing useful work now over merely describing how the user could do it.
@@ -429,7 +573,8 @@ CONFIG = types.LiveConnectConfig(
     ),
     tools=[types.Tool(function_declarations=[
         agentjob_declaration, artifact_declaration, bash_declaration,
-        ask_user_question_declaration,
+        ask_user_question_declaration, cron_create_declaration,
+        cron_delete_declaration, cron_list_declaration,
     ])],
 )
 
@@ -539,6 +684,14 @@ class TextLoop:
         # follow-up typed message until Gemini has acknowledged that turn.
         self._ready_for_input = asyncio.Event()
         self._ready_for_input.set()
+        self._cron_jobs = {}
+        self._scheduled_prompts = asyncio.Queue()
+        # A due job can wait in this queue while a model turn is active. Keep
+        # enough state to make deletion and expiry apply to those queued copies
+        # too, rather than only to the next occurrence in `_cron_jobs`.
+        self._queued_cron_job_counts = {}
+        self._cancelled_queued_cron_jobs = set()
+        self._generation_active = False
 
     def discard_playback(self):
         """Immediately drop audio queued in aplay after a server interruption."""
@@ -586,6 +739,7 @@ class TextLoop:
                     audio={"data": cleaned_audio, "mime_type": "audio/pcm;rate=16000"}
                 )
                 if speech_ended:
+                    self._generation_active = True
                     await self.session.send_realtime_input(audio_stream_end=True)
 
     async def interrupt(self):
@@ -640,6 +794,7 @@ class TextLoop:
                 # interruption handshake before it can reliably accept this
                 # next user turn.
                 await self._ready_for_input.wait()
+                self._generation_active = True
                 await self.session.send_client_content(
                     turns={"role": "user", "parts": [{"text": text or "."}]},
                     turn_complete=True,
@@ -722,6 +877,125 @@ class TextLoop:
             if self._active_bash_cancel is cancel_event:
                 self._active_bash_cancel = None
 
+    @staticmethod
+    def _cron_job_view(job):
+        return {
+            "job_id": job["job_id"],
+            "cron": job["cron"],
+            "prompt": job["prompt"],
+            "recurring": job["recurring"],
+            "created_at": job["created_at"].isoformat(),
+            "expires_at": job["expires_at"].isoformat(),
+            "next_run": job["next_run"].isoformat() if job["next_run"] else None,
+            "timezone": job["timezone"],
+        }
+
+    def _expire_cron_jobs(self, now):
+        for job_id, job in list(self._cron_jobs.items()):
+            if now >= job["expires_at"]:
+                del self._cron_jobs[job_id]
+
+    async def _queue_cron_job(self, job):
+        """Queue a due job while retaining cancellation state for its copies."""
+        job_id = job["job_id"]
+        self._queued_cron_job_counts[job_id] = self._queued_cron_job_counts.get(job_id, 0) + 1
+        await self._scheduled_prompts.put(job.copy())
+
+    def _finish_queued_cron_job(self, job_id):
+        """Record removal of one queued copy and clean up cancellation state."""
+        remaining = self._queued_cron_job_counts.get(job_id, 0) - 1
+        if remaining > 0:
+            self._queued_cron_job_counts[job_id] = remaining
+            return
+        self._queued_cron_job_counts.pop(job_id, None)
+        self._cancelled_queued_cron_jobs.discard(job_id)
+
+    async def cron_create(self, args):
+        cron = args.get("cron")
+        prompt = args.get("prompt")
+        recurring = args.get("recurring", True)
+        if not isinstance(prompt, str) or not prompt.strip():
+            return {"error": "CronCreate requires a non-empty prompt"}
+        if not isinstance(recurring, bool):
+            return {"error": "CronCreate requires recurring to be true or false"}
+        try:
+            schedule = parse_cron(cron)
+        except ValueError as error:
+            return {"error": str(error)}
+        now = datetime.now().astimezone()
+        expires_at = now + CRON_MAX_LIFETIME
+        next_run = next_cron_run(schedule, now, expires_at)
+        if next_run is None:
+            return {"error": "cron has no matching time before the three-day session expiry"}
+        job_id = f"cron-{uuid.uuid4().hex[:8]}"
+        job = {
+            "job_id": job_id,
+            "cron": cron.strip(),
+            "schedule": schedule,
+            "prompt": prompt.strip(),
+            "recurring": recurring,
+            "created_at": now,
+            "expires_at": expires_at,
+            "next_run": next_run,
+            "timezone": now.tzname() or str(now.tzinfo),
+        }
+        self._cron_jobs[job_id] = job
+        return self._cron_job_view(job)
+
+    async def cron_delete(self, args):
+        job_id = args.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            return {"error": "CronDelete requires job_id"}
+        self._expire_cron_jobs(datetime.now().astimezone())
+        job = self._cron_jobs.pop(job_id, None)
+        queued = self._queued_cron_job_counts.get(job_id, 0) > 0
+        if job is None and not queued:
+            return {"error": f"no active cron job named {job_id}"}
+        if queued:
+            self._cancelled_queued_cron_jobs.add(job_id)
+        return {"deleted": True, "job_id": job_id}
+
+    async def cron_list(self, _args):
+        now = datetime.now().astimezone()
+        self._expire_cron_jobs(now)
+        jobs = sorted(self._cron_jobs.values(), key=lambda job: job["next_run"])
+        return {"jobs": [self._cron_job_view(job) for job in jobs], "timezone": now.tzname() or str(now.tzinfo)}
+
+    async def scheduler_loop(self):
+        """Queue due jobs and deliver them only between active model turns."""
+        while True:
+            now = datetime.now().astimezone()
+            self._expire_cron_jobs(now)
+            for job_id, job in list(self._cron_jobs.items()):
+                if now < job["next_run"]:
+                    continue
+                await self._queue_cron_job(job)
+                if job["recurring"]:
+                    job["next_run"] = next_cron_run(job["schedule"], job["next_run"], job["expires_at"])
+                    if job["next_run"] is None:
+                        del self._cron_jobs[job_id]
+                else:
+                    del self._cron_jobs[job_id]
+            if self.session is not None and not self._generation_active and not self._scheduled_prompts.empty():
+                job = self._scheduled_prompts.get_nowait()
+                cancelled = job["job_id"] in self._cancelled_queued_cron_jobs
+                self._finish_queued_cron_job(job["job_id"])
+                if cancelled or now >= job["expires_at"]:
+                    continue
+                out("<<SCHEDULED_TASK>>" + json.dumps({"job_id": job["job_id"], "prompt": job["prompt"]}))
+                self._generation_active = True
+                try:
+                    await self.session.send_client_content(
+                        turns={"role": "user", "parts": [{
+                            "text": f"[Scheduled job {job['job_id']}] {job['prompt']}"
+                        }]},
+                        turn_complete=True,
+                    )
+                except Exception as error:
+                    self._generation_active = False
+                    print(f"scheduled job {job['job_id']} could not be delivered: {error}", file=sys.stderr)
+            await asyncio.sleep(1)
+
     async def receive_text(self):
         while True:
             if self.session is not None:
@@ -782,6 +1056,12 @@ class TextLoop:
                                     result = await self.run_active_bash(args_dict, emit_tool_output)
                                 elif fc.name == "askUserQuestion":
                                     result = await self.ask_user_question(args_dict)
+                                elif fc.name == "CronCreate":
+                                    result = await self.cron_create(args_dict)
+                                elif fc.name == "CronDelete":
+                                    result = await self.cron_delete(args_dict)
+                                elif fc.name == "CronList":
+                                    result = await self.cron_list(args_dict)
                                 else:
                                     result = {"error": f"unknown tool {fc.name}"}
                                 print(f"TOOL CALL: {fc.name} {args_dict} -> {result}", file=sys.stderr)
@@ -833,6 +1113,7 @@ class TextLoop:
                 # A stream that carried tool calls is only the tool round. The
                 # next receive() stream carries the model's spoken/text answer.
                 if (reached_idle or timed_out or not saw_tool_call) and not saw_tool_call:
+                    self._generation_active = False
                     out("<<END>>")
 
     async def run(self):
@@ -845,6 +1126,7 @@ class TextLoop:
                 await asyncio.sleep(0.1)
                 send_text_task = tg.create_task(self.send_text())
                 tg.create_task(self.receive_text())
+                tg.create_task(self.scheduler_loop())
                 if MIC:
                     tg.create_task(self.listen_audio())
                     tg.create_task(self.send_audio())

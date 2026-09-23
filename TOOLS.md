@@ -73,11 +73,23 @@ same model call so it can continue with the user's decision rather than guess.
   submit a free-text answer.
 - Escape cancels the pending question along with the active response.
 
+# IMPLEMENTED: CRONCREATE, CRONDELETE, CRONLIST
+
+These tools schedule prompts only within the active Priya session. They are not
+OS crontab entries, are discarded when Priya exits, and have a three-day safety
+expiry. Cron expressions use Priya's local timezone and standard numeric
+five-field syntax: `minute hour day-of-month month day-of-week`.
+
+- `CronCreate {cron, prompt, recurring?}` → creates a job and returns its
+  `job_id`, next run, expiry, and timezone. `recurring: false` runs at the next
+  matching time only and then removes the job; it defaults to `true`.
+- `CronList {}` → active jobs and their next scheduled local run.
+- `CronDelete {job_id}` → removes an active job.
+- Due prompts wait until Priya is between model turns, then appear as a
+  scheduled turn and execute without interrupting an active response.
+
 # COMING SOON
 
-- CronCreate
-- CronDelete
-- CronList
 - Edit
 - EnterPlanMode
 - EnterWorktree
