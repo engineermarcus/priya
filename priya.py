@@ -234,12 +234,17 @@ class PriyaApp(App):
 
     busy = reactive(False)
 
-    def __init__(self, talk=False):
+    def __init__(self, talk=False, mic=False):
         super().__init__()
-        self.talk = talk
+        # Mic conversations are spoken conversations: keep the model's audio
+        # enabled while its transcription and tool activity remain visible.
+        self.talk = talk or mic
+        self.mic = mic
         self.proc = None
         self.raw_q = queue.Queue()
         self.ui_q = queue.Queue()
+        self.render_q = queue.Queue()
+        self._stdin_lock = threading.Lock()
         self._spinner_i = 0
         self._flush_timer = None
         self._spinner_timer = None
@@ -255,11 +260,16 @@ class PriyaApp(App):
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="convo")
         yield Static(f"  {MODEL_NAME}  \u00b7  {os.getcwd()}", id="statusbar")
-        yield Input(placeholder="Type your message\u2026", id="inputbar")
+        placeholder = "Type or speak your message\u2026" if self.mic else "Type your message\u2026"
+        yield Input(placeholder=placeholder, id="inputbar")
         yield Static("^o expand  ^e all  ^r collapse  ^c quit", id="keybar")
 
     def on_mount(self):
-        cmd = [sys.executable, WORKER] + (["--talk"] if self.talk else [])
+        cmd = [sys.executable, WORKER]
+        if self.talk:
+            cmd.append("--talk")
+        if self.mic:
+            cmd.append("--mic")
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -270,7 +280,12 @@ class PriyaApp(App):
                          daemon=True).start()
         self.query_one("#inputbar", Input).focus()
         self._flush_timer = self.set_interval(1 / 30, self._drain_ui_q)
+        # Textual batches widget updates per refresh. Presenting one protocol
+        # event at a time gives a streamed model reply a refresh before the
+        # following tool result changes the same turn's layout.
+        self.set_interval(0.06, self._present_next)
         self._spinner_timer = self.set_interval(0.1, self._tick_spinner)
+        self.read_worker()
 
     def on_unmount(self):
         if self.proc is not None:
@@ -300,8 +315,13 @@ class PriyaApp(App):
     def _drain_ui_q(self):
         try:
             while True:
-                msg = self.ui_q.get_nowait()
-                self._handle_msg(msg)
+                self.render_q.put(self.ui_q.get_nowait())
+        except queue.Empty:
+            pass
+
+    def _present_next(self):
+        try:
+            self._handle_msg(self.render_q.get_nowait())
         except queue.Empty:
             pass
 
@@ -324,6 +344,7 @@ class PriyaApp(App):
     # ── UI operations (UI thread only, called from _drain_ui_q) ─────────────
 
     def _do_mount_turn(self, user_text):
+        self.busy = True
         convo = self.query_one("#convo", VerticalScroll)
         turn = Vertical(classes="turn")
         convo.mount(turn)
@@ -434,23 +455,33 @@ class PriyaApp(App):
         if text.lower() == "q":
             self.exit()
             return
-        self.run_turn(text)
+        self.send_turn(text)
 
-    # ── Turn worker (background thread, NEVER blocks) ───────────────────────
+    # ── Backend I/O workers (background threads, NEVER touch widgets) ───────
 
-    @work(exclusive=True, thread=True)
-    def run_turn(self, text):
-        self.busy = True
-
-        # Mount turn container — fire and forget
+    @work(thread=True)
+    def send_turn(self, text):
         self.ui_q.put(MountTurn(text))
 
-        self.proc.stdin.write(text + "\n")
-        self.proc.stdin.flush()
+        try:
+            with self._stdin_lock:
+                self.proc.stdin.write(text + "\n")
+                self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self.ui_q.put(WorkerClosed())
+
+    @work(exclusive=True, thread=True)
+    def read_worker(self):
+        """Translate the worker protocol into ordered UI presentation events.
+
+        This reader runs for the lifetime of the process, so microphone turns
+        receive the same model/text/tool rendering as typed turns.
+        """
 
         tool_id_counter = 0
         pending_tool_id = None
         thinking_hidden = False
+        deferred_tool_finishes = []
 
         while True:
             item = self.raw_q.get()
@@ -459,6 +490,17 @@ class PriyaApp(App):
                 return
 
             line = item.strip()
+
+            if line.startswith("<<USER_SPEECH>>"):
+                text = line[len("<<USER_SPEECH>>"):].strip()
+                if text:
+                    # This arrives before the server begins its response for
+                    # the spoken turn, preserving a normal conversation turn.
+                    self.ui_q.put(MountTurn(text))
+                    pending_tool_id = None
+                    thinking_hidden = False
+                    deferred_tool_finishes.clear()
+                continue
 
             if line.startswith("<<TOOL_START>>"):
                 try:
@@ -481,14 +523,25 @@ class PriyaApp(App):
                     result_text = "(unparsed result)"
                 if pending_tool_id is not None:
                     stat = diff_stat(result)
-                    self.ui_q.put(FinishToolNode(pending_tool_id,
-                                                  result_text, stat))
+                    # Hold the result until the model's next text is shown.
+                    # Otherwise a tree refresh can consume the same Textual
+                    # render frame as the first assistant transcription.
+                    deferred_tool_finishes.append(
+                        FinishToolNode(pending_tool_id, result_text, stat)
+                    )
                 pending_tool_id = None
                 continue
 
             if line == "<<END>>":
+                for tool_finish in deferred_tool_finishes:
+                    self.ui_q.put(tool_finish)
+                deferred_tool_finishes.clear()
                 self.ui_q.put(EndTurn())
-                return
+                pending_tool_id = None
+                thinking_hidden = False
+                # The backend is long-lived; keep reading for the next typed
+                # or microphone turn.
+                continue
 
             if line:
                 # Hide thinking on FIRST text line
@@ -496,11 +549,17 @@ class PriyaApp(App):
                     thinking_hidden = True
                     self.ui_q.put(HideThinking())
                 self.ui_q.put(AppendText(line + " "))
+                # Let the text render first; _present_next supplies the small
+                # inter-event delay before result tree updates.
+                for tool_finish in deferred_tool_finishes:
+                    self.ui_q.put(tool_finish)
+                deferred_tool_finishes.clear()
 
 
 def main():
     talk = "--talk" in sys.argv[1:]
-    app = PriyaApp(talk=talk)
+    mic = "--mic" in sys.argv[1:]
+    app = PriyaApp(talk=talk, mic=mic)
     app.run()
 
 

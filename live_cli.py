@@ -144,6 +144,10 @@ def run_bash(args: dict) -> dict:
 
 CONFIG = types.LiveConnectConfig(
     response_modalities=["AUDIO"],
+    # Input transcription makes spoken turns available to the TUI as normal
+    # user messages. Output remains audio, with its transcription streamed so
+    # text and tool activity are rendered alongside playback.
+    input_audio_transcription=types.AudioTranscriptionConfig(),
     output_audio_transcription=types.AudioTranscriptionConfig(),
     system_instruction=(
         "You are Priya. For ANY request that touches files, commands, code, processes, or system state, you MUST call the 'bash' or 'agentjob' tool before responding -- never answer from assumption, and never claim an error occurred unless a tool call actually returned one. You have a 'bash' tool for direct shell "
@@ -207,6 +211,16 @@ def emit_content(sc):
                 emitted_any = True
 
     return emitted_any
+
+
+def emit_input_transcription(sc):
+    """Send finalized microphone speech to the frontend as a user turn."""
+    if sc is None:
+        return
+    transcription = getattr(sc, "input_transcription", None)
+    text = getattr(transcription, "text", None)
+    if text:
+        out("<<USER_SPEECH>>" + text)
 
 
 class TextLoop:
@@ -273,6 +287,8 @@ class TextLoop:
                             response = await asyncio.wait_for(turn.__anext__(), timeout=180)
                             sc = response.server_content
                             print(f"RAW: {response}", file=sys.stderr)
+
+                            emit_input_transcription(sc)
 
                             if response.tool_call:
                                 function_responses = []
