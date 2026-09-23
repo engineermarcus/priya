@@ -136,6 +136,48 @@ artifact_declaration = types.FunctionDeclaration(
 )
 
 
+ask_user_question_declaration = types.FunctionDeclaration(
+    name="askUserQuestion",
+    behavior="BLOCKING",
+    description=(
+        "Pause to ask the user one to four important multiple-choice questions before "
+        "continuing. Use this when a decision would materially change the work instead "
+        "of guessing. Each question is rendered with selectable options and also accepts "
+        "a custom free-text answer. The tool returns the user's answers in order."
+    ),
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "questions": {
+                "type": "ARRAY",
+                "description": "One to four questions to ask together.",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "header": {"type": "STRING", "description": "Short label for the question."},
+                        "question": {"type": "STRING", "description": "The decision the user should make."},
+                        "options": {
+                            "type": "ARRAY",
+                            "description": "Two to four concise choices.",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "label": {"type": "STRING", "description": "Short option name."},
+                                    "description": {"type": "STRING", "description": "What choosing it means."},
+                                },
+                                "required": ["label", "description"],
+                            },
+                        },
+                    },
+                    "required": ["question", "options"],
+                },
+            },
+        },
+        "required": ["questions"],
+    },
+)
+
+
 def run_artifact(args: dict) -> dict:
     action = args.get("action")
     cmd = [sys.executable, ARTIFACT_BIN, action]
@@ -276,8 +318,9 @@ CONFIG = types.LiveConnectConfig(
         "You are Priya. For ANY request that touches files, commands, code, processes, or system state, you MUST call the appropriate tool before responding -- never answer from assumption, and never claim an error occurred unless a tool call actually returned one. You have a 'bash' tool for direct shell "
         "access, an 'agentjob' tool to delegate self-contained coding tasks to a "
         "background subagent, and an 'artifact' tool for versioned interactive HTML "
-        "pages. Use artifact when a visual browser-rendered result is materially more "
-        "useful than terminal text. "
+        "pages. You also have askUserQuestion: use it to obtain a material decision "
+        "before changing code rather than making an unsupported assumption. Use artifact "
+        "when a visual browser-rendered result is materially more useful than terminal text. "
         "background subagent. Prefer spawning agentjob for substantial builds so you "
         "can keep talking with the user; use bash directly for quick checks, reading "
         "files, or verifying a subagent's work. Never trust a subagent's 'done' claim "
@@ -299,7 +342,10 @@ CONFIG = types.LiveConnectConfig(
         trigger_tokens=120000,
         sliding_window=types.SlidingWindow(target_tokens=60000),
     ),
-    tools=[types.Tool(function_declarations=[agentjob_declaration, artifact_declaration, bash_declaration])],
+    tools=[types.Tool(function_declarations=[
+        agentjob_declaration, artifact_declaration, bash_declaration,
+        ask_user_question_declaration,
+    ])],
 )
 
 PIPED = not sys.stdin.isatty()
@@ -399,6 +445,8 @@ class TextLoop:
         self.mic_queue = asyncio.Queue(maxsize=10) if MIC else None
         self.mic_stream = None
         self._tool_event_id = 0
+        self._question_event_id = 0
+        self._pending_question = None
         self.mic_processor = MicrophoneProcessor() if MIC else None
         self._discard_until_idle = False
 
@@ -454,6 +502,7 @@ class TextLoop:
         """Cut off the active Live generation without closing the session."""
         self._discard_until_idle = True
         self.discard_playback()
+        self._resolve_pending_question({"cancelled": True})
         if self.mic_processor is not None:
             self.mic_processor.reset()
         if self.session is not None:
@@ -479,11 +528,92 @@ class TextLoop:
                 continue
             if text.lower() == "q":
                 break
+            if text.startswith("<<ASK_USER_ANSWER>>"):
+                try:
+                    answer = json.loads(text[len("<<ASK_USER_ANSWER>>"):])
+                except json.JSONDecodeError:
+                    print("invalid askUserQuestion answer", file=sys.stderr)
+                    continue
+                if self._pending_question is None:
+                    print("received askUserQuestion answer with no pending question", file=sys.stderr)
+                    continue
+                if answer.get("id") != self._pending_question["id"]:
+                    print("received askUserQuestion answer for a different question", file=sys.stderr)
+                    continue
+                self._resolve_pending_question(answer)
+                continue
             if self.session is not None:
                 await self.session.send_client_content(
                     turns={"role": "user", "parts": [{"text": text or "."}]},
                     turn_complete=True,
                 )
+
+    @staticmethod
+    def _validate_questions(raw_questions):
+        """Return UI-safe question data or a useful tool error."""
+        if not isinstance(raw_questions, list) or not 1 <= len(raw_questions) <= 4:
+            return None, "askUserQuestion requires one to four questions"
+        questions = []
+        for index, raw in enumerate(raw_questions, start=1):
+            if not isinstance(raw, dict):
+                return None, f"question {index} must be an object"
+            question = raw.get("question")
+            options = raw.get("options")
+            if not isinstance(question, str) or not question.strip():
+                return None, f"question {index} needs non-empty question text"
+            if not isinstance(options, list) or not 2 <= len(options) <= 4:
+                return None, f"question {index} needs two to four options"
+            cleaned_options = []
+            labels = set()
+            for option in options:
+                if not isinstance(option, dict):
+                    return None, f"question {index} has an invalid option"
+                label = option.get("label")
+                description = option.get("description")
+                if not isinstance(label, str) or not label.strip() or not isinstance(description, str):
+                    return None, f"question {index} options need label and description"
+                normalized_label = label.strip()
+                if normalized_label.casefold() in labels:
+                    return None, f"question {index} has duplicate option labels"
+                labels.add(normalized_label.casefold())
+                cleaned_options.append({"label": normalized_label, "description": description.strip()})
+            header = raw.get("header", f"Question {index}")
+            questions.append({
+                "header": header.strip() if isinstance(header, str) and header.strip() else f"Question {index}",
+                "question": question.strip(),
+                "options": cleaned_options,
+            })
+        return questions, None
+
+    def _resolve_pending_question(self, answer):
+        pending = self._pending_question
+        if pending is not None and not pending["future"].done():
+            pending["future"].set_result(answer)
+
+    async def ask_user_question(self, args):
+        questions, error = self._validate_questions(args.get("questions"))
+        if error:
+            return {"error": error}
+        self._question_event_id += 1
+        question_id = self._question_event_id
+        future = asyncio.get_running_loop().create_future()
+        self._pending_question = {"id": question_id, "future": future, "questions": questions}
+        out("<<ASK_USER_QUESTION>>" + json.dumps({"id": question_id, "questions": questions}))
+        try:
+            response = await future
+        finally:
+            self._pending_question = None
+        if response.get("cancelled"):
+            return {"cancelled": True}
+        answers = response.get("answers")
+        if not isinstance(answers, list) or len(answers) != len(questions):
+            return {"error": "the question response was incomplete"}
+        result_answers = []
+        for question, answer in zip(questions, answers):
+            if not isinstance(answer, str) or not answer.strip():
+                return {"error": "the question response contained an empty answer"}
+            result_answers.append({"question": question["question"], "answer": answer.strip()})
+        return {"answers": result_answers}
 
     async def receive_text(self):
         while True:
@@ -539,6 +669,8 @@ class TextLoop:
                                     result = await asyncio.to_thread(run_artifact, args_dict)
                                 elif fc.name == "bash":
                                     result = await asyncio.to_thread(run_bash, args_dict, emit_tool_output)
+                                elif fc.name == "askUserQuestion":
+                                    result = await self.ask_user_question(args_dict)
                                 else:
                                     result = {"error": f"unknown tool {fc.name}"}
                                 print(f"TOOL CALL: {fc.name} {args_dict} -> {result}", file=sys.stderr)

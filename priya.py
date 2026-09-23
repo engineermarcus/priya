@@ -15,6 +15,7 @@ Critical fixes vs original:
 Protocol (same as original):
   <<TOOL_START>>{"name": ..., "detail": ...}
   <<TOOL_END>>{"name": ..., "result": ...}
+  <<ASK_USER_QUESTION>>{"id": ..., "questions": [...]}
   <<END>>
   (any other line = streamed model text)
 """
@@ -29,7 +30,8 @@ from collections import deque
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Tree, Input, Static
+from textual.widgets import Tree, Input, Static, OptionList
+from textual.widgets.option_list import Option
 from textual.reactive import reactive
 from textual import work
 from rich.text import Text
@@ -135,6 +137,11 @@ class AppendText(Msg):
 class HideThinking(Msg):
     pass
 
+class AskUserQuestion(Msg):
+    def __init__(self, question_id, questions):
+        self.question_id = question_id
+        self.questions = questions
+
 class EndTurn(Msg):
     pass
 
@@ -181,6 +188,33 @@ class PriyaApp(App):
     .thinking {
         color: #555555;
         background: transparent;
+    }
+
+    .ask-question {
+        width: 72%;
+        height: auto;
+        margin: 0 0 1 2;
+        padding: 1;
+        background: #151515;
+        border: round #4b5563;
+    }
+    .ask-header {
+        color: #a5b4fc;
+        text-style: bold;
+    }
+    .ask-prompt {
+        color: #f5f5f5;
+        margin: 1 0 0 0;
+    }
+    .ask-help, .ask-answer {
+        color: #9ca3af;
+        margin: 1 0 0 0;
+    }
+    .ask-options {
+        height: auto;
+        max-height: 10;
+        margin: 1 0 0 0;
+        background: #111111;
     }
 
     .turn-tools {
@@ -258,12 +292,14 @@ class PriyaApp(App):
         self._spinner_timer = None
         # Current turn state (UI thread only)
         self._cur_tree = None
+        self._cur_turn = None
         self._cur_ai_bubble = None
         self._cur_ai_text = ""
         self._cur_thinking = None
         self._cur_tool_node = None
         self._all_tool_nodes = []
         self._node_registry = {}
+        self._question_state = None
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="convo")
@@ -346,6 +382,8 @@ class PriyaApp(App):
             self._do_append_text(msg.text)
         elif isinstance(msg, HideThinking):
             self._do_hide_thinking()
+        elif isinstance(msg, AskUserQuestion):
+            self._do_ask_user_question(msg.question_id, msg.questions)
         elif isinstance(msg, EndTurn):
             self._do_end_turn()
         elif isinstance(msg, WorkerClosed):
@@ -378,6 +416,7 @@ class PriyaApp(App):
         convo.scroll_end(animate=False)
 
         self._cur_tree = tree
+        self._cur_turn = turn
         self._cur_ai_bubble = ai_bubble
         self._cur_ai_text = ""
         self._cur_thinking = thinking_bubble
@@ -437,13 +476,69 @@ class PriyaApp(App):
             self._cur_thinking.remove()
             self._cur_thinking = None
 
+    def _do_ask_user_question(self, question_id, questions):
+        """Show one question at a time; all answers return in one tool response."""
+        if self._cur_turn is None or self._question_state is not None:
+            return
+        self._question_state = {
+            "id": question_id, "questions": questions, "answers": [], "index": 0,
+            "card": None, "options": None,
+        }
+        self._set_status("  ?  Waiting for your answer", "#a5b4fc")
+        self._show_next_question()
+
+    def _show_next_question(self):
+        state = self._question_state
+        if state is None:
+            return
+        question = state["questions"][state["index"]]
+        options = OptionList(*[
+            Option(f"{option['label']} — {option['description']}", id=option["label"])
+            for option in question["options"]
+        ], classes="ask-options", id="ask-options")
+        card = Vertical(
+            Static(question["header"], classes="ask-header"),
+            Static(question["question"], classes="ask-prompt"),
+            options,
+            Static("↑/↓ then Enter to choose · Tab to type a custom answer", classes="ask-help"),
+            classes="ask-question",
+        )
+        self._cur_turn.mount(card)
+        state["card"] = card
+        state["options"] = options
+        self.call_after_refresh(options.focus)
+        self.call_after_refresh(self.query_one("#convo", VerticalScroll).scroll_end, animate=False)
+
+    def _answer_question(self, answer):
+        state = self._question_state
+        if state is None or not isinstance(answer, str) or not answer.strip():
+            return False
+        answer = answer.strip()
+        card, options = state["card"], state["options"]
+        if options is not None:
+            options.remove()
+        card.mount(Static(f"Answer: {answer}", classes="ask-answer"))
+        state["answers"].append(answer)
+        state["index"] += 1
+        if state["index"] < len(state["questions"]):
+            self._show_next_question()
+            return True
+
+        payload = {"id": state["id"], "answers": state["answers"]}
+        self._question_state = None
+        self._set_status(f"  {SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]}  {MODEL_NAME} is working…")
+        self.send_question_answers(payload)
+        return True
+
     def _do_end_turn(self):
         self.busy = False
         self._set_status(f"  {CHECK}  {MODEL_NAME}  \u00b7  ready", "#4ade80")
         self._do_hide_thinking()
         self._cur_tree = None
+        self._cur_turn = None
         self._cur_ai_bubble = None
         self._cur_tool_node = None
+        self._question_state = None
 
     def _do_worker_closed(self):
         self.busy = False
@@ -472,6 +567,14 @@ class PriyaApp(App):
         if self.proc is None or self.proc.stdin is None:
             return
         try:
+            if self._question_state is not None:
+                options = self._question_state.get("options")
+                card = self._question_state.get("card")
+                if options is not None:
+                    options.remove()
+                if card is not None:
+                    card.mount(Static("Question cancelled", classes="ask-answer"))
+                self._question_state = None
             with self._stdin_lock:
                 self.proc.stdin.write("<<PRIYA_INTERRUPT>>\n")
                 self.proc.stdin.flush()
@@ -484,6 +587,9 @@ class PriyaApp(App):
         text = event.value.strip()
         event.input.value = ""
         if not text:
+            return
+        if self._question_state is not None:
+            self._answer_question(text)
             return
         if text.lower() == "q":
             self.exit()
@@ -502,6 +608,23 @@ class PriyaApp(App):
                 self.proc.stdin.flush()
         except (BrokenPipeError, OSError):
             self.ui_q.put(WorkerClosed())
+
+    @work(thread=True)
+    def send_question_answers(self, payload):
+        """Return a completed interactive question to the waiting worker call."""
+        try:
+            with self._stdin_lock:
+                self.proc.stdin.write("<<ASK_USER_ANSWER>>" + json.dumps(payload) + "\n")
+                self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self.ui_q.put(WorkerClosed())
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected):
+        state = self._question_state
+        if state is None or event.option_list is not state["options"]:
+            return
+        if event.option.id is not None:
+            self._answer_question(str(event.option.id))
 
     @work(exclusive=True, thread=True)
     def read_worker(self):
@@ -559,6 +682,18 @@ class PriyaApp(App):
                 except (json.JSONDecodeError, KeyError):
                     continue
                 self.ui_q.put(AppendToolLog(tool_id, stream, text))
+                continue
+
+            if line.startswith("<<ASK_USER_QUESTION>>"):
+                try:
+                    payload = json.loads(line[len("<<ASK_USER_QUESTION>>"):])
+                    question_id = payload["id"]
+                    questions = payload["questions"]
+                    if not isinstance(questions, list):
+                        raise ValueError("questions is not a list")
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue
+                self.ui_q.put(AskUserQuestion(question_id, questions))
                 continue
 
             if line.startswith("<<TOOL_END>>"):

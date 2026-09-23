@@ -54,9 +54,22 @@ were manually verified through the Live-tool adapter. The missing-cloudflared
 error path was also verified; a real public tunnel still requires cloudflared
 to be installed and tested on this machine.
 
+# IMPLEMENTED: ASKUSERQUESTION
+
+`askUserQuestion` pauses the current model tool round and presents one to four
+structured decisions in the Priya TUI. Each question provides two to four
+keyboard-navigable choices, and the normal input field accepts a custom answer.
+After every question has an answer, Priya returns the ordered answers to the
+same model call so it can continue with the user's decision rather than guess.
+
+- `askUserQuestion {questions: [{header?, question, options: [{label, description}]}]}`
+  → `{answers: [{question, answer}]}`.
+- Use ↑/↓ and Enter to choose an option; press Tab to focus the input field and
+  submit a free-text answer.
+- Escape cancels the pending question along with the active response.
+
 # COMING SOON
 
-- AskUserQuestion
 - CronCreate
 - CronDelete
 - CronList

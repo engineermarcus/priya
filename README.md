@@ -57,3 +57,8 @@ revisions are saved under `.priya/artifacts/`, and its local server refreshes
 an open artifact page automatically when a newer revision is published. Use
 the `artifact share` tool action only when you want to expose that local server
 through an installed `cloudflared` tunnel.
+
+When a coding decision needs your input, the model can call `askUserQuestion`.
+Priya pauses the tool round and renders its multiple-choice options in the
+terminal. Choose with arrow keys and Enter, or press Tab and submit a custom
+free-text answer; the model resumes with your answers.
