@@ -30,9 +30,10 @@ client = genai.Client(
 
 AGENTJOB_BIN = os.path.expanduser("~/agent/job_runner.py")
 
-agentjob_declaration = {
-    "name": "agentjob",
-    "description": (
+agentjob_declaration = types.FunctionDeclaration(
+    name="agentjob",
+    behavior="NON_BLOCKING",
+    description=(
         "Manage a background coding subagent (Gemini 3.5 Flash Lite with shell access). "
         "Use 'spawn' to delegate a self-contained build/fix task - it runs in the "
         "background, non-blocking. Use 'status' to poll progress (never blocks). "
@@ -40,18 +41,18 @@ agentjob_declaration = {
         "turn boundary, not mid-generation). Use 'stop' to hard-kill it; partial files "
         "remain in its workdir for you to inspect or finish yourself."
     ),
-    "parameters": {
-        "type": "object",
+    parameters={
+        "type": "OBJECT",
         "properties": {
-            "action": {"type": "string", "enum": ["spawn", "status", "log", "send", "stop"]},
-            "task": {"type": "string", "description": "Required for 'spawn'."},
-            "workdir": {"type": "string", "description": "Optional for 'spawn'."},
-            "job_id": {"type": "string", "description": "Required for status/log/send/stop."},
-            "message": {"type": "string", "description": "Required for 'send'."},
+            "action": {"type": "STRING", "enum": ["spawn", "status", "log", "send", "stop"]},
+            "task": {"type": "STRING", "description": "Required for 'spawn'."},
+            "workdir": {"type": "STRING", "description": "Optional for 'spawn'."},
+            "job_id": {"type": "STRING", "description": "Required for status/log/send/stop."},
+            "message": {"type": "STRING", "description": "Required for 'send'."},
         },
         "required": ["action"],
     },
-}
+)
 
 
 def run_agentjob(args: dict) -> dict:
@@ -92,23 +93,24 @@ def run_agentjob(args: dict) -> dict:
         return {"error": str(e)}
 
 
-bash_declaration = {
-    "name": "bash",
-    "description": (
+bash_declaration = types.FunctionDeclaration(
+    name="bash",
+    behavior="NON_BLOCKING",
+    description=(
         "Run a bash command directly and return its output. Use this to read/write "
         "files, inspect a subagent's workdir, verify a subagent's claims, check "
         "processes, or do anything else yourself. Runs with your current user's "
         "permissions, no sandboxing."
     ),
-    "parameters": {
-        "type": "object",
+    parameters={
+        "type": "OBJECT",
         "properties": {
-            "command": {"type": "string", "description": "The bash command to run."},
-            "timeout_s": {"type": "integer", "description": "Optional. Default 60."},
+            "command": {"type": "STRING", "description": "The bash command to run."},
+            "timeout_s": {"type": "INTEGER", "description": "Optional. Default 60."},
         },
         "required": ["command"],
     },
-}
+)
 
 
 def run_bash(args: dict) -> dict:
@@ -157,7 +159,7 @@ CONFIG = types.LiveConnectConfig(
         trigger_tokens=120000,
         sliding_window=types.SlidingWindow(target_tokens=60000),
     ),
-    tools=[{"function_declarations": [agentjob_declaration, bash_declaration]}],
+    tools=[types.Tool(function_declarations=[agentjob_declaration, bash_declaration])],
 )
 
 PIPED = not sys.stdin.isatty()
@@ -177,6 +179,42 @@ def start_player():
         stdin=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
+
+
+def emit_content(sc):
+    """Stream every text-bearing piece of a server_content chunk out,
+    in the order it actually arrived, regardless of whether it came in
+    as an audio transcription or as a text part of model_turn. This is
+    audio-first model (response_modalities=["AUDIO"]) so most or all of
+    what reaches here will be transcription text rather than model_turn
+    text parts — but both paths are checked every time so nothing that
+    does show up in either gets silently dropped.
+
+    If text still never appears in the UI after this, the transcription
+    itself is coming back empty from the API for this session — check
+    the RAW server_content dumps this file writes to stderr
+    (/tmp/priya_worker.log when run from priya_ui.py) to see whether
+    output_transcription.text is actually populated on the raw
+    response; if it's empty there too, this is a config/SDK-level
+    issue upstream of this function, not a UI or emission bug.
+    """
+    if sc is None:
+        return
+
+    emitted_any = False
+
+    if sc.output_transcription and sc.output_transcription.text:
+        out(sc.output_transcription.text)
+        emitted_any = True
+
+    if sc.model_turn and sc.model_turn.parts:
+        for part in sc.model_turn.parts:
+            text = getattr(part, "text", None)
+            if text:
+                out(text)
+                emitted_any = True
+
+    return emitted_any
 
 
 class TextLoop:
@@ -237,13 +275,7 @@ class TextLoop:
                                     function_responses=function_responses
                                 )
 
-                            if sc is not None:
-                                if sc.output_transcription and sc.output_transcription.text:
-                                    out(sc.output_transcription.text)
-                                if sc.model_turn and sc.model_turn.parts:
-                                    for part in sc.model_turn.parts:
-                                        if getattr(part, "text", None):
-                                            out(part.text)
+                            emit_content(sc)
 
                             if TALK and response.data:
                                 self.player.stdin.write(response.data)
