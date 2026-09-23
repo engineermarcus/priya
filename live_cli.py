@@ -22,6 +22,15 @@ from google.genai import types
 
 MODEL = "gemini-3.8-live"
 TALK = "--talk" in sys.argv[1:]
+MIC = "--mic" in sys.argv[1:]
+
+if MIC:
+    import pyaudio
+    FORMAT = pyaudio.paInt16
+    CHANNELS = 1
+    SEND_SAMPLE_RATE = 16000
+    CHUNK_SIZE = 1024
+    pya = pyaudio.PyAudio()
 
 client = genai.Client(
     http_options={"api_version": "v1beta"},
@@ -204,6 +213,36 @@ class TextLoop:
     def __init__(self):
         self.session = None
         self.player = start_player() if TALK else None
+        self.mic_queue = asyncio.Queue(maxsize=10) if MIC else None
+        self.mic_stream = None
+
+    async def listen_audio(self):
+        """Reads mic PCM chunks off-thread and queues them for send_audio."""
+        mic_info = pya.get_default_input_device_info()
+        self.mic_stream = await asyncio.to_thread(
+            pya.open,
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SEND_SAMPLE_RATE,
+            input=True,
+            input_device_index=mic_info["index"],
+            frames_per_buffer=CHUNK_SIZE,
+        )
+        while True:
+            data = await asyncio.to_thread(
+                self.mic_stream.read, CHUNK_SIZE, exception_on_overflow=False
+            )
+            await self.mic_queue.put(data)
+
+    async def send_audio(self):
+        """Streams queued mic chunks to the session. Server-side VAD handles turn
+        boundaries automatically -- no explicit activity_start/end needed."""
+        while True:
+            data = await self.mic_queue.get()
+            if self.session is not None:
+                await self.session.send_realtime_input(
+                    audio={"data": data, "mime_type": "audio/pcm;rate=16000"}
+                )
 
     async def send_text(self):
         while True:
@@ -292,6 +331,9 @@ class TextLoop:
                 await asyncio.sleep(0.1)
                 send_text_task = tg.create_task(self.send_text())
                 tg.create_task(self.receive_text())
+                if MIC:
+                    tg.create_task(self.listen_audio())
+                    tg.create_task(self.send_audio())
                 await send_text_task
                 raise asyncio.CancelledError("User requested exit")
         except asyncio.CancelledError:
