@@ -36,10 +36,6 @@ if MIC:
     FORMAT = pyaudio.paInt16
     CHANNELS = 1
     SEND_SAMPLE_RATE = 16000
-    PLAYBACK_SAMPLE_RATE = 24000
-    # Do not reopen the microphone immediately after playback stops: speaker
-    # output and room reflections arrive at the mic slightly late.
-    PLAYBACK_ECHO_GUARD_SECONDS = 0.75
     # WebRTC VAD accepts 10, 20, or 30 ms frames. Thirty milliseconds gives
     # low latency without treating tiny room sounds as a complete utterance.
     CHUNK_SIZE = 480
@@ -205,9 +201,8 @@ CONFIG = types.LiveConnectConfig(
             prefix_padding_ms=120,
             silence_duration_ms=450,
         ),
-        # Keep Gemini ready for an interruption from text input. Microphone
-        # frames are deliberately gated during local speaker playback so the
-        # assistant's own voice cannot trigger this server-side path.
+        # Permit a real user to barge in. Echo filtering below rejects Priya's
+        # own playback before it reaches this server-side interruption path.
         activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
     ),
     system_instruction=(
@@ -289,7 +284,7 @@ def emit_input_transcription(sc):
 
 
 class MicrophoneProcessor:
-    """Local speech gating plus a hard guard while the assistant is speaking."""
+    """WebRTC AEC/NS and a local end-of-speech signal for Gemini hybrid VAD."""
 
     def __init__(self):
         self.vad = webrtcvad.Vad(3)
@@ -306,7 +301,6 @@ class MicrophoneProcessor:
         self.far_16khz = deque()
         self.speech_active = False
         self.silent_frames = 0
-        self.playback_until = 0.0
 
     def reset(self):
         self.processor.reset()
@@ -314,32 +308,17 @@ class MicrophoneProcessor:
         self.far_16khz.clear()
         self.speech_active = False
         self.silent_frames = 0
-        self.playback_until = 0.0
 
     def add_playback(self, pcm_24khz):
-        """Extend the period in which mic input must not be sent upstream.
-
-        AEC improves audio quality but cannot be trusted as the only echo
-        barrier: its reference is not sample-synchronous with aplay or room
-        acoustics.  Dropping capture during playback is what prevents Priya's
-        voice from creating a new Gemini turn.
-        """
-        now = time.monotonic()
-        if now >= self.playback_until + PLAYBACK_ECHO_GUARD_SECONDS:
-            # Any old AEC reference belongs to a previous response.
-            self.far_24khz.clear()
-            self.far_16khz.clear()
-            self.processor.reset()
-            self.speech_active = False
-            self.silent_frames = 0
-            self.playback_until = now
-        self.playback_until = max(self.playback_until, now) + (
-            len(pcm_24khz) / (2 * PLAYBACK_SAMPLE_RATE)
-        )
-
-    def playback_active(self):
-        """Whether microphone capture is still inside the echo-protection window."""
-        return time.monotonic() < self.playback_until + PLAYBACK_ECHO_GUARD_SECONDS
+        """Add the PCM sent to aplay as the far-end AEC reference signal."""
+        self.far_24khz.extend(memoryview(pcm_24khz).cast("h"))
+        # Convert 24 kHz playback to 16 kHz for the microphone processor.
+        while len(self.far_24khz) >= 3:
+            first = self.far_24khz.popleft()
+            second = self.far_24khz.popleft()
+            third = self.far_24khz.popleft()
+            self.far_16khz.append(first)
+            self.far_16khz.append((second + third) // 2)
 
     def process(self, microphone_pcm):
         """Return cleaned PCM and whether local VAD finalized an utterance."""
@@ -416,23 +395,9 @@ class TextLoop:
             await self.mic_queue.put(data)
 
     async def send_audio(self):
-        """Stream mic audio continuously; local VAD only finalizes turns early."""
-        was_playback_active = False
+        """Use local noise/VAD gating with Gemini's automatic VAD as fallback."""
         while True:
             data = await self.mic_queue.get()
-            if self.mic_processor.playback_active():
-                if not was_playback_active and self.session is not None:
-                    # Gemini automatic/hybrid VAD requires this whenever the
-                    # continuous microphone stream is paused.  It flushes
-                    # cached input and lets a later audio chunk reopen it.
-                    await self.session.send_realtime_input(audio_stream_end=True)
-                was_playback_active = True
-                continue
-            if was_playback_active:
-                # Discard any partial utterance/VAD state from before playback.
-                # The next speech is necessarily a fresh user turn.
-                self.mic_processor.reset()
-                was_playback_active = False
             cleaned_audio, speech_ended = self.mic_processor.process(data)
             if self.session is not None:
                 await self.session.send_realtime_input(
