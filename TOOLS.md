@@ -1,20 +1,62 @@
 **TOOL SET A**
 
-#  AGENT
+# IMPLEMENTED: AGENTJOB
 
-**Agent Job (background subagent via CLI)**
-- `agentjob spawn "<task>" [workdir]` -> {job_id, workdir}
-- `agentjob status <job_id>` -> current state (running/done/failed/stopped + reason)
-- `agentjob log <job_id> [--follow]`
-- `agentjob send <job_id> "<message>"` — steer at next turn boundary
-- `agentjob stop <job_id>` — hard kill, preserves partial workdir state
-Use for any substantial subtask that can run independently while you continue other work. Always spawn, never block — check status periodically instead of waiting.
+`agentjob` launches a non-blocking Gemini `gemini-3.5-flash-lite` coding
+subagent with shell access. The versioned runner is `tools/job_runner.py`;
+transient job state and logs are stored in `.priya/jobs/` and are not tracked.
+
+- `agentjob spawn "<task>" [workdir]` → `{job_id, workdir}`. Without a workdir,
+  it works in the repository root.
+- `agentjob status <job_id>` → `{status, reason, turn, workdir, ...}`.
+- `agentjob log <job_id>` → current job transcript snapshot.
+- `agentjob send <job_id> "<message>"` → queues steering for the next turn.
+- `agentjob stop <job_id>` → terminates the job process group and preserves its
+  transcript/status files.
+
+Use it for substantial independent work. It is non-blocking: spawn, then poll
+status or read the log rather than waiting in the foreground. The complete
+lifecycle above was manually verified against the local runner.
+
+# IMPLEMENTED: BASH
+
+`bash` runs a shell command in Priya's current working directory.
+
+- `bash {command, timeout_s?}` → `{exit_code, stdout, stderr}`.
+- `timeout_s` defaults to 60 seconds.
+- Stdout and stderr are streamed to the UI while the command runs, then the
+  final result is returned (stdout is capped at 8,000 characters and stderr at
+  4,000 characters).
+- On timeout, the complete command process group is terminated; no background
+  descendants are left running.
+
+Its streaming, error-stream capture, timeout, and process-group cleanup were
+manually verified.
+
+# IMPLEMENTED: ARTIFACT
+
+`artifact` turns a generated HTML result into a versioned interactive local web
+page. Its repository-local implementation is `tools/artifact.py`; revisions,
+server state, and logs are stored under `.priya/artifacts/` and ignored by Git.
+
+- `artifact publish {name, title?, html}` → creates a new immutable HTML
+  revision and returns its stable artifact URL.
+- `artifact list`, `artifact history {name}`, and `artifact revert {name,
+  version}` → inspect and restore revisions.
+- `artifact start {port?}` / `artifact stop` → runs or stops a local server
+  (default: `http://127.0.0.1:8765`). The stable artifact page polls once per
+  second and refreshes its iframe in place after a publish or revert.
+- `artifact share` → starts a Cloudflare quick tunnel only after explicit use
+  of this action. It requires the separately installed `cloudflared` command.
+
+Publish, live local serving, revision history, reversion, and server shutdown
+were manually verified through the Live-tool adapter. The missing-cloudflared
+error path was also verified; a real public tunnel still requires cloudflared
+to be installed and tested on this machine.
 
 # COMING SOON
 
-- Artifact
 - AskUserQuestion
-- Bash
 - CronCreate
 - CronDelete
 - CronList
@@ -28,8 +70,6 @@ Use for any substantial subtask that can run independently while you continue ot
 - LSP
 - ListMcpResourcesTool
 - Monitor
-- NotebookEdit
-- PowerShell
 - PushNotification
 - Read
 - ReadMcpResourceTool
@@ -114,4 +154,3 @@ Use for any substantial subtask that can run independently while you continue ot
 
 **Parallel dispatch (1)**
 - `multi_tool_use.parallel`
-

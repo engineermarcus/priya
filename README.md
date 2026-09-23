@@ -49,4 +49,11 @@ Press `Ctrl+C` to exit. In the input field, enter `q` to quit.
 The model can call `bash` for local shell work and `agentjob` to delegate a
 background coding task. Expand a running `bash` tool in the UI to follow its
 stdout and stderr; the final result is appended after the live log. `agentjob`
-expects its runner at `~/agent/job_runner.py`.
+uses the repository-local runner at `tools/job_runner.py`. Its transient job
+state and logs live under `.priya/jobs/` (ignored by Git).
+
+The model can also publish a self-contained interactive HTML artifact. Artifact
+revisions are saved under `.priya/artifacts/`, and its local server refreshes
+an open artifact page automatically when a newer revision is published. Use
+the `artifact share` tool action only when you want to expose that local server
+through an installed `cloudflared` tunnel.

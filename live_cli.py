@@ -19,6 +19,7 @@ import subprocess
 import queue
 import threading
 import time
+import signal
 
 from google import genai
 from google.genai import types
@@ -44,7 +45,9 @@ client = genai.Client(
     api_key=os.environ.get("GEMINI_API_KEY"),
 )
 
-AGENTJOB_BIN = os.path.expanduser("~/agent/job_runner.py")
+DIR = os.path.dirname(os.path.abspath(__file__))
+AGENTJOB_BIN = os.path.join(DIR, "tools", "job_runner.py")
+ARTIFACT_BIN = os.path.join(DIR, "tools", "artifact.py")
 INTERRUPT_COMMAND = "<<PRIYA_INTERRUPT>>"
 
 agentjob_declaration = types.FunctionDeclaration(
@@ -110,6 +113,64 @@ def run_agentjob(args: dict) -> dict:
         return {"error": str(e)}
 
 
+artifact_declaration = types.FunctionDeclaration(
+    name="artifact",
+    behavior="NON_BLOCKING",
+    description=(
+        "Publish versioned interactive HTML artifacts, serve them locally, inspect "
+        "their history, revert a version, or explicitly expose the local server with "
+        "cloudflared. Use publish with complete self-contained HTML."
+    ),
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "action": {"type": "STRING", "enum": ["publish", "list", "history", "revert", "start", "stop", "share"]},
+            "name": {"type": "STRING", "description": "Artifact slug; required for publish, history, and revert."},
+            "html": {"type": "STRING", "description": "Complete HTML document; required for publish."},
+            "title": {"type": "STRING", "description": "Optional browser title for publish."},
+            "version": {"type": "STRING", "description": "Version ID required for revert."},
+            "port": {"type": "INTEGER", "description": "Optional local server port for start; defaults to 8765."},
+        },
+        "required": ["action"],
+    },
+)
+
+
+def run_artifact(args: dict) -> dict:
+    action = args.get("action")
+    cmd = [sys.executable, ARTIFACT_BIN, action]
+    if action == "publish":
+        if not args.get("name") or not args.get("html"):
+            return {"error": "publish requires name and html"}
+        cmd.extend([args["name"], "--html", args["html"]])
+        if args.get("title"):
+            cmd.extend(["--title", args["title"]])
+    elif action in ("history", "revert"):
+        if not args.get("name"):
+            return {"error": f"{action} requires name"}
+        cmd.append(args["name"])
+        if action == "revert":
+            if not args.get("version"):
+                return {"error": "revert requires version"}
+            cmd.append(args["version"])
+    elif action == "start":
+        if args.get("port") is not None:
+            cmd.extend(["--port", str(args["port"])])
+    elif action not in ("list", "stop", "share"):
+        return {"error": f"unknown artifact action: {action}"}
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        raw = (result.stdout or "").strip()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"error": result.stderr.strip() or raw or f"artifact exited {result.returncode}"}
+    except subprocess.TimeoutExpired:
+        return {"error": "artifact call timed out (30s)"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 bash_declaration = types.FunctionDeclaration(
     name="bash",
     behavior="NON_BLOCKING",
@@ -139,7 +200,7 @@ def run_bash(args: dict, on_output=None) -> dict:
     try:
         proc = subprocess.Popen(
             command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
+            text=True, bufsize=1, start_new_session=True,
         )
         events = queue.Queue()
 
@@ -158,7 +219,14 @@ def run_bash(args: dict, on_output=None) -> dict:
         deadline = time.monotonic() + timeout_s
         while closed_streams < 2:
             if not timed_out and time.monotonic() >= deadline:
-                proc.kill()
+                # The shell may have started descendants. Killing its process
+                # group prevents a timed-out command from surviving in the
+                # background after its tool result has been returned.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    # The command exited between the deadline check and kill.
+                    pass
                 timed_out = True
             try:
                 stream_name, chunk = events.get(timeout=0.1)
@@ -205,8 +273,11 @@ CONFIG = types.LiveConnectConfig(
         activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
     ),
     system_instruction=(
-        "You are Priya. For ANY request that touches files, commands, code, processes, or system state, you MUST call the 'bash' or 'agentjob' tool before responding -- never answer from assumption, and never claim an error occurred unless a tool call actually returned one. You have a 'bash' tool for direct shell "
-        "access, and an 'agentjob' tool to delegate self-contained coding tasks to a "
+        "You are Priya. For ANY request that touches files, commands, code, processes, or system state, you MUST call the appropriate tool before responding -- never answer from assumption, and never claim an error occurred unless a tool call actually returned one. You have a 'bash' tool for direct shell "
+        "access, an 'agentjob' tool to delegate self-contained coding tasks to a "
+        "background subagent, and an 'artifact' tool for versioned interactive HTML "
+        "pages. Use artifact when a visual browser-rendered result is materially more "
+        "useful than terminal text. "
         "background subagent. Prefer spawning agentjob for substantial builds so you "
         "can keep talking with the user; use bash directly for quick checks, reading "
         "files, or verifying a subagent's work. Never trust a subagent's 'done' claim "
@@ -228,7 +299,7 @@ CONFIG = types.LiveConnectConfig(
         trigger_tokens=120000,
         sliding_window=types.SlidingWindow(target_tokens=60000),
     ),
-    tools=[types.Tool(function_declarations=[agentjob_declaration, bash_declaration])],
+    tools=[types.Tool(function_declarations=[agentjob_declaration, artifact_declaration, bash_declaration])],
 )
 
 PIPED = not sys.stdin.isatty()
@@ -464,6 +535,8 @@ class TextLoop:
 
                                 if fc.name == "agentjob":
                                     result = await asyncio.to_thread(run_agentjob, args_dict)
+                                elif fc.name == "artifact":
+                                    result = await asyncio.to_thread(run_artifact, args_dict)
                                 elif fc.name == "bash":
                                     result = await asyncio.to_thread(run_bash, args_dict, emit_tool_output)
                                 else:
