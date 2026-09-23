@@ -3,3 +3,4 @@ textual==8.2.8
 rich==15.0.0
 PyAudio==0.2.14
 webrtcvad-wheels==2.0.14
+pywebrtc-audio==0.2.0

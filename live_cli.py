@@ -31,6 +31,8 @@ MIC = "--mic" in sys.argv[1:]
 if MIC:
     import pyaudio
     import webrtcvad
+    import numpy as np
+    from pywebrtc_audio import AudioProcessor
     FORMAT = pyaudio.paInt16
     CHANNELS = 1
     SEND_SAMPLE_RATE = 16000
@@ -194,11 +196,14 @@ CONFIG = types.LiveConnectConfig(
     realtime_input_config=types.RealtimeInputConfig(
         automatic_activity_detection=types.AutomaticActivityDetection(
             disabled=False,
-            start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+            start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
             end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
             prefix_padding_ms=120,
-            silence_duration_ms=700,
-        )
+            silence_duration_ms=450,
+        ),
+        # Permit a real user to barge in. Echo filtering below rejects Priya's
+        # own playback before it reaches this server-side interruption path.
+        activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
     ),
     system_instruction=(
         "You are Priya. For ANY request that touches files, commands, code, processes, or system state, you MUST call the 'bash' or 'agentjob' tool before responding -- never answer from assumption, and never claim an error occurred unless a tool call actually returned one. You have a 'bash' tool for direct shell "
@@ -278,60 +283,70 @@ def emit_input_transcription(sc):
         out("<<USER_SPEECH>>" + text)
 
 
-class MicrophoneGate:
-    """Reject non-speech and mark the end of local speech for hybrid VAD."""
+class MicrophoneProcessor:
+    """WebRTC AEC/NS and a local end-of-speech signal for Gemini hybrid VAD."""
 
     def __init__(self):
         self.vad = webrtcvad.Vad(3)
-        self.noise_floor = 80.0
-        self.pre_roll = deque(maxlen=7)  # 210 ms, preserves the first syllable
-        self.active = False
+        self.processor = AudioProcessor(
+            sample_rate=SEND_SAMPLE_RATE,
+            echo_cancellation=True,
+            noise_suppression=True,
+            high_pass_filter=True,
+            auto_gain_control=False,
+            ns_level=2,
+            stream_delay_ms=60,
+        )
+        self.far_24khz = deque()
+        self.far_16khz = deque()
+        self.speech_active = False
         self.silent_frames = 0
-
-    @staticmethod
-    def rms(frame):
-        samples = memoryview(frame).cast("h")
-        if not samples:
-            return 0.0
-        return (sum(sample * sample for sample in samples) / len(samples)) ** 0.5
 
     def reset(self):
-        self.pre_roll.clear()
-        self.active = False
+        self.processor.reset()
+        self.far_24khz.clear()
+        self.far_16khz.clear()
+        self.speech_active = False
         self.silent_frames = 0
 
-    def process(self, frame):
-        """Return (frames_to_send, speech_ended) for one 30 ms PCM frame."""
-        level = self.rms(frame)
-        voice = level >= max(180.0, self.noise_floor * 2.5) and self.vad.is_speech(
-            frame, SEND_SAMPLE_RATE
-        )
-        if not voice:
-            self.noise_floor = self.noise_floor * 0.97 + level * 0.03
+    def add_playback(self, pcm_24khz):
+        """Add the PCM sent to aplay as the far-end AEC reference signal."""
+        self.far_24khz.extend(memoryview(pcm_24khz).cast("h"))
+        # Convert 24 kHz playback to 16 kHz for the microphone processor.
+        while len(self.far_24khz) >= 3:
+            first = self.far_24khz.popleft()
+            second = self.far_24khz.popleft()
+            third = self.far_24khz.popleft()
+            self.far_16khz.append(first)
+            self.far_16khz.append((second + third) // 2)
 
-        if not self.active:
-            self.pre_roll.append((frame, voice))
-            # Require three voiced frames in the most recent 120 ms. This
-            # rejects clicks, keyboard taps, fans, and short speaker echoes.
-            if sum(is_voice for _, is_voice in self.pre_roll) < 3:
-                return [], False
-            self.active = True
-            self.silent_frames = 0
-            frames = [saved_frame for saved_frame, _ in self.pre_roll]
-            self.pre_roll.clear()
-            return frames, False
+    def process(self, microphone_pcm):
+        """Return cleaned PCM and whether local VAD finalized an utterance."""
+        near = np.frombuffer(microphone_pcm, dtype="<i2")
+        if len(self.far_16khz) >= len(near):
+            far = np.fromiter(
+                (self.far_16khz.popleft() for _ in range(len(near))),
+                dtype=np.int16,
+                count=len(near),
+            )
+        else:
+            far = np.zeros(len(near), dtype=np.int16)
+        cleaned = self.processor.process(near, far)
+        cleaned_pcm = cleaned.astype("<i2", copy=False).tobytes()
+        voice = self.vad.is_speech(cleaned_pcm, SEND_SAMPLE_RATE)
 
         if voice:
+            self.speech_active = True
             self.silent_frames = 0
-            return [frame], False
-
+            return cleaned_pcm, False
+        if not self.speech_active:
+            return cleaned_pcm, False
         self.silent_frames += 1
-        # Retain a little natural pause in the stream, then promptly finalize
-        # through Gemini's hybrid VAD path.
-        if self.silent_frames <= 10:
-            return [frame], False
-        self.reset()
-        return [], True
+        if self.silent_frames < 15:  # 450 ms of silence
+            return cleaned_pcm, False
+        self.speech_active = False
+        self.silent_frames = 0
+        return cleaned_pcm, True
 
 
 class TextLoop:
@@ -341,8 +356,25 @@ class TextLoop:
         self.mic_queue = asyncio.Queue(maxsize=10) if MIC else None
         self.mic_stream = None
         self._tool_event_id = 0
-        self.mic_gate = MicrophoneGate() if MIC else None
-        self.mic_muted_until = 0.0
+        self.mic_processor = MicrophoneProcessor() if MIC else None
+
+    def discard_playback(self):
+        """Immediately drop audio queued in aplay after a server interruption."""
+        if self.player is None:
+            return
+        old_player = self.player
+        self.player = None
+        try:
+            old_player.stdin.close()
+        except (BrokenPipeError, OSError, AttributeError):
+            pass
+        old_player.terminate()
+        try:
+            old_player.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            old_player.kill()
+        if TALK:
+            self.player = start_player()
 
     async def listen_audio(self):
         """Reads mic PCM chunks off-thread and queues them for send_audio."""
@@ -360,23 +392,17 @@ class TextLoop:
             data = await asyncio.to_thread(
                 self.mic_stream.read, CHUNK_SIZE, exception_on_overflow=False
             )
-            # Keep a capture timestamp: delayed frames recorded while Priya
-            # was speaking must not be sent after audio playback ends.
-            await self.mic_queue.put((time.monotonic(), data))
+            await self.mic_queue.put(data)
 
     async def send_audio(self):
         """Use local noise/VAD gating with Gemini's automatic VAD as fallback."""
         while True:
-            captured_at, data = await self.mic_queue.get()
-            if captured_at < self.mic_muted_until:
-                self.mic_gate.reset()
-                continue
-            frames, speech_ended = self.mic_gate.process(data)
+            data = await self.mic_queue.get()
+            cleaned_audio, speech_ended = self.mic_processor.process(data)
             if self.session is not None:
-                for frame in frames:
-                    await self.session.send_realtime_input(
-                        audio={"data": frame, "mime_type": "audio/pcm;rate=16000"}
-                    )
+                await self.session.send_realtime_input(
+                    audio={"data": cleaned_audio, "mime_type": "audio/pcm;rate=16000"}
+                )
                 if speech_ended:
                     await self.session.send_realtime_input(audio_stream_end=True)
 
@@ -417,6 +443,15 @@ class TextLoop:
 
                         emit_input_transcription(sc)
 
+                        was_interrupted = bool(sc is not None and sc.interrupted)
+                        if was_interrupted:
+                            # Gemini documents that client playback must be
+                            # cleared here. Without this, queued speech keeps
+                            # reaching the microphone after the turn ends.
+                            self.discard_playback()
+                            if self.mic_processor is not None:
+                                self.mic_processor.reset()
+
                         if response.tool_call:
                             saw_tool_call = True
                             function_responses = []
@@ -456,17 +491,11 @@ class TextLoop:
 
                         emit_content(sc)
 
-                        if TALK and response.data:
+                        if TALK and response.data and self.player is not None and not was_interrupted:
+                            if self.mic_processor is not None:
+                                self.mic_processor.add_playback(response.data)
                             self.player.stdin.write(response.data)
                             self.player.stdin.flush()
-                            # The microphone can pick up speakers in the same
-                            # room. Do not feed model audio back as user speech;
-                            # the tail also absorbs the aplay device buffer.
-                            playback_seconds = len(response.data) / (24000 * 2)
-                            self.mic_muted_until = max(
-                                self.mic_muted_until,
-                                time.monotonic() + playback_seconds + 0.45,
-                            )
 
                         status = getattr(sc, "interaction_status", None) if sc is not None else None
                         if status == "IDLE":
@@ -504,7 +533,10 @@ class TextLoop:
             traceback.print_exception(EG)
         finally:
             if self.player is not None:
-                self.player.stdin.close()
+                try:
+                    self.player.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
                 self.player.wait()
 
 
