@@ -16,6 +16,7 @@ Protocol (same as original):
   <<TOOL_START>>{"name": ..., "detail": ...}
   <<TOOL_END>>{"name": ..., "result": ...}
   <<ASK_USER_QUESTION>>{"id": ..., "questions": [...]}
+  <<EDIT_APPROVAL>>{"id": ..., "path": ..., "diff": ...}
   <<SCHEDULED_TASK>>{"job_id": ..., "prompt": ...}
   <<END>>
   (any other line = streamed model text)
@@ -25,13 +26,14 @@ import os
 import sys
 import json
 import queue
+import re
 import subprocess
 import threading
 from collections import deque
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Tree, Input, Static, OptionList
+from textual.widgets import Tree, Input, Static, OptionList, Link
 from textual.widgets.option_list import Option
 from textual.reactive import reactive
 from textual import work
@@ -51,11 +53,72 @@ THINKING_FRAMES = [f + " thinking\u2026" for f in SPINNER_FRAMES]
 
 _ADD_KEYS = ("added", "inserted", "lines_added", "additions")
 _DEL_KEYS = ("removed", "deleted", "lines_removed", "deletions")
+_URL_PATTERN = re.compile(r"https?://[^\s<>\]\[\"']+")
+_ERROR_PATTERN = re.compile(r"\b(error|failed|failure|exception|traceback|fatal|denied)\b", re.IGNORECASE)
+_WARNING_PATTERN = re.compile(r"\b(warn(?:ing)?|deprecated|retry)\b", re.IGNORECASE)
+_SUCCESS_PATTERN = re.compile(r"\b(ok|pass(?:ed)?|success(?:ful(?:ly)?)?|done|complete(?:d)?)\b", re.IGNORECASE)
+_JSON_KEY_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"(?=\s*:)')
+_JSON_STRING_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"')
+_JSON_LITERAL_PATTERN = re.compile(r"\b(?:true|false|null)\b")
+_NUMBER_PATTERN = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?")
+_PATH_PATTERN = re.compile(r"(?<!\w)(?:\.?\.?/)[\w./-]+")
+
+
+def extract_urls(value):
+    """Return distinct HTTP(S) URLs from streamed text or tool results."""
+    if not isinstance(value, str):
+        return []
+    urls = []
+    for match in _URL_PATTERN.finditer(value):
+        url = match.group(0).rstrip(".,;:!?)")
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 
 def diff_stat(result):
     if not isinstance(result, dict):
         return None
+
+
+def colorize_tool_text(value, stream="stdout", *, result=False):
+    """Return a compact terminal-style Rich label without altering log text."""
+    base = "#aeb8c8" if stream == "stdout" else "#fbbf24"
+    text = Text(value, style=base)
+
+    if result:
+        for match in _JSON_STRING_PATTERN.finditer(value):
+            text.stylize("#a7f3d0", match.start(), match.end())
+        for match in _JSON_KEY_PATTERN.finditer(value):
+            text.stylize("bold #7dd3fc", match.start(), match.end())
+        for match in _JSON_LITERAL_PATTERN.finditer(value):
+            text.stylize("bold #c4b5fd", match.start(), match.end())
+        for match in _NUMBER_PATTERN.finditer(value):
+            text.stylize("#fdba74", match.start(), match.end())
+    else:
+        for match in _PATH_PATTERN.finditer(value):
+            text.stylize("#67e8f9", match.start(), match.end())
+
+    for url in extract_urls(value):
+        start = value.find(url)
+        if start >= 0:
+            text.stylize(f"underline #60a5fa link {url}", start, start + len(url))
+    for match in _WARNING_PATTERN.finditer(value):
+        text.stylize("bold #facc15", match.start(), match.end())
+    for match in _SUCCESS_PATTERN.finditer(value):
+        text.stylize("bold #4ade80", match.start(), match.end())
+    for match in _ERROR_PATTERN.finditer(value):
+        text.stylize("bold #fb7185", match.start(), match.end())
+    return text
+
+
+def tool_log_label(stream, value):
+    """Render live logs quietly; final results retain richer status colors."""
+    label = Text()
+    label.append(f"{stream}", style="dim #64748b")
+    label.append(" │ ", style="dim #475569")
+    label.append(value, style="dim #7c8798")
+    return label
     added = next((result[k] for k in _ADD_KEYS if k in result), None)
     removed = next((result[k] for k in _DEL_KEYS if k in result), None)
     if added is None and removed is None:
@@ -89,15 +152,19 @@ def tool_label(data, spinner_frame=None):
         frame = spinner_frame or SPINNER_FRAMES[0]
         label.append(f"{frame} ", style="dim")
     name = (data.name[:1].upper() + data.name[1:]) if data.name else "Tool"
-    label.append(name, style="bold white")
-    label.append(f"({data.detail})", style="dim")
+    tool_color = {
+        "bash": "#4ade80", "artifact": "#60a5fa", "edit": "#c4b5fd",
+        "read": "#67e8f9", "askUserQuestion": "#facc15",
+    }.get(data.name, "white")
+    label.append(name, style=f"bold {tool_color}")
+    label.append(f"  {data.detail}", style="dim #94a3b8")
     if data.stat:
         added, removed = data.stat
         label.append("  ")
         if added:
-            label.append(f"+{added} ", style="white")
+            label.append(f"+{added} ", style="bold #4ade80")
         if removed:
-            label.append(f"-{removed}", style="white")
+            label.append(f"-{removed}", style="bold #fb7185")
     return label
 
 
@@ -142,6 +209,12 @@ class AskUserQuestion(Msg):
     def __init__(self, question_id, questions):
         self.question_id = question_id
         self.questions = questions
+
+class EditApproval(Msg):
+    def __init__(self, edit_id, path, diff):
+        self.edit_id = edit_id
+        self.path = path
+        self.diff = diff
 
 class EndTurn(Msg):
     pass
@@ -220,6 +293,18 @@ class PriyaApp(App):
         max-height: 10;
         margin: 1 0 0 0;
         background: #111111;
+    }
+    .edit-diff {
+        height: auto;
+        max-height: 14;
+        margin: 1 0 0 0;
+        color: #d1d5db;
+        background: #0b0b0b;
+    }
+    .reply-link {
+        width: auto;
+        height: auto;
+        margin: 0 0 1 2;
     }
 
     .turn-tools {
@@ -302,9 +387,11 @@ class PriyaApp(App):
         self._cur_ai_text = ""
         self._cur_thinking = None
         self._cur_tool_node = None
+        self._cur_links = set()
         self._all_tool_nodes = []
         self._node_registry = {}
         self._question_state = None
+        self._edit_approval_state = None
         self._interrupted = False
 
     def compose(self) -> ComposeResult:
@@ -379,7 +466,7 @@ class PriyaApp(App):
         # Esc has already shown a terminal interruption state. Drop delayed
         # worker output rather than letting queued logs/text revive the turn.
         if self._interrupted and isinstance(
-            msg, (AddToolNode, FinishToolNode, AppendToolLog, AppendText, AskUserQuestion)
+            msg, (AddToolNode, FinishToolNode, AppendToolLog, AppendText, AskUserQuestion, EditApproval)
         ):
             return
         if isinstance(msg, MountTurn):
@@ -396,6 +483,8 @@ class PriyaApp(App):
             self._do_hide_thinking()
         elif isinstance(msg, AskUserQuestion):
             self._do_ask_user_question(msg.question_id, msg.questions)
+        elif isinstance(msg, EditApproval):
+            self._do_edit_approval(msg.edit_id, msg.path, msg.diff)
         elif isinstance(msg, EndTurn):
             self._do_end_turn()
         elif isinstance(msg, WorkerClosed):
@@ -434,6 +523,7 @@ class PriyaApp(App):
         self._cur_ai_text = ""
         self._cur_thinking = thinking_bubble
         self._cur_tool_node = None
+        self._cur_links = set()
 
     def _do_add_tool_node(self, tool_id, name, detail):
         if self._cur_tree is None:
@@ -455,34 +545,46 @@ class PriyaApp(App):
         data.stat = stat
         node.set_label(tool_label(data))
         if node.children:
-            node.add_leaf(Text("result", style="bold dim"))
+            node.add_leaf(Text("result", style="bold #94a3b8"))
         for ln in (result_text.splitlines() or [""]):
-            node.add_leaf(Text(ln, style="dim"))
+            node.add_leaf(colorize_tool_text(ln, result=True))
         if self._cur_tool_node is node:
             self._cur_tool_node = None
         for n, t in self._all_tool_nodes:
             if n is node:
                 t.refresh()
                 break
+        self._mount_links(result_text)
 
     def _do_append_tool_log(self, tool_id, stream, text):
         node = self._node_registry.get(tool_id)
         if node is None:
             return
-        style = "dim" if stream == "stdout" else "bold #fbbf24"
-        node.add_leaf(Text(f"{stream}: {text}", style=style))
+        node.add_leaf(tool_log_label(stream, text))
         for n, tree in self._all_tool_nodes:
             if n is node:
                 tree.refresh()
                 break
+        self._mount_links(text)
 
     def _do_append_text(self, text):
         if self._cur_ai_bubble is None:
             return
         self._cur_ai_text += text
         self._cur_ai_bubble.update(self._cur_ai_text)
+        self._mount_links(text)
         convo = self.query_one("#convo", VerticalScroll)
         convo.scroll_end(animate=False)
+
+    def _mount_links(self, text):
+        """Add actual Link widgets, which Textual opens on click or Enter."""
+        if self._cur_turn is None:
+            return
+        for url in extract_urls(text):
+            if url in self._cur_links:
+                continue
+            self._cur_links.add(url)
+            self._cur_turn.mount(Link(url, url=url, tooltip="Open in browser", classes="reply-link"))
 
     def _do_hide_thinking(self):
         if self._cur_thinking is not None:
@@ -530,7 +632,8 @@ class PriyaApp(App):
         card, options = state["card"], state["options"]
         if options is not None:
             options.remove()
-        card.mount(Static(f"Answer: {answer}", classes="ask-answer"))
+        if card is not None:
+            card.remove()
         state["answers"].append(answer)
         state["index"] += 1
         if state["index"] < len(state["questions"]):
@@ -541,6 +644,45 @@ class PriyaApp(App):
         self._question_state = None
         self._set_status(f"  {SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]}  {MODEL_NAME} is working…")
         self.send_question_answers(payload)
+        return True
+
+    def _do_edit_approval(self, edit_id, path, diff):
+        if (self._cur_turn is None or self._question_state is not None
+                or self._edit_approval_state is not None):
+            return
+        options = OptionList(
+            Option("Approve — apply this exact diff", id="approve"),
+            Option("Cancel — leave the file unchanged", id="cancel"),
+            classes="ask-options", id="edit-approval-options",
+        )
+        card = Vertical(
+            Static("Review edit", classes="ask-header"),
+            Static(path, classes="ask-prompt"),
+            Static(Text(diff or "(no textual diff)"), classes="edit-diff"),
+            options,
+            Static("↑/↓ then Enter to approve or cancel", classes="ask-help"),
+            classes="ask-question",
+        )
+        self._edit_approval_state = {"id": edit_id, "card": card, "options": options}
+        self._set_status("  ?  Waiting for edit approval", "#a5b4fc")
+        self._cur_turn.mount(card)
+        self.call_after_refresh(options.focus)
+        self.call_after_refresh(self.query_one("#convo", VerticalScroll).scroll_end, animate=False)
+
+    def _answer_edit_approval(self, approved):
+        state = self._edit_approval_state
+        if state is None:
+            return False
+        options = state["options"]
+        if options is not None:
+            options.remove()
+        state["card"].mount(Static(
+            "Edit approved" if approved else "Edit cancelled", classes="ask-answer",
+        ))
+        payload = {"id": state["id"], "approved": approved}
+        self._edit_approval_state = None
+        self._set_status(f"  {SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]}  {MODEL_NAME} is working…")
+        self.send_edit_approval(payload)
         return True
 
     def _do_end_turn(self):
@@ -555,6 +697,7 @@ class PriyaApp(App):
         self._cur_ai_bubble = None
         self._cur_tool_node = None
         self._question_state = None
+        self._edit_approval_state = None
 
     def _do_interrupted(self):
         """Immediately reflect Esc, before the worker finishes cancelling."""
@@ -612,6 +755,14 @@ class PriyaApp(App):
                 if card is not None:
                     card.mount(Static("Question cancelled", classes="ask-answer"))
                 self._question_state = None
+            if self._edit_approval_state is not None:
+                options = self._edit_approval_state.get("options")
+                card = self._edit_approval_state.get("card")
+                if options is not None:
+                    options.remove()
+                if card is not None:
+                    card.mount(Static("Edit cancelled", classes="ask-answer"))
+                self._edit_approval_state = None
             self._do_interrupted()
             with self._stdin_lock:
                 self.proc.stdin.write("<<PRIYA_INTERRUPT>>\n")
@@ -628,6 +779,13 @@ class PriyaApp(App):
             return
         if self._question_state is not None:
             self._answer_question(text)
+            return
+        if self._edit_approval_state is not None:
+            normalized = text.casefold()
+            if normalized in ("approve", "approved", "yes", "y"):
+                self._answer_edit_approval(True)
+            elif normalized in ("cancel", "no", "n"):
+                self._answer_edit_approval(False)
             return
         if text.lower() == "q":
             self.exit()
@@ -648,6 +806,15 @@ class PriyaApp(App):
             self.ui_q.put(WorkerClosed())
 
     @work(thread=True)
+    def send_edit_approval(self, payload):
+        try:
+            with self._stdin_lock:
+                self.proc.stdin.write("<<EDIT_APPROVAL>>" + json.dumps(payload) + "\n")
+                self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self.ui_q.put(WorkerClosed())
+
+    @work(thread=True)
     def send_question_answers(self, payload):
         """Return a completed interactive question to the waiting worker call."""
         try:
@@ -659,10 +826,12 @@ class PriyaApp(App):
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected):
         state = self._question_state
-        if state is None or event.option_list is not state["options"]:
-            return
-        if event.option.id is not None:
+        if state is not None and event.option_list is state["options"] and event.option.id is not None:
             self._answer_question(str(event.option.id))
+            return
+        state = self._edit_approval_state
+        if state is not None and event.option_list is state["options"] and event.option.id is not None:
+            self._answer_edit_approval(event.option.id == "approve")
 
     @work(exclusive=True, thread=True)
     def read_worker(self):
@@ -745,6 +914,19 @@ class PriyaApp(App):
                 except (json.JSONDecodeError, KeyError, ValueError):
                     continue
                 self.ui_q.put(AskUserQuestion(question_id, questions))
+                continue
+
+            if line.startswith("<<EDIT_APPROVAL>>"):
+                try:
+                    payload = json.loads(line[len("<<EDIT_APPROVAL>>"):])
+                    edit_id = payload["id"]
+                    path = payload["path"]
+                    diff = payload["diff"]
+                    if not isinstance(path, str) or not isinstance(diff, str):
+                        raise ValueError("invalid edit approval")
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue
+                self.ui_q.put(EditApproval(edit_id, path, diff))
                 continue
 
             if line.startswith("<<TOOL_END>>"):

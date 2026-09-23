@@ -46,8 +46,11 @@ Press `Ctrl+C` to exit. In the input field, enter `q` to quit.
 
 ## Tools
 
-The model can call `bash` for local shell work and `agentjob` to delegate a
-background coding task. Expand a running `bash` tool in the UI to follow its
+The model can call `bash` for local shell work and `agentjob` for non-trivial
+front-end implementation in this repository, including pages, components,
+layouts, styles, and browser interactions. `agentjob` runs in the background;
+the model checks its progress and reviews the changed files before reporting
+completion. Expand a running `bash` tool in the UI to follow its
 stdout and stderr; the final result is appended after the live log. `agentjob`
 uses the repository-local runner at `tools/job_runner.py`. Its transient job
 state and logs live under `.priya/jobs/` (ignored by Git).
@@ -65,6 +68,11 @@ they are stopped by their returned process-group PID.
 Priya can also schedule session-scoped prompts through its cron tools. Schedules
 use local-time numeric five-field cron expressions, wait for an idle model turn
 before running, expire after three days, and disappear when Priya exits.
+
+For surgical changes to existing text files, Priya uses `Read` followed by
+`Edit`. Edit requires the file to be unchanged since its read, replaces an
+exact old-text match (or every match when explicitly requested), displays a
+unified diff, and waits for approval before writing.
 
 The model can also publish a self-contained interactive HTML artifact. Artifact
 revisions are saved under `.priya/artifacts/`, and its local server refreshes

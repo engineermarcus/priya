@@ -14,9 +14,15 @@ transient job state and logs are stored in `.priya/jobs/` and are not tracked.
 - `agentjob stop <job_id>` → terminates the job process group and preserves its
   transcript/status files.
 
-Use it for substantial independent work. It is non-blocking: spawn, then poll
-status or read the log rather than waiting in the foreground. The complete
-lifecycle above was manually verified against the local runner.
+Use `agentjob` as the default implementation path for any non-trivial front-end
+change in this repository: pages, components, layout, styling, responsive
+behavior, and browser interactions. Spawn even when the task is fully specified;
+only tiny one-line UI fixes are small enough to do directly. Include concrete
+requirements, relevant paths, constraints, and verification instructions. It is
+non-blocking: spawn, continue independent inspection, poll status and read the
+log, then inspect the changed files and verify them before reporting completion.
+Use it for repository UI implementation; use the artifact tool for standalone
+browser deliverables that do not belong in the source tree.
 
 # IMPLEMENTED: BASH
 
@@ -88,9 +94,21 @@ five-field syntax: `minute hour day-of-month month day-of-week`.
 - Due prompts wait until Priya is between model turns, then appear as a
   scheduled turn and execute without interrupting an active response.
 
+# IMPLEMENTED: READ, EDIT
+
+`Read` and `Edit` provide a reviewable path for precise changes to existing
+UTF-8 text files. A file must be read through `Read` and remain unchanged
+before `Edit` can propose a replacement. Priya shows a unified diff and waits
+for the user's approval; cancelling leaves the file untouched.
+
+- `Read {path}` → file content and canonical path.
+- `Edit {path, old_string, new_string, replace_all?}` → replaces one exact
+  unique match, or every match only when `replace_all: true` is specified.
+- Edits reject missing or ambiguous old text, stale reads, and changes made
+  while approval is pending.
+
 # COMING SOON
 
-- Edit
 - EnterPlanMode
 - EnterWorktree
 - ExitPlanMode
@@ -101,7 +119,6 @@ five-field syntax: `minute hour day-of-month month day-of-week`.
 - ListMcpResourcesTool
 - Monitor
 - PushNotification
-- Read
 - ReadMcpResourceTool
 - RemoteTrigger
 - ReportFindings

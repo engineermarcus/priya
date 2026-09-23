@@ -9,6 +9,8 @@ import threading
 import time
 import signal
 import uuid
+import difflib
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -140,24 +142,26 @@ agentjob_declaration = types.FunctionDeclaration(
     name="agentjob",
     behavior="NON_BLOCKING",
     description=(
-        "Manage a background coding subagent (Gemini 3.5 Flash Lite with shell access). "
-        "Use it ONLY for substantial, self-contained web front-end tasks involving "
-        "React, Next.js, HTML, CSS, or JavaScript. Do not delegate backend, systems, "
-        "data, debugging, analysis, testing, or other heavy tasks: handle those yourself "
-        "with bash. 'spawn' runs a qualifying web task in the background, non-blocking. "
-        "Use 'status' to poll progress (never blocks). "
-        "Use 'log' to read its transcript. Use 'send' to steer it (applies at its next "
-        "turn boundary, not mid-generation). Use 'stop' to hard-kill it; partial files "
-        "remain in its workdir for you to inspect or finish yourself."
+        "Delegate non-trivial front-end implementation in this repository to this "
+        "background coding agent. This includes adding or substantially changing a "
+        "page, component, layout, styling, responsive behavior, or browser interaction "
+        "in React, Next.js, HTML, CSS, or JavaScript. For those tasks, spawn the agent "
+        "as the default first implementation step, even when the task is clear or you "
+        "could implement it directly. Tiny one-line UI fixes and non-front-end work stay "
+        "local. Spawn returns immediately; use status and log to follow progress, then "
+        "inspect changed files and verify the result yourself before reporting completion. "
+        "Use send to steer the agent at its next turn boundary. Use stop to terminate a "
+        "job; partial files remain in its workdir. If the user asks to build or change "
+        "this repository's website or UI, use this tool, not artifact."
     ),
     parameters={
         "type": "OBJECT",
         "properties": {
-            "action": {"type": "STRING", "enum": ["spawn", "status", "log", "send", "stop"]},
-            "task": {"type": "STRING", "description": "Required for 'spawn'."},
-            "workdir": {"type": "STRING", "description": "Optional for 'spawn'."},
-            "job_id": {"type": "STRING", "description": "Required for status/log/send/stop."},
-            "message": {"type": "STRING", "description": "Required for 'send'."},
+            "action": {"type": "STRING", "enum": ["spawn", "status", "log", "send", "stop"], "description": "Use spawn for non-trivial repository front-end implementation; status/log to follow and review it."},
+            "task": {"type": "STRING", "description": "For spawn: concrete UI requirements, relevant paths, constraints, and requested verification."},
+            "workdir": {"type": "STRING", "description": "Optional project directory; omit to use Priya's repository root."},
+            "job_id": {"type": "STRING", "description": "Job ID returned by spawn; required for status/log/send/stop."},
+            "message": {"type": "STRING", "description": "Required for send; instructions for the running agent's next turn."},
         },
         "required": ["action"],
     },
@@ -206,16 +210,23 @@ artifact_declaration = types.FunctionDeclaration(
     name="artifact",
     behavior="NON_BLOCKING",
     description=(
-        "Publish versioned interactive HTML artifacts, serve them locally, inspect "
-        "their history, revert a version, or explicitly expose the local server with "
-        "cloudflared. Use publish with complete self-contained HTML."
+        "Create and manage a standalone browser deliverable, separate from this "
+        "repository's source code. Use this only when the user wants a one-off visual "
+        "result opened in a browser rather than an implementation in the repository. "
+        "For changes to this repository's website or UI, use agentjob instead. The normal lifecycle "
+        "is: publish complete self-contained HTML using a stable lowercase slug; start "
+        "the local server; report start.url + publish.url as the browser URL. Publishing "
+        "again under the same name creates a version and refreshes an already-open stable "
+        "artifact page automatically. list/history inspect artifacts; revert selects a "
+        "known history version; stop stops the local server; share creates a public "
+        "cloudflared tunnel only after the user explicitly asks for public sharing."
     ),
     parameters={
         "type": "OBJECT",
         "properties": {
-            "action": {"type": "STRING", "enum": ["publish", "list", "history", "revert", "start", "stop", "share"]},
-            "name": {"type": "STRING", "description": "Artifact slug; required for publish, history, and revert."},
-            "html": {"type": "STRING", "description": "Complete HTML document; required for publish."},
+            "action": {"type": "STRING", "enum": ["publish", "list", "history", "revert", "start", "stop", "share"], "description": "publish creates a revision; start serves it; list/history/revert inspect or select versions; share is explicit-public only."},
+            "name": {"type": "STRING", "description": "Stable lowercase slug ([a-z0-9_-]); required for publish, history, and revert."},
+            "html": {"type": "STRING", "description": "Complete standalone HTML document with inline CSS and JavaScript; required for publish. Do not provide a fragment or a repository file path."},
             "title": {"type": "STRING", "description": "Optional browser title for publish."},
             "version": {"type": "STRING", "description": "Version ID required for revert."},
             "port": {"type": "INTEGER", "description": "Optional local server port for start; defaults to 8765."},
@@ -305,6 +316,47 @@ cron_list_declaration = types.FunctionDeclaration(
     name="CronList",
     description="List active session-scoped scheduled prompts and their next local run time.",
     parameters={"type": "OBJECT", "properties": {}},
+)
+
+
+read_declaration = types.FunctionDeclaration(
+    name="Read",
+    description=(
+        "Read an existing UTF-8 text file before proposing an Edit. Edit rejects "
+        "files that have not first been read through this tool, or that changed "
+        "after being read."
+    ),
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "path": {"type": "STRING", "description": "Path to an existing text file."},
+        },
+        "required": ["path"],
+    },
+)
+
+
+edit_declaration = types.FunctionDeclaration(
+    name="Edit",
+    behavior="BLOCKING",
+    description=(
+        "The preferred way to modify an existing UTF-8 text file: make one narrow, "
+        "reviewable replacement instead of rewriting the file. First call Read on the "
+        "path, then pass exact old_string and new_string. Include enough surrounding "
+        "context to make old_string unique; use replace_all=true only when every "
+        "occurrence must change. Edit displays a unified diff and blocks for the user's "
+        "approval. It writes nothing if rejected, cancelled, stale, missing, or ambiguous."
+    ),
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "path": {"type": "STRING", "description": "Path previously passed to Read."},
+            "old_string": {"type": "STRING", "description": "Exact existing text to replace."},
+            "new_string": {"type": "STRING", "description": "Replacement text."},
+            "replace_all": {"type": "BOOLEAN", "description": "Replace every match; defaults to false."},
+        },
+        "required": ["path", "old_string", "new_string"],
+    },
 )
 
 
@@ -491,20 +543,36 @@ Tool-use policy:
   block the conversation; it returns immediately with a PID and log paths.
   Keep finite checks such as tests and builds in the foreground when their
   result is needed before you reply.
-- `agentjob` is a narrowly scoped background web-front-end helper, not a
-  general-purpose delegation tool. Use it only for a substantial,
-  self-contained React, Next.js, HTML, CSS, or JavaScript front-end task where
-  parallel work is genuinely useful. Do not use it for backend work, systems
-  work, data work, debugging, analysis, tests, research, or any other heavy
-  task: handle those directly yourself with `bash`. For a qualifying task,
-  `spawn` is non-blocking; then use `status` and/or `log` to inspect progress
-  or completion. Never say a subagent completed work until you have checked
-  its output yourself with `bash` or its log. Use `send` to steer it and `stop`
-  only to cancel it.
-- `artifact` publishes a complete interactive HTML page with revision history.
-  Use it when a browser-rendered visual, dashboard, demo, or interactive result
-  is materially more useful than terminal text. Use `start` to serve locally,
-  and use `share` only when the user explicitly wants a public tunnel.
+- `agentjob` is Priya's implementation path for non-trivial front-end changes
+  in this repository. When the user asks to build or substantially change a
+  browser UI, page, component, layout, styling, responsive behavior, or
+  interaction in React, Next.js, HTML, CSS, or JavaScript, you MUST call
+  `agentjob` with `action: "spawn"` as the first implementation step. Apply
+  this even when the request is clear or you could code it yourself; do not
+  use "parallel work might help" as a reason to skip delegation. Only a tiny
+  one-line UI fix is small enough to handle directly. Keep backend, systems,
+  data, and other non-front-end work local. Give the agent concrete
+  requirements, relevant paths, constraints, and a verification request.
+  Spawn returns immediately; do independent inspection or planning while it
+  works, poll `status` and read `log`, then inspect its changed files and
+  verify the result yourself before reporting completion. Use `send` to steer
+  it and `stop` to cancel it. Use `artifact` for standalone visual deliverables
+  that should be opened in a browser rather than added to this repository.
+- `artifact` creates a standalone browser deliverable rather than changing this
+  repository's website or application. Use it when the user wants a one-off
+  interactive visual result opened in a browser; do not use it for implementing
+  or changing this repository's UI (use `agentjob`), ordinary code edits, static
+  prose, or a terminal-only answer.
+  Its normal workflow is: (1) compose a complete, self-contained HTML document
+  with inline CSS/JS; (2) `artifact publish` it under a stable lowercase slug;
+  (3) `artifact start`; (4) report the full browser URL by joining `start.url`
+  with the `publish.url` path. Never tell the user an artifact exists without
+  publishing it. Publishing the same slug again creates a revision and an open
+  artifact page refreshes automatically; use that for iterations. Use `list` or
+  `history` to inspect, `revert` only with a version returned by history, `stop`
+  to stop local serving, and `share` only when the user explicitly requests a
+  public URL (it requires cloudflared). Do not use `bash` to hand-roll artifact
+  storage or serving when this tool fits.
 - `askUserQuestion` pauses for one to four structured choices. Use it before
   code changes when an unresolved product, design, scope, or implementation
   decision would materially affect the result. Offer concise, distinct options
@@ -516,16 +584,29 @@ Tool-use policy:
   expression and jobs expire within three days. Use `recurring: false` for the
   next matching occurrence only. Use CronList before changing or deleting an
   existing schedule, and CronDelete with the returned job ID to cancel it.
+- `Edit` is a first-class, approval-gated editor for changing an existing
+  UTF-8 text file. Prefer it over a `bash` rewrite whenever the requested
+  change is a targeted replacement. Its required workflow is: (1) call `Read`
+  for the path; (2) identify an exact `old_string` from that result and supply
+  its `new_string`; (3) if the old text is duplicated, add surrounding context
+  until it is unique, or use `replace_all: true` only when every copy should
+  change; (4) wait for the user to approve the displayed unified diff. Do not
+  claim the change landed unless Edit returns `approved: true` and
+  `changed: true`. If it reports a stale read, re-read before proposing again;
+  if the user declines or cancels, leave the file alone. Do not use `bash` to
+  bypass this approval flow for ordinary edits. Use `bash` only for file
+  creation, broad generated output, or an operation that cannot be expressed
+  as a precise text replacement.
 
 Working style:
 - Prefer doing useful work now over merely describing how the user could do it.
   For a request to build, fix, change, investigate, or verify, make the needed
   tool calls before replying. For a purely conversational or general knowledge
   question, answer directly unless a local check would improve correctness.
-- Select the smallest suitable tool: `bash` for all direct work, including
-  heavy non-front-end work; `agentjob` only for qualifying web-front-end work;
-  `artifact` for visual output; and `askUserQuestion` for a consequential
-  missing decision. Do not use `agentjob` merely to avoid doing difficult work.
+- Select the suitable tool: `bash` for inspection and direct non-front-end
+  work; `agentjob` for non-trivial front-end implementation in the repository;
+  `artifact` for standalone browser deliverables; and `askUserQuestion` for a
+  consequential missing decision. Do not use `agentjob` for non-front-end work.
 - Report what actually happened, including relevant command/test results. If a
   tool fails, state its real returned error and either try a sensible recovery
   or explain the concrete blocker; never invent a generic system error.
@@ -575,6 +656,7 @@ CONFIG = types.LiveConnectConfig(
         agentjob_declaration, artifact_declaration, bash_declaration,
         ask_user_question_declaration, cron_create_declaration,
         cron_delete_declaration, cron_list_declaration,
+        read_declaration, edit_declaration,
     ])],
 )
 
@@ -677,6 +759,9 @@ class TextLoop:
         self._tool_event_id = 0
         self._question_event_id = 0
         self._pending_question = None
+        self._edit_event_id = 0
+        self._pending_edit = None
+        self._read_files = {}
         self._active_bash_cancel = None
         self.mic_processor = MicrophoneProcessor() if MIC else None
         self._discard_until_idle = False
@@ -750,6 +835,7 @@ class TextLoop:
         if self._active_bash_cancel is not None:
             self._active_bash_cancel.set()
         self._resolve_pending_question({"cancelled": True})
+        self._resolve_pending_edit({"cancelled": True})
         if self.mic_processor is not None:
             self.mic_processor.reset()
         if self.session is not None:
@@ -788,6 +874,23 @@ class TextLoop:
                     print("received askUserQuestion answer for a different question", file=sys.stderr)
                     continue
                 self._resolve_pending_question(answer)
+                continue
+            if text.startswith("<<EDIT_APPROVAL>>"):
+                try:
+                    approval = json.loads(text[len("<<EDIT_APPROVAL>>"):])
+                except json.JSONDecodeError:
+                    print("invalid Edit approval", file=sys.stderr)
+                    continue
+                if not isinstance(approval, dict):
+                    print("invalid Edit approval", file=sys.stderr)
+                    continue
+                if self._pending_edit is None:
+                    print("received Edit approval with no pending edit", file=sys.stderr)
+                    continue
+                if approval.get("id") != self._pending_edit["id"]:
+                    print("received Edit approval for a different edit", file=sys.stderr)
+                    continue
+                self._resolve_pending_edit(approval)
                 continue
             if self.session is not None:
                 # The UI remains usable after Esc, but Gemini must finish its
@@ -841,6 +944,105 @@ class TextLoop:
         pending = self._pending_question
         if pending is not None and not pending["future"].done():
             pending["future"].set_result(answer)
+
+    def _resolve_pending_edit(self, approval):
+        pending = self._pending_edit
+        if pending is not None and not pending["future"].done():
+            pending["future"].set_result(approval)
+
+    @staticmethod
+    def _edit_path(path):
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("Edit requires a non-empty path")
+        return os.path.realpath(os.path.abspath(path))
+
+    @staticmethod
+    def _read_text_file(path):
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as source:
+                return source.read()
+        except FileNotFoundError:
+            raise ValueError(f"file does not exist: {path}")
+        except IsADirectoryError:
+            raise ValueError(f"path is a directory: {path}")
+        except UnicodeDecodeError:
+            raise ValueError(f"file is not valid UTF-8 text: {path}")
+        except OSError as error:
+            raise ValueError(f"could not read {path}: {error}")
+
+    async def read_file(self, args):
+        try:
+            path = self._edit_path(args.get("path"))
+            content = self._read_text_file(path)
+        except ValueError as error:
+            return {"error": str(error)}
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        self._read_files[path] = digest
+        return {"path": path, "content": content, "bytes": len(content.encode("utf-8"))}
+
+    async def request_edit_approval(self, path, diff):
+        self._edit_event_id += 1
+        edit_id = self._edit_event_id
+        future = asyncio.get_running_loop().create_future()
+        self._pending_edit = {"id": edit_id, "future": future}
+        out("<<EDIT_APPROVAL>>" + json.dumps({"id": edit_id, "path": path, "diff": diff}))
+        try:
+            return await future
+        finally:
+            self._pending_edit = None
+
+    async def edit_file(self, args):
+        path_arg = args.get("path")
+        old_string = args.get("old_string")
+        new_string = args.get("new_string")
+        replace_all = args.get("replace_all", False)
+        if not isinstance(old_string, str) or not old_string:
+            return {"error": "Edit requires a non-empty old_string"}
+        if not isinstance(new_string, str):
+            return {"error": "Edit requires new_string to be a string"}
+        if old_string == new_string:
+            return {"error": "old_string and new_string are identical"}
+        if not isinstance(replace_all, bool):
+            return {"error": "Edit requires replace_all to be true or false"}
+        try:
+            path = self._edit_path(path_arg)
+            content = self._read_text_file(path)
+        except ValueError as error:
+            return {"error": str(error)}
+        current_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if self._read_files.get(path) != current_digest:
+            return {"error": "Edit requires Read on this unchanged file first"}
+        matches = content.count(old_string)
+        if not matches:
+            return {"error": "old_string was not found in the file"}
+        if matches > 1 and not replace_all:
+            return {"error": f"old_string occurs {matches} times; add context or set replace_all: true"}
+        updated = content.replace(old_string, new_string, -1 if replace_all else 1)
+        diff = "".join(difflib.unified_diff(
+            content.splitlines(keepends=True), updated.splitlines(keepends=True),
+            fromfile=path, tofile=path,
+        ))
+        approval = await self.request_edit_approval(path, diff)
+        if approval.get("cancelled") or not approval.get("approved"):
+            return {"approved": False, "path": path, "changed": False}
+        # Recheck after approval so a concurrent edit cannot be overwritten.
+        try:
+            current = self._read_text_file(path)
+        except ValueError as error:
+            return {"error": str(error)}
+        if current != content:
+            return {"error": "file changed while awaiting approval; Read it again before editing"}
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as destination:
+                destination.write(updated)
+        except OSError as error:
+            return {"error": f"could not write {path}: {error}"}
+        self._read_files[path] = hashlib.sha256(updated.encode("utf-8")).hexdigest()
+        return {
+            "approved": True, "path": path, "changed": True,
+            "replacements": matches if replace_all else 1,
+            "diff": diff,
+        }
 
     async def ask_user_question(self, args):
         questions, error = self._validate_questions(args.get("questions"))
@@ -1062,6 +1264,10 @@ class TextLoop:
                                     result = await self.cron_delete(args_dict)
                                 elif fc.name == "CronList":
                                     result = await self.cron_list(args_dict)
+                                elif fc.name == "Read":
+                                    result = await self.read_file(args_dict)
+                                elif fc.name == "Edit":
+                                    result = await self.edit_file(args_dict)
                                 else:
                                     result = {"error": f"unknown tool {fc.name}"}
                                 print(f"TOOL CALL: {fc.name} {args_dict} -> {result}", file=sys.stderr)
