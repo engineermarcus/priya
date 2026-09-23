@@ -20,7 +20,7 @@ import subprocess
 from google import genai
 from google.genai import types
 
-MODEL = "models/gemini-3.8-live-extended-thinking"
+MODEL = "models/gemini-3.8-live"
 TALK = "--talk" in sys.argv[1:]
 
 client = genai.Client(
@@ -32,7 +32,9 @@ AGENTJOB_BIN = os.path.expanduser("~/agent/job_runner.py")
 
 agentjob_declaration = types.FunctionDeclaration(
     name="agentjob",
-    behavior="NON_BLOCKING",
+    behavior="BLOCKING",  # gemini-3.8-live (non-extended-thinking) supports
+                          # BLOCKING; using it to avoid the async tool-call
+                          # path that was silently dropping calls.
     description=(
         "Manage a background coding subagent (Gemini 3.5 Flash Lite with shell access). "
         "Use 'spawn' to delegate a self-contained build/fix task - it runs in the "
@@ -95,7 +97,7 @@ def run_agentjob(args: dict) -> dict:
 
 bash_declaration = types.FunctionDeclaration(
     name="bash",
-    behavior="NON_BLOCKING",
+    behavior="BLOCKING",  # see note on agentjob_declaration above.
     description=(
         "Run a bash command directly and return its output. Use this to read/write "
         "files, inspect a subagent's workdir, verify a subagent's claims, check "
@@ -143,9 +145,6 @@ CONFIG = types.LiveConnectConfig(
         "can keep talking with the user; use bash directly for quick checks, reading "
         "files, or verifying a subagent's work. Never trust a subagent's 'done' claim "
         "without checking its log or output yourself."
-    ),
-    thinking_config=types.ThinkingConfig(
-        thinking_level="medium",
     ),
     speech_config=types.SpeechConfig(
         voice_config=types.VoiceConfig(

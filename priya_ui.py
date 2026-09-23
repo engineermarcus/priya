@@ -11,6 +11,7 @@ and ">" only ever appears in the input line, never in the transcript.
 """
 
 import os
+import re
 import sys
 import json
 import queue
@@ -20,6 +21,7 @@ import time
 
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
@@ -27,7 +29,7 @@ from prompt_toolkit.styles import Style
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(DIR, "live_cli.py")
-MODEL_NAME = "gemini-3.8-live-extended-thinking"
+MODEL_NAME = "gemini-3.8-live"
 
 SENTINEL = object()
 
@@ -48,7 +50,7 @@ style = Style.from_dict({
     "rule": "fg:#3a3a3a",
 
     "text.you": "fg:#ffffff bold",
-    "text.ai": "",  # plain default terminal foreground — no arbitrary tint
+    "text.ai": "fg:#b0b0b0",
     "text.frozen": "fg:#555555 italic",
 
     "input.idle": "fg:#ffffff",
@@ -61,10 +63,58 @@ style = Style.from_dict({
     "tool.hint": "fg:#888888 italic",
     "tool.dropdown": "fg:#555555",
     "tool.output": "fg:#7a7a7a",
+    "tool.json.key": "fg:#5fafd7",
+    "tool.json.string": "fg:#87af5f",
+    "tool.json.number": "fg:#d78700",
+    "tool.json.bool": "fg:#d75f5f",
+    "tool.json.punct": "fg:#7a7a7a",
 
-    "prompt-gutter": "fg:#ff5555 bold",
+    "prompt-gutter": "fg:#999999 bold",
     "status-bar": "fg:#666666",
 })
+
+_KV_RE = re.compile(r'^(\s*)"((?:[^"\\]|\\.)*)"\s*:\s*(.*)$')
+_STR_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"(,?)$')
+_NUM_RE = re.compile(r'^(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(,?)$')
+_BOOL_RE = re.compile(r'^(true|false|null)(,?)$')
+
+
+def colorize_json_value(value):
+    m = _STR_RE.match(value)
+    if m:
+        s, comma = m.groups()
+        return [
+            ("class:tool.json.punct", '"'),
+            ("class:tool.json.string", s),
+            ("class:tool.json.punct", '"' + comma),
+        ]
+    m = _NUM_RE.match(value)
+    if m:
+        n, comma = m.groups()
+        return [("class:tool.json.number", n), ("class:tool.json.punct", comma)]
+    m = _BOOL_RE.match(value)
+    if m:
+        b, comma = m.groups()
+        return [("class:tool.json.bool", b), ("class:tool.json.punct", comma)]
+    return [("class:tool.json.punct", value)] if value else []
+
+
+def colorize_json_line(line):
+    indent_len = len(line) - len(line.lstrip(" "))
+    indent, rest = line[:indent_len], line[indent_len:]
+    frags = [("class:tool.output", indent)] if indent else []
+
+    m = _KV_RE.match(rest)
+    if m:
+        _, key, value = m.groups()
+        frags.append(("class:tool.json.punct", '"'))
+        frags.append(("class:tool.json.key", key))
+        frags.append(("class:tool.json.punct", '": '))
+        frags.extend(colorize_json_value(value))
+        return frags
+
+    frags.extend(colorize_json_value(rest))
+    return frags
 
 
 class SpinnerEntry:
@@ -99,7 +149,9 @@ class ToolEntry:
             body = self.result if self.result is not None else "running..."
             lines.append(("class:tool.dropdown", "  \u2514\u2500\n"))  # └─
             for line in body.splitlines() or [""]:
-                lines.append(("class:tool.output", f"     {line}\n"))
+                lines.append(("class:tool.output", "     "))
+                lines.extend(colorize_json_line(line))
+                lines.append(("class:tool.output", "\n"))
         return lines
 
 
@@ -180,24 +232,34 @@ def main():
     app_ref = {}  # filled in once Application exists; refresh() closes over it
 
     output_control = FormattedTextControl(lambda: state.render_fragments())
+    def get_vertical_scroll(window):
+        # Documented prompt_toolkit hook (see Window's get_vertical_scroll
+        # param): return the preferred scroll position each render. While
+        # following, pin to the bottom of the *previously measured*
+        # content/window height — the correct, clamp-respecting way to
+        # auto-scroll a cursor-less Window.
+        if follow_bottom[0]:
+            info = window.render_info
+            if info is not None:
+                return max(0, info.content_height - info.window_height)
+        return window.vertical_scroll
+
     output_window = Window(
         content=output_control,
         wrap_lines=True,
         always_hide_cursor=True,
-        allow_scroll_beyond_bottom=True,
+        get_vertical_scroll=get_vertical_scroll,
     )
 
     def refresh():
-        # Any time content changes, keep the view pinned to the newest
-        # line unless the user has manually scrolled up. A very large
-        # scroll value is clamped to the real max by prompt_toolkit's
-        # own renderer, so this is a cheap way to say "show the end".
-        if follow_bottom[0]:
-            output_window.vertical_scroll = 1 << 30
+        # Re-render; get_vertical_scroll() (passed to output_window above)
+        # handles pinning to the bottom while follow_bottom[0] is True.
         if "app" in app_ref:
             app_ref["app"].invalidate()
 
     busy = [False]  # True from send until <<END>> (or an Esc interrupt)
+    mouse_enabled = [False]  # off by default so native text selection/copy works;
+                              # toggle with F2 when you want the wheel to scroll
 
     def input_style():
         return "class:input.busy" if busy[0] else "class:input.idle"
@@ -214,7 +276,7 @@ def main():
 
     status_window = Window(
         content=FormattedTextControl(
-            lambda: [("class:status-bar", f"  {status_text[0]:<20} Ctrl+O expand/collapse   Ctrl+S save transcript   Ctrl+C quit")]
+            lambda: [("class:status-bar", f"  {status_text[0]:<20} F2 toggle mouse/copy   Ctrl+O expand/collapse   Ctrl+S save transcript   Ctrl+C quit")]
         ),
         height=1,
     )
@@ -254,31 +316,54 @@ def main():
     def _(event):
         event.app.exit()
 
-    def _scroll(delta):
+    @kb.add("f2")
+    def _(event):
+        mouse_enabled[0] = not mouse_enabled[0]
+        status_text[0] = "mouse: ON (wheel scrolls)" if mouse_enabled[0] else "mouse: off (native copy)"
+        event.app.invalidate()
+
+    def _scroll(direction, count):
         # output_window is not focused (input always is), so it doesn't
-        # get key events by default — drive its scroll position directly.
+        # get key events by default — drive it directly via the same
+        # _scroll_up/_scroll_down primitives prompt_toolkit's own
+        # mouse-wheel handling uses.
         follow_bottom[0] = False  # manual scroll breaks auto-follow
-        new_pos = max(0, output_window.vertical_scroll + delta)
-        output_window.vertical_scroll = new_pos
+        step = output_window._scroll_up if direction == "up" else output_window._scroll_down
+        for _ in range(count):
+            step()
+
+    def _page_size():
+        info = output_window.render_info
+        return info.window_height if info is not None else 10
 
     @kb.add("pageup")
     def _(event):
-        _scroll(-10)
+        _scroll("up", _page_size())
         event.app.invalidate()
 
     @kb.add("pagedown")
     def _(event):
-        _scroll(10)
+        _scroll("down", _page_size())
         event.app.invalidate()
 
     @kb.add("c-u")
     def _(event):
-        _scroll(-3)
+        _scroll("up", 3)
         event.app.invalidate()
 
     @kb.add("c-d")
     def _(event):
-        _scroll(3)
+        _scroll("down", 3)
+        event.app.invalidate()
+
+    @kb.add("up")
+    def _(event):
+        _scroll("up", 1)
+        event.app.invalidate()
+
+    @kb.add("down")
+    def _(event):
+        _scroll("down", 1)
         event.app.invalidate()
 
     @kb.add("enter")
@@ -334,7 +419,7 @@ def main():
         key_bindings=kb,
         style=style,
         full_screen=True,
-        mouse_support=True,  # lets the terminal's mouse wheel scroll output_window
+        mouse_support=Condition(lambda: mouse_enabled[0]),  # off by default; F2 to enable wheel-scroll
     )
     app_ref["app"] = app
     threading.Thread(target=spinner_thread, args=(app, state), daemon=True).start()
