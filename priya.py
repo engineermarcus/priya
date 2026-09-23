@@ -25,6 +25,7 @@ import json
 import queue
 import subprocess
 import threading
+from collections import deque
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
@@ -479,7 +480,7 @@ class PriyaApp(App):
         """
 
         tool_id_counter = 0
-        pending_tool_id = None
+        pending_tool_ids = deque()
         thinking_hidden = False
         deferred_tool_finishes = []
 
@@ -497,7 +498,7 @@ class PriyaApp(App):
                     # This arrives before the server begins its response for
                     # the spoken turn, preserving a normal conversation turn.
                     self.ui_q.put(MountTurn(text))
-                    pending_tool_id = None
+                    pending_tool_ids.clear()
                     thinking_hidden = False
                     deferred_tool_finishes.clear()
                 continue
@@ -509,7 +510,7 @@ class PriyaApp(App):
                 except (json.JSONDecodeError, KeyError):
                     name, detail = "tool", "(unparsed)"
                 tool_id_counter += 1
-                pending_tool_id = tool_id_counter
+                pending_tool_ids.append(tool_id_counter)
                 self.ui_q.put(AddToolNode(tool_id_counter, name, detail))
                 continue
 
@@ -521,15 +522,15 @@ class PriyaApp(App):
                 except (json.JSONDecodeError, KeyError):
                     result = None
                     result_text = "(unparsed result)"
-                if pending_tool_id is not None:
+                if pending_tool_ids:
+                    tool_id = pending_tool_ids.popleft()
                     stat = diff_stat(result)
                     # Hold the result until the model's next text is shown.
                     # Otherwise a tree refresh can consume the same Textual
                     # render frame as the first assistant transcription.
                     deferred_tool_finishes.append(
-                        FinishToolNode(pending_tool_id, result_text, stat)
+                        FinishToolNode(tool_id, result_text, stat)
                     )
-                pending_tool_id = None
                 continue
 
             if line == "<<END>>":
@@ -537,7 +538,7 @@ class PriyaApp(App):
                     self.ui_q.put(tool_finish)
                 deferred_tool_finishes.clear()
                 self.ui_q.put(EndTurn())
-                pending_tool_id = None
+                pending_tool_ids.clear()
                 thinking_hidden = False
                 # The backend is long-lived; keep reading for the next typed
                 # or microphone turn.

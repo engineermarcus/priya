@@ -279,63 +279,66 @@ class TextLoop:
     async def receive_text(self):
         while True:
             if self.session is not None:
-                idle = False
-                while not idle:
-                    turn = self.session.receive()
-                    try:
-                        while True:
-                            response = await asyncio.wait_for(turn.__anext__(), timeout=180)
-                            sc = response.server_content
-                            print(f"RAW: {response}", file=sys.stderr)
+                # A function-call stream ends immediately after its responses
+                # are sent. Gemini then opens a new stream for its answer. Do
+                # not end the frontend turn at that handoff or its audio
+                # transcription will have no assistant bubble to update.
+                saw_tool_call = False
+                reached_idle = False
+                timed_out = False
+                turn = self.session.receive()
+                try:
+                    while True:
+                        response = await asyncio.wait_for(turn.__anext__(), timeout=180)
+                        sc = response.server_content
+                        print(f"RAW: {response}", file=sys.stderr)
 
-                            emit_input_transcription(sc)
+                        emit_input_transcription(sc)
 
-                            if response.tool_call:
-                                function_responses = []
-                                for fc in response.tool_call.function_calls:
-                                    args_dict = dict(fc.args)
-                                    detail = args_dict.get("command") or args_dict.get("task") or json.dumps(args_dict)
-                                    out("<<TOOL_START>>" + json.dumps({"name": fc.name, "detail": detail}))
-                                    if fc.name == "agentjob":
-                                        result = await asyncio.to_thread(run_agentjob, args_dict)
-                                    elif fc.name == "bash":
-                                        result = await asyncio.to_thread(run_bash, args_dict)
-                                    else:
-                                        result = {"error": f"unknown tool {fc.name}"}
-                                    print(f"TOOL CALL: {fc.name} {args_dict} -> {result}", file=sys.stderr)
-                                    out("<<TOOL_END>>" + json.dumps({"name": fc.name, "result": result}))
-                                    function_responses.append(
-                                        types.FunctionResponse(
-                                            id=fc.id, name=fc.name, response=result,
-                                        )
+                        if response.tool_call:
+                            saw_tool_call = True
+                            function_responses = []
+                            for fc in response.tool_call.function_calls:
+                                args_dict = dict(fc.args)
+                                detail = args_dict.get("command") or args_dict.get("task") or json.dumps(args_dict)
+                                out("<<TOOL_START>>" + json.dumps({"name": fc.name, "detail": detail}))
+                                if fc.name == "agentjob":
+                                    result = await asyncio.to_thread(run_agentjob, args_dict)
+                                elif fc.name == "bash":
+                                    result = await asyncio.to_thread(run_bash, args_dict)
+                                else:
+                                    result = {"error": f"unknown tool {fc.name}"}
+                                print(f"TOOL CALL: {fc.name} {args_dict} -> {result}", file=sys.stderr)
+                                out("<<TOOL_END>>" + json.dumps({"name": fc.name, "result": result}))
+                                function_responses.append(
+                                    types.FunctionResponse(
+                                        id=fc.id, name=fc.name, response=result,
                                     )
-                                await self.session.send_tool_response(
-                                    function_responses=function_responses
                                 )
+                            await self.session.send_tool_response(
+                                function_responses=function_responses
+                            )
 
-                            emit_content(sc)
+                        emit_content(sc)
 
-                            if TALK and response.data:
-                                self.player.stdin.write(response.data)
-                                self.player.stdin.flush()
+                        if TALK and response.data:
+                            self.player.stdin.write(response.data)
+                            self.player.stdin.flush()
 
-                            status = getattr(sc, "interaction_status", None) if sc is not None else None
-                            if status == "IDLE":
-                                idle = True
-                    except StopAsyncIteration:
-                        # The turn's generator ended on its own — this IS
-                        # end-of-turn even when no interaction_status ever
-                        # arrived. Previously this was `pass`, which left
-                        # idle False and looped back into a second
-                        # self.session.receive() that then blocked up to
-                        # 90s waiting for a turn that was already over,
-                        # so <<END>> never fired and the UI stayed "busy"
-                        # forever after ordinary replies like "Pong!".
-                        idle = True
-                    except asyncio.TimeoutError:
-                        print("receive_text: stalled turn, forcing end", file=sys.stderr)
-                        idle = True
-                out("<<END>>")
+                        status = getattr(sc, "interaction_status", None) if sc is not None else None
+                        if status == "IDLE":
+                            reached_idle = True
+                            break
+                except StopAsyncIteration:
+                    pass
+                except asyncio.TimeoutError:
+                    print("receive_text: stalled turn, forcing end", file=sys.stderr)
+                    timed_out = True
+
+                # A stream that carried tool calls is only the tool round. The
+                # next receive() stream carries the model's spoken/text answer.
+                if reached_idle or timed_out or not saw_tool_call:
+                    out("<<END>>")
 
     async def run(self):
         try:

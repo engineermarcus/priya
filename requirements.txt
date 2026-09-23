@@ -1,0 +1,4 @@
+google-genai==2.25.0
+textual==8.2.8
+rich==15.0.0
+PyAudio==0.2.14
