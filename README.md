@@ -48,12 +48,14 @@ Press `Ctrl+C` to exit. In the input field, enter `q` to quit.
 
 The model can call `bash` for local shell work and `agentjob` for non-trivial
 front-end implementation in this repository, including pages, components,
-layouts, styles, and browser interactions. `agentjob` runs in the background;
-the model checks its progress and reviews the changed files before reporting
-completion. Expand a running `bash` tool in the UI to follow its
-stdout and stderr; the final result is appended after the live log. `agentjob`
-uses the repository-local runner at `tools/job_runner.py`. Its transient job
-state and logs live under `.priya/jobs/` (ignored by Git).
+layouts, styles, and browser interactions. `agentjob` runs in the background,
+so Priya can continue a normal conversation while it works. Its agent narrates
+milestones, and its shell commands/output stream into the same expandable live
+tool log used by `bash`; neither requires a later `status` or `log` call.
+Priya still inspects and verifies the changed files before reporting completion.
+`agentjob` uses the repository-local runner at `tools/job_runner.py`. Its
+transient job state and append-only event journal live under `.priya/jobs/`
+(ignored by Git).
 
 For a development server, watcher, or other long-running local command, Priya
 can run `bash` in background mode. It immediately returns the process ID and

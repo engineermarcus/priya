@@ -3,24 +3,34 @@
 # IMPLEMENTED: AGENTJOB
 
 `agentjob` launches a non-blocking Gemini `gemini-3.5-flash-lite` coding
-subagent with shell access. The versioned runner is `tools/job_runner.py`;
-transient job state and logs are stored in `.priya/jobs/` and are not tracked.
+subagent. It has Priya-style `bash`, `Read`, and precise `Edit` tools, plus a
+`narrate` tool that it uses for concise live milestones. The versioned runner
+is `tools/job_runner.py`; transient job state and an append-only event journal
+are stored in `.priya/jobs/` and are not tracked. Priya tails that journal
+automatically, so the user sees narration and bash-like output while they can
+continue chatting normally.
 
 - `agentjob spawn "<task>" [workdir]` → `{job_id, workdir}`. Without a workdir,
   it works in the repository root.
 - `agentjob status <job_id>` → `{status, reason, turn, workdir, ...}`.
-- `agentjob log <job_id>` → current job transcript snapshot.
+- `agentjob log <job_id> [cursor]` → structured journal events after a cursor,
+  with `next_cursor` for the next incremental poll. Live UI tailing is automatic.
 - `agentjob send <job_id> "<message>"` → queues steering for the next turn.
 - `agentjob stop <job_id>` → terminates the job process group and preserves its
   transcript/status files.
+
+Transient agent/API failures retry automatically up to three times, with each
+retry shown in the live journal. If the job remains failed, Priya takes over
+with its local tools rather than abandoning the requested work.
 
 Use `agentjob` as the default implementation path for any non-trivial front-end
 change in this repository: pages, components, layout, styling, responsive
 behavior, and browser interactions. Spawn even when the task is fully specified;
 only tiny one-line UI fixes are small enough to do directly. Include concrete
 requirements, relevant paths, constraints, and verification instructions. It is
-non-blocking: spawn, continue independent inspection, poll status and read the
-log, then inspect the changed files and verify them before reporting completion.
+non-blocking: spawn, continue independent inspection or conversation while the
+live journal tails, then inspect the changed files and verify them before
+reporting completion.
 Use it for repository UI implementation; use the artifact tool for standalone
 browser deliverables that do not belong in the source tree.
 

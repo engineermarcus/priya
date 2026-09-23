@@ -8,9 +8,11 @@ Git; the runner itself is versioned in ``tools/``.
 
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -21,6 +23,8 @@ PYTHON = sys.executable
 MODEL = "gemini-3.5-flash-lite"
 MAX_TURNS = 60
 SHELL_TIMEOUT_SECONDS = 120
+MAX_EVENT_MESSAGE_CHARS = 4000
+MAX_API_RETRIES = 3
 
 
 def paths(job_id):
@@ -29,6 +33,7 @@ def paths(job_id):
         "base": base,
         "status": base / "status.json",
         "log": base / "log.txt",
+        "events": base / "events.jsonl",
         "input_queue": base / "input_queue",
         "pid": base / "pid",
     }
@@ -46,6 +51,28 @@ def emit(value):
     print(json.dumps(value), flush=True)
 
 
+def record_event(job_id, kind, message, **extra):
+    """Append one durable, UI-friendly progress event.
+
+    The worker's stdout is deliberately still retained as a human-readable
+    transcript, but consumers should tail this journal.  Unlike the old log it
+    has a cursor, so polling never has to redisplay the whole agent transcript.
+    """
+    p = paths(job_id)
+    message = str(message)
+    if len(message) > MAX_EVENT_MESSAGE_CHARS:
+        message = message[:MAX_EVENT_MESSAGE_CHARS] + "\n… [truncated]"
+    state = json.loads(p["status"].read_text())
+    cursor = state.get("event_cursor", 0) + 1
+    event = {"cursor": cursor, "time": time.time(), "kind": kind, "message": message, **extra}
+    with open(p["events"], "a", encoding="utf-8") as events:
+        events.write(json.dumps(event) + "\n")
+        events.flush()
+    write_status(job_id, event_cursor=cursor, last_event=message)
+    print(f"[{kind}] {message}", flush=True)
+    return event
+
+
 def spawn(task, workdir=None):
     job_id = uuid.uuid4().hex[:10]
     p = paths(job_id)
@@ -58,9 +85,10 @@ def spawn(task, workdir=None):
 
     write_status(
         job_id, status="running", reason=None, turn=0, task=task,
-        workdir=str(resolved_workdir), created_at=time.time(),
+        workdir=str(resolved_workdir), created_at=time.time(), event_cursor=0,
     )
     p["log"].write_text("")
+    p["events"].write_text("")
     env = os.environ.copy()
     env["PRIYA_AGENT_JOB_ID"] = job_id
     with open(p["log"], "a") as log:
@@ -69,6 +97,7 @@ def spawn(task, workdir=None):
             stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True,
         )
     p["pid"].write_text(str(proc.pid))
+    record_event(job_id, "started", "Coding job started", workdir=str(resolved_workdir))
     emit({"job_id": job_id, "workdir": str(resolved_workdir)})
 
 
@@ -80,12 +109,28 @@ def status(job_id):
     emit(json.loads(p["status"].read_text()))
 
 
-def log(job_id):
+def log(job_id, after=0):
     p = paths(job_id)
-    if not p["log"].exists():
+    if not p["status"].exists():
         emit({"error": "no such job"})
         return
-    print(p["log"].read_text(), end="")
+    try:
+        after = max(0, int(after))
+    except (TypeError, ValueError):
+        emit({"error": "after must be a non-negative cursor"})
+        return
+    events = []
+    if p["events"].exists():
+        for line in p["events"].read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("cursor", 0) > after:
+                events.append(event)
+    state = json.loads(p["status"].read_text())
+    emit({"job_id": job_id, "status": state.get("status"), "events": events,
+          "cursor": after, "next_cursor": state.get("event_cursor", after)})
 
 
 def send(job_id, message):
@@ -107,6 +152,7 @@ def stop(job_id):
     except ProcessLookupError:
         pass
     write_status(job_id, status="stopped", reason="user_stop")
+    record_event(job_id, "stopped", "Coding job stopped")
     emit({"stopped": True})
 
 
@@ -127,27 +173,62 @@ def worker(job_id):
     state = json.loads(p["status"].read_text())
     workdir = Path(state["workdir"])
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
-    shell_tool = types.Tool(function_declarations=[types.FunctionDeclaration(
-        name="shell", description="Run a bash command in the project workdir.",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={"command": types.Schema(type=types.Type.STRING)},
-            required=["command"],
-        ),
-    )])
+    def declaration(name, description, properties, required):
+        return types.FunctionDeclaration(
+            name=name, description=description,
+            parameters=types.Schema(type=types.Type.OBJECT, properties=properties, required=required),
+        )
+
+    string = lambda description: types.Schema(type=types.Type.STRING, description=description)
+    boolean = lambda description: types.Schema(type=types.Type.BOOLEAN, description=description)
+    agent_tools = types.Tool(function_declarations=[
+        declaration("bash", "Run a bash command in the project workdir. Use it for search, files, tests, and verification.",
+                    {"command": string("Command to execute."), "timeout_s": types.Schema(type=types.Type.INTEGER, description="Optional timeout in seconds.")}, ["command"]),
+        declaration("Read", "Read a UTF-8 text file relative to the project workdir.", {"path": string("File path.")}, ["path"]),
+        declaration("Edit", "Make a precise replacement in a UTF-8 text file. Use bash for new files or broader generated output.",
+                    {"path": string("File path."), "old_string": string("Exact existing text."), "new_string": string("Replacement text."), "replace_all": boolean("Replace every occurrence.")}, ["path", "old_string", "new_string"]),
+        declaration("narrate", "Report a short user-facing milestone to Priya. Call before investigation, before edits, and after verification.",
+                    {"message": string("Concise progress update with what you are doing or learned.")}, ["message"]),
+    ])
     system = (
-        "You are an autonomous coding agent with shell access. Work in "
-        f"{workdir}. Complete the task, verify it, then say DONE."
+        "You are an autonomous coding agent working for Priya. Work in "
+        f"{workdir}. You have bash, Read, Edit, and narrate. Call narrate with "
+        "a concise milestone before investigating, before making changes, and after "
+        "verification; Priya relays those updates live to the user. Use bash output "
+        "and tests as evidence. Complete the task, verify it, then say DONE."
     )
     contents = [types.Content(role="user", parts=[types.Part(text=state["task"])])]
 
-    def run_shell(command):
+    def run_shell(command, timeout=SHELL_TIMEOUT_SECONDS):
+        """Bash equivalent with incremental output recorded to the event journal."""
         try:
-            result = subprocess.run(
-                command, shell=True, cwd=workdir, capture_output=True, text=True,
-                timeout=SHELL_TIMEOUT_SECONDS,
-            )
-            return f"[exit {result.returncode}]\n{((result.stdout or '') + (result.stderr or ''))[-8000:]}"
+            record_event(job_id, "command", f"$ {command}")
+            proc = subprocess.Popen(command, shell=True, cwd=workdir, text=True, bufsize=1,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            pending = queue.Queue()
+            def drain(stream_name, stream):
+                for line in iter(stream.readline, ""):
+                    pending.put((stream_name, line))
+                pending.put((stream_name, None))
+            for stream_name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+                threading.Thread(target=drain, args=(stream_name, stream), daemon=True).start()
+            captured, closed, deadline = {"stdout": "", "stderr": ""}, 0, time.monotonic() + timeout
+            while closed < 2:
+                if time.monotonic() >= deadline and proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    record_event(job_id, "command_error", f"Command timed out after {timeout}s")
+                try:
+                    stream_name, line = pending.get(timeout=.1)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    closed += 1
+                    continue
+                captured[stream_name] = (captured[stream_name] + line)[-8000:]
+                record_event(job_id, "command_output", line.rstrip("\r\n"), stream=stream_name)
+            code = proc.wait()
+            record_event(job_id, "command_result", f"Command exited {code}", exit_code=code)
+            return f"[exit {code}]\n{captured['stdout']}{captured['stderr']}"
         except subprocess.TimeoutExpired:
             return f"[TIMEOUT after {SHELL_TIMEOUT_SECONDS}s]"
         except Exception as exc:
@@ -156,51 +237,94 @@ def worker(job_id):
     try:
         for turn in range(1, MAX_TURNS + 1):
             write_status(job_id, turn=turn)
+            record_event(job_id, "turn", f"Agent planning turn {turn}", turn=turn)
             for message in queued_messages(p):
                 print(f"\n[STEERING RECEIVED] {message}", flush=True)
                 contents.append(types.Content(role="user", parts=[types.Part(text=f"[steering] {message}")]))
-            try:
-                stream = client.models.generate_content_stream(
-                    model=MODEL, contents=contents,
-                    config=types.GenerateContentConfig(system_instruction=system, tools=[shell_tool]),
-                )
-                text, calls, model_parts = [], [], []
-                for chunk in stream:
-                    if not chunk.candidates:
-                        continue
-                    for part in chunk.candidates[0].content.parts:
-                        if part.text:
-                            text.append(part.text)
-                        if part.function_call:
-                            calls.append(part.function_call)
-                        model_parts.append(part)
-            except genai_errors.ClientError as exc:
-                write_status(job_id, status="failed", reason="api_error", error=str(exc))
-                return
+            for retry in range(MAX_API_RETRIES + 1):
+                try:
+                    stream = client.models.generate_content_stream(
+                        model=MODEL, contents=contents,
+                        config=types.GenerateContentConfig(system_instruction=system, tools=[agent_tools]),
+                    )
+                    text, calls, model_parts = [], [], []
+                    for chunk in stream:
+                        if not chunk.candidates:
+                            continue
+                        for part in chunk.candidates[0].content.parts:
+                            if part.text:
+                                text.append(part.text)
+                            if part.function_call:
+                                calls.append(part.function_call)
+                            model_parts.append(part)
+                    break
+                except genai_errors.ClientError as exc:
+                    if retry == MAX_API_RETRIES:
+                        write_status(job_id, status="failed", reason="api_error", error=str(exc), api_retries=retry)
+                        record_event(job_id, "failed", f"Agent API failed after {MAX_API_RETRIES} retries: {exc}")
+                        return
+                    delay = 2 ** (retry + 1)
+                    write_status(job_id, api_retries=retry + 1, last_api_error=str(exc))
+                    record_event(job_id, "retry", f"Agent API failed; retrying ({retry + 1}/{MAX_API_RETRIES}) in {delay}s")
+                    time.sleep(delay)
 
             contents.append(types.Content(role="model", parts=model_parts))
             response_text = "".join(text)
             print(f"\n=== TURN {turn} ===\n{response_text}", flush=True)
+            if response_text.strip():
+                record_event(job_id, "agent_message", response_text.strip()[-2000:])
             if not calls:
                 if "DONE" in response_text.upper():
                     write_status(job_id, status="done", reason=None)
+                    record_event(job_id, "done", "Agent reported completion")
                     return
                 contents.append(types.Content(role="user", parts=[types.Part(text="Continue or say DONE.")]))
                 continue
 
             responses = []
             for call in calls:
-                command = call.args.get("command", "")
-                print(f"$ {command}", flush=True)
-                output = run_shell(command)
+                args = dict(call.args)
+                if call.name == "narrate":
+                    message = args.get("message", "").strip()
+                    output = "Recorded" if message else "Narration requires a message"
+                    if message:
+                        record_event(job_id, "narration", message)
+                elif call.name == "bash":
+                    output = run_shell(args.get("command", ""), args.get("timeout_s", SHELL_TIMEOUT_SECONDS))
+                elif call.name == "Read":
+                    try:
+                        output = (workdir / args.get("path", "")).read_text(encoding="utf-8")[-12000:]
+                        record_event(job_id, "read", f"Read {args.get('path')}")
+                    except Exception as exc:
+                        output = f"[ERROR: {exc}]"
+                elif call.name == "Edit":
+                    try:
+                        path = workdir / args.get("path", "")
+                        source = path.read_text(encoding="utf-8")
+                        old, new = args.get("old_string", ""), args.get("new_string", "")
+                        count = source.count(old)
+                        if not old or not count:
+                            output = "[ERROR: old_string was not found]"
+                        elif count > 1 and not args.get("replace_all", False):
+                            output = f"[ERROR: old_string occurs {count} times; use more context or replace_all]"
+                        else:
+                            path.write_text(source.replace(old, new, -1 if args.get("replace_all") else 1), encoding="utf-8")
+                            output = f"Edited {path} ({count if args.get('replace_all') else 1} replacement)"
+                            record_event(job_id, "edit", output, path=str(path))
+                    except Exception as exc:
+                        output = f"[ERROR: {exc}]"
+                else:
+                    output = f"[ERROR: unknown tool {call.name}]"
                 print(output, flush=True)
                 responses.append(types.Part(function_response=types.FunctionResponse(
-                    name="shell", response={"output": output},
+                    name=call.name, response={"output": output},
                 )))
             contents.append(types.Content(role="user", parts=responses))
         write_status(job_id, status="failed", reason="max_turns_exceeded")
+        record_event(job_id, "failed", "Agent exceeded its maximum number of turns")
     except Exception as exc:
         write_status(job_id, status="failed", reason="crash", error=str(exc))
+        record_event(job_id, "failed", f"Agent crashed: {exc}")
         raise
 
 
@@ -218,8 +342,8 @@ def main():
         spawn(args[1], args[2] if len(args) == 3 else None)
     elif command == "status" and len(args) == 2:
         status(args[1])
-    elif command == "log" and len(args) == 2:
-        log(args[1])
+    elif command == "log" and len(args) in (2, 3):
+        log(args[1], args[2] if len(args) == 3 else 0)
     elif command == "send" and len(args) == 3:
         send(args[1], args[2])
     elif command == "stop" and len(args) == 2:

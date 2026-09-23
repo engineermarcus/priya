@@ -157,18 +157,19 @@ agentjob_declaration = types.FunctionDeclaration(
     parameters={
         "type": "OBJECT",
         "properties": {
-            "action": {"type": "STRING", "enum": ["spawn", "status", "log", "send", "stop"], "description": "Use spawn for non-trivial repository front-end implementation; status/log to follow and review it."},
+            "action": {"type": "STRING", "enum": ["spawn", "status", "log", "send", "stop"], "description": "Use spawn for non-trivial repository front-end implementation; Priya automatically relays live agent narration and command output. log returns new journal events after cursor."},
             "task": {"type": "STRING", "description": "For spawn: concrete UI requirements, relevant paths, constraints, and requested verification."},
             "workdir": {"type": "STRING", "description": "Optional project directory; omit to use Priya's repository root."},
             "job_id": {"type": "STRING", "description": "Job ID returned by spawn; required for status/log/send/stop."},
             "message": {"type": "STRING", "description": "Required for send; instructions for the running agent's next turn."},
+            "cursor": {"type": "INTEGER", "description": "Optional log cursor. Return only events after this cursor; use next_cursor from a prior log response."},
         },
         "required": ["action"],
     },
 )
 
 
-def run_agentjob(args: dict) -> dict:
+def run_agentjob(args: dict, on_output=None) -> dict:
     action = args.get("action")
     cmd = [sys.executable, AGENTJOB_BIN, action]
 
@@ -184,6 +185,8 @@ def run_agentjob(args: dict) -> dict:
         if not job_id:
             return {"error": f"{action} requires 'job_id'"}
         cmd.append(job_id)
+        if action == "log" and args.get("cursor") is not None:
+            cmd.append(str(args["cursor"]))
     elif action == "send":
         job_id = args.get("job_id")
         message = args.get("message")
@@ -197,7 +200,13 @@ def run_agentjob(args: dict) -> dict:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         raw = (result.stdout or "").strip()
         try:
-            return json.loads(raw)
+            parsed = json.loads(raw)
+            if action == "log" and on_output is not None:
+                for event in parsed.get("events", []):
+                    message = event.get("message")
+                    if isinstance(message, str) and message:
+                        on_output("agentjob", message)
+            return parsed
         except json.JSONDecodeError:
             return {"raw_output": raw, "stderr": result.stderr[-500:]}
     except subprocess.TimeoutExpired:
@@ -553,11 +562,18 @@ Tool-use policy:
   one-line UI fix is small enough to handle directly. Keep backend, systems,
   data, and other non-front-end work local. Give the agent concrete
   requirements, relevant paths, constraints, and a verification request.
-  Spawn returns immediately; do independent inspection or planning while it
-  works, poll `status` and read `log`, then inspect its changed files and
-  verify the result yourself before reporting completion. Use `send` to steer
-  it and `stop` to cancel it. Use `artifact` for standalone visual deliverables
+  Spawn returns immediately. Priya automatically relays the job's narration,
+  shell commands, and output to the user, so acknowledge the delegation and
+  remain available for unrelated user messages instead of waiting silently or
+  repeatedly polling just to provide progress. Do independent inspection or
+  planning while it works; when completion matters, inspect the changed files
+  and verify the result yourself before reporting completion. Use `send` to
+  steer it and `stop` to cancel it. Use `artifact` for standalone visual deliverables
   that should be opened in a browser rather than added to this repository.
+  Recovery policy: an agentjob retries transient agent/API failures up to three
+  times. If its status is still failed after those retries, take over the task
+  yourself using Priya's local tools; do not leave the user with an unfinished
+  implementation or ask them to restart the same failed job unless they ask.
 - `artifact` creates a standalone browser deliverable rather than changing this
   repository's website or application. Use it when the user wants a one-off
   interactive visual result opened in a browser; do not use it for implementing
@@ -753,6 +769,11 @@ class MicrophoneProcessor:
 class TextLoop:
     def __init__(self):
         self.session = None
+        # The Live websocket is shared by typed input, tool responses, audio,
+        # and scheduled prompts.  Concurrent sends can close the connection
+        # (and previously took down the TaskGroup when someone messaged while
+        # an agentjob tool round was still being acknowledged).
+        self._session_send_lock = asyncio.Lock()
         self.player = start_player() if TALK else None
         self.mic_queue = asyncio.Queue(maxsize=10) if MIC else None
         self.mic_stream = None
@@ -777,6 +798,49 @@ class TextLoop:
         self._queued_cron_job_counts = {}
         self._cancelled_queued_cron_jobs = set()
         self._generation_active = False
+        # Background coding jobs are independent of Live turns.  Keep their
+        # journal tailers here so the UI receives progress even while Priya is
+        # answering an unrelated user message.
+        self._agentjob_watchers = {}
+
+    async def watch_agentjob(self, job_id, tool_event_id):
+        """Relay a job's append-only journal to its existing tool node."""
+        cursor = 0
+        try:
+            while True:
+                result = await asyncio.to_thread(run_agentjob, {
+                    "action": "log", "job_id": job_id, "cursor": cursor,
+                })
+                if result.get("error"):
+                    out("<<TOOL_LOG>>" + json.dumps({
+                        "id": tool_event_id, "stream": "agentjob", "text": result["error"],
+                    }))
+                    return
+                for event in result.get("events", []):
+                    message = event.get("message")
+                    if isinstance(message, str) and message:
+                        out("<<TOOL_LOG>>" + json.dumps({
+                            "id": tool_event_id, "stream": "agentjob", "text": message,
+                        }))
+                cursor = result.get("next_cursor", cursor)
+                if result.get("status") != "running":
+                    return
+                await asyncio.sleep(.35)
+        except Exception as error:
+            # A tailing failure must never affect the Live session or make an
+            # active coding job invisible.  It can still be inspected with
+            # agentjob status/log, and the next spawned job gets a new tailer.
+            out("<<TOOL_LOG>>" + json.dumps({
+                "id": tool_event_id, "stream": "agentjob", "text": f"Progress tailer error: {error}",
+            }))
+        finally:
+            self._agentjob_watchers.pop(job_id, None)
+
+    def start_agentjob_watcher(self, job_id, tool_event_id):
+        if job_id and job_id not in self._agentjob_watchers:
+            self._agentjob_watchers[job_id] = asyncio.create_task(
+                self.watch_agentjob(job_id, tool_event_id)
+            )
 
     def discard_playback(self):
         """Immediately drop audio queued in aplay after a server interruption."""
@@ -795,6 +859,24 @@ class TextLoop:
             old_player.kill()
         if TALK:
             self.player = start_player()
+
+    async def _send_client_content(self, **kwargs):
+        if self.session is None:
+            raise RuntimeError("Live session is not connected")
+        async with self._session_send_lock:
+            await self.session.send_client_content(**kwargs)
+
+    async def _send_tool_response(self, **kwargs):
+        if self.session is None:
+            raise RuntimeError("Live session is not connected")
+        async with self._session_send_lock:
+            await self.session.send_tool_response(**kwargs)
+
+    async def _send_realtime_input(self, **kwargs):
+        if self.session is None:
+            return
+        async with self._session_send_lock:
+            await self.session.send_realtime_input(**kwargs)
 
     async def listen_audio(self):
         """Reads mic PCM chunks off-thread and queues them for send_audio."""
@@ -820,12 +902,12 @@ class TextLoop:
             data = await self.mic_queue.get()
             cleaned_audio, speech_ended = self.mic_processor.process(data)
             if self.session is not None:
-                await self.session.send_realtime_input(
+                await self._send_realtime_input(
                     audio={"data": cleaned_audio, "mime_type": "audio/pcm;rate=16000"}
                 )
                 if speech_ended:
                     self._generation_active = True
-                    await self.session.send_realtime_input(audio_stream_end=True)
+                    await self._send_realtime_input(audio_stream_end=True)
 
     async def interrupt(self):
         """Cut off the active Live generation without closing the session."""
@@ -841,17 +923,26 @@ class TextLoop:
         if self.session is not None:
             # Gemini 3.8 Live defines completed client content as an
             # unconditional interruption of an active generation.
-            await self.session.send_client_content(
-                turns={"role": "user", "parts": [{"text": INTERRUPT_COMMAND}]},
-                turn_complete=True,
-            )
+            try:
+                await self._send_client_content(
+                    turns={"role": "user", "parts": [{"text": INTERRUPT_COMMAND}]},
+                    turn_complete=True,
+                )
+            except Exception as error:
+                out(f"Priya could not interrupt the current response: {error}")
 
     async def send_text(self):
         while True:
             if PIPED:
                 line = await asyncio.to_thread(sys.stdin.readline)
                 if not line:
-                    break
+                    # The TUI owns this pipe for its whole lifetime.  Do not
+                    # interpret a transient/early EOF as a user request to
+                    # kill the Live worker (which used to surface as
+                    # "worker closed the connection" after a normal turn).
+                    print("send_text: stdin reached EOF; keeping Live worker alive", file=sys.stderr)
+                    await asyncio.sleep(1)
+                    continue
                 text = line.rstrip("\n")
             else:
                 text = await asyncio.to_thread(input, "message > ")
@@ -898,10 +989,23 @@ class TextLoop:
                 # next user turn.
                 await self._ready_for_input.wait()
                 self._generation_active = True
-                await self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": text or "."}]},
-                    turn_complete=True,
-                )
+                # Do not barge into the tool/response hand-off on the same
+                # Live connection.  A background agentjob keeps running after
+                # that hand-off, so this only queues a message until Priya's
+                # short acknowledgement is idle—not until the coding job ends.
+                self._ready_for_input.clear()
+                try:
+                    await self._send_client_content(
+                        turns={"role": "user", "parts": [{"text": text or "."}]},
+                        turn_complete=True,
+                    )
+                except Exception as error:
+                    # Never let a rejected concurrent turn kill the persistent
+                    # input task.  The job tailers continue, and the next user
+                    # message can still use the established Live session.
+                    self._generation_active = False
+                    self._ready_for_input.set()
+                    out(f"Priya could not send that message: {error}")
 
     @staticmethod
     def _validate_questions(raw_questions):
@@ -1187,7 +1291,7 @@ class TextLoop:
                 out("<<SCHEDULED_TASK>>" + json.dumps({"job_id": job["job_id"], "prompt": job["prompt"]}))
                 self._generation_active = True
                 try:
-                    await self.session.send_client_content(
+                    await self._send_client_content(
                         turns={"role": "user", "parts": [{
                             "text": f"[Scheduled job {job['job_id']}] {job['prompt']}"
                         }]},
@@ -1199,6 +1303,27 @@ class TextLoop:
             await asyncio.sleep(1)
 
     async def receive_text(self):
+        """Keep a receiver failure from terminating Priya's input/UI worker."""
+        reported_failure = False
+        while True:
+            try:
+                await self._receive_text()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._generation_active = False
+                self._ready_for_input.set()
+                print(f"receive_text failed: {error}", file=sys.stderr)
+                if not reported_failure:
+                    out(f"Priya's Live receive loop had an error: {error}")
+                    out("<<END>>")
+                    reported_failure = True
+                # A transient websocket failure can recover; more importantly,
+                # never let it cancel send_text and make the UI report that its
+                # worker has closed.
+                await asyncio.sleep(1)
+
+    async def _receive_text(self):
         while True:
             if self.session is not None:
                 # A function-call stream ends immediately after its responses
@@ -1230,7 +1355,8 @@ class TextLoop:
                             # This is Gemini's acknowledgement that it has
                             # stopped the active generation. A queued next
                             # user message can now be sent safely.
-                            self._ready_for_input.set()
+                            if not saw_tool_call:
+                                self._ready_for_input.set()
 
                         if response.tool_call and not suppress_response:
                             saw_tool_call = True
@@ -1251,7 +1377,9 @@ class TextLoop:
                                         }))
 
                                 if fc.name == "agentjob":
-                                    result = await asyncio.to_thread(run_agentjob, args_dict)
+                                    result = await asyncio.to_thread(run_agentjob, args_dict, emit_tool_output)
+                                    if args_dict.get("action") == "spawn":
+                                        self.start_agentjob_watcher(result.get("job_id"), tool_event_id)
                                 elif fc.name == "artifact":
                                     result = await asyncio.to_thread(run_artifact, args_dict)
                                 elif fc.name == "bash":
@@ -1279,7 +1407,7 @@ class TextLoop:
                                         id=fc.id, name=fc.name, response=result,
                                     )
                                 )
-                            await self.session.send_tool_response(
+                            await self._send_tool_response(
                                 function_responses=function_responses
                             )
 
@@ -1296,6 +1424,11 @@ class TextLoop:
                         status = getattr(sc, "interaction_status", None) if sc is not None else None
                         turn_complete = bool(getattr(sc, "turn_complete", False)) if sc is not None else False
                         if status == "IDLE" or turn_complete:
+                            # It is now safe to send the next typed turn.  In
+                            # particular, this releases messages queued while
+                            # a tool response was being written.
+                            if not saw_tool_call:
+                                self._ready_for_input.set()
                             if self._discard_until_idle:
                                 self._discard_until_idle = False
                                 self._ready_for_input.set()
@@ -1305,6 +1438,8 @@ class TextLoop:
                     # Current Live streams commonly end without the legacy
                     # interaction_status=IDLE event. Their exhaustion is a
                     # valid completion boundary as well.
+                    if not saw_tool_call:
+                        self._ready_for_input.set()
                     if self._discard_until_idle:
                         self._discard_until_idle = False
                         self._ready_for_input.set()
@@ -1312,6 +1447,7 @@ class TextLoop:
                 except asyncio.TimeoutError:
                     print("receive_text: stalled turn, forcing end", file=sys.stderr)
                     timed_out = True
+                    self._ready_for_input.set()
                     if self._discard_until_idle:
                         self._discard_until_idle = False
                         self._ready_for_input.set()
@@ -1337,6 +1473,7 @@ class TextLoop:
                     tg.create_task(self.listen_audio())
                     tg.create_task(self.send_audio())
                 await send_text_task
+                print("send_text: user requested exit", file=sys.stderr)
                 raise asyncio.CancelledError("User requested exit")
         except asyncio.CancelledError:
             pass

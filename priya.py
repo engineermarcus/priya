@@ -354,6 +354,10 @@ class PriyaApp(App):
     #inputbar Input:focus {
         border: none;
     }
+    #inputbar.-disabled {
+        color: #525252;
+        background: #111111;
+    }
     """
 
     BINDINGS = [
@@ -393,6 +397,7 @@ class PriyaApp(App):
         self._question_state = None
         self._edit_approval_state = None
         self._interrupted = False
+        self._worker_restart_count = 0
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="convo")
@@ -402,6 +407,17 @@ class PriyaApp(App):
         yield Static("esc stop  ^o expand  ^e all  ^r collapse  ^c quit", id="keybar")
 
     def on_mount(self):
+        self._start_worker()
+        self.query_one("#inputbar", Input).focus()
+        self._flush_timer = self.set_interval(1 / 30, self._drain_ui_q)
+        # Textual batches widget updates per refresh. Presenting one protocol
+        # event at a time gives a streamed model reply a refresh before the
+        # following tool result changes the same turn's layout.
+        self.set_interval(0.06, self._present_next)
+        self._spinner_timer = self.set_interval(0.1, self._tick_spinner)
+        self.read_worker()
+
+    def _start_worker(self):
         cmd = [sys.executable, WORKER]
         if self.talk:
             cmd.append("--talk")
@@ -415,14 +431,15 @@ class PriyaApp(App):
         )
         threading.Thread(target=reader_thread, args=(self.proc, self.raw_q),
                          daemon=True).start()
+
+    def _restart_worker(self):
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        self._start_worker()
+        self._worker_restart_count = 0
+        self.query_one("#inputbar", Input).disabled = False
         self.query_one("#inputbar", Input).focus()
-        self._flush_timer = self.set_interval(1 / 30, self._drain_ui_q)
-        # Textual batches widget updates per refresh. Presenting one protocol
-        # event at a time gives a streamed model reply a refresh before the
-        # following tool result changes the same turn's layout.
-        self.set_interval(0.06, self._present_next)
-        self._spinner_timer = self.set_interval(0.1, self._tick_spinner)
-        self.read_worker()
+        self._set_status(f"  {CHECK}  {MODEL_NAME} reconnected · ready", "#4ade80")
 
     def on_unmount(self):
         if self.proc is not None:
@@ -495,6 +512,7 @@ class PriyaApp(App):
     def _do_mount_turn(self, user_text):
         self._interrupted = False
         self.busy = True
+        self.query_one("#inputbar", Input).disabled = True
         convo = self.query_one("#convo", VerticalScroll)
         turn = Vertical(classes="turn")
         convo.mount(turn)
@@ -536,7 +554,10 @@ class PriyaApp(App):
         self._cur_tree.refresh()
 
     def _do_finish_tool_node(self, tool_id, result_text, stat):
-        node = self._node_registry.pop(tool_id, None)
+        # Keep the registry entry after completion.  Most tools stop emitting
+        # at their final response, but agentjob is deliberately non-blocking:
+        # its live journal continues to append to this completed spawn node.
+        node = self._node_registry.get(tool_id)
         if node is None:
             return
         data = node.data
@@ -599,6 +620,9 @@ class PriyaApp(App):
             "id": question_id, "questions": questions, "answers": [], "index": 0,
             "card": None, "options": None,
         }
+        # A question permits a custom typed answer even though ordinary turns
+        # remain locked until the active model turn has ended.
+        self.query_one("#inputbar", Input).disabled = False
         self._set_status("  ?  Waiting for your answer", "#a5b4fc")
         self._show_next_question()
 
@@ -642,6 +666,7 @@ class PriyaApp(App):
 
         payload = {"id": state["id"], "answers": state["answers"]}
         self._question_state = None
+        self.query_one("#inputbar", Input).disabled = True
         self._set_status(f"  {SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]}  {MODEL_NAME} is working…")
         self.send_question_answers(payload)
         return True
@@ -664,6 +689,7 @@ class PriyaApp(App):
             classes="ask-question",
         )
         self._edit_approval_state = {"id": edit_id, "card": card, "options": options}
+        self.query_one("#inputbar", Input).disabled = False
         self._set_status("  ?  Waiting for edit approval", "#a5b4fc")
         self._cur_turn.mount(card)
         self.call_after_refresh(options.focus)
@@ -681,6 +707,7 @@ class PriyaApp(App):
         ))
         payload = {"id": state["id"], "approved": approved}
         self._edit_approval_state = None
+        self.query_one("#inputbar", Input).disabled = True
         self._set_status(f"  {SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]}  {MODEL_NAME} is working…")
         self.send_edit_approval(payload)
         return True
@@ -698,6 +725,9 @@ class PriyaApp(App):
         self._cur_tool_node = None
         self._question_state = None
         self._edit_approval_state = None
+        input_bar = self.query_one("#inputbar", Input)
+        input_bar.disabled = False
+        input_bar.focus()
 
     def _do_interrupted(self):
         """Immediately reflect Esc, before the worker finishes cancelling."""
@@ -722,7 +752,13 @@ class PriyaApp(App):
 
     def _do_worker_closed(self):
         self.busy = False
-        self._set_status("  worker closed the connection", "#f87171")
+        self.query_one("#inputbar", Input).disabled = True
+        self._worker_restart_count += 1
+        if self._worker_restart_count <= 3:
+            self._set_status("  reconnecting Priya…", "#fbbf24")
+            self.set_timer(0.5, self._restart_worker)
+        else:
+            self._set_status("  worker closed the connection", "#f87171")
         self._do_hide_thinking()
         if self._cur_ai_bubble is not None:
             self._cur_ai_bubble.update("(worker closed the connection)")
@@ -773,6 +809,11 @@ class PriyaApp(App):
     # ── Input ────────────────────────────────────────────────────────────────
 
     def on_input_submitted(self, event: Input.Submitted):
+        # This also closes the tiny scheduling window before MountTurn reaches
+        # the UI queue, so two rapid Enters cannot be written to Live while it
+        # is processing a tool/response hand-off.
+        if self.busy and self._question_state is None and self._edit_approval_state is None:
+            return
         text = event.value.strip()
         event.input.value = ""
         if not text:
@@ -790,6 +831,9 @@ class PriyaApp(App):
         if text.lower() == "q":
             self.exit()
             return
+        self.busy = True
+        event.input.disabled = True
+        self._set_status(f"  {SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]}  {MODEL_NAME} is working…")
         self.send_turn(text)
 
     # ── Backend I/O workers (background threads, NEVER touch widgets) ───────
