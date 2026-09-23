@@ -43,5 +43,6 @@ Press `Ctrl+C` to exit. In the input field, enter `q` to quit.
 ## Tools
 
 The model can call `bash` for local shell work and `agentjob` to delegate a
-background coding task. `agentjob` expects its runner at
-`~/agent/job_runner.py`.
+background coding task. Expand a running `bash` tool in the UI to follow its
+stdout and stderr; the final result is appended after the live log. `agentjob`
+expects its runner at `~/agent/job_runner.py`.

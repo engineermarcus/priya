@@ -122,6 +122,12 @@ class FinishToolNode(Msg):
         self.result_text = result_text
         self.stat = stat
 
+class AppendToolLog(Msg):
+    def __init__(self, tool_id, stream, text):
+        self.tool_id = tool_id
+        self.stream = stream
+        self.text = text
+
 class AppendText(Msg):
     def __init__(self, text):
         self.text = text
@@ -333,6 +339,8 @@ class PriyaApp(App):
             self._do_add_tool_node(msg.tool_id, msg.name, msg.detail)
         elif isinstance(msg, FinishToolNode):
             self._do_finish_tool_node(msg.tool_id, msg.result_text, msg.stat)
+        elif isinstance(msg, AppendToolLog):
+            self._do_append_tool_log(msg.tool_id, msg.stream, msg.text)
         elif isinstance(msg, AppendText):
             self._do_append_text(msg.text)
         elif isinstance(msg, HideThinking):
@@ -393,7 +401,8 @@ class PriyaApp(App):
         data.result = result_text
         data.stat = stat
         node.set_label(tool_label(data))
-        node.remove_children()
+        if node.children:
+            node.add_leaf(Text("result", style="bold dim"))
         for ln in (result_text.splitlines() or [""]):
             node.add_leaf(Text(ln, style="dim"))
         if self._cur_tool_node is node:
@@ -401,6 +410,17 @@ class PriyaApp(App):
         for n, t in self._all_tool_nodes:
             if n is node:
                 t.refresh()
+                break
+
+    def _do_append_tool_log(self, tool_id, stream, text):
+        node = self._node_registry.get(tool_id)
+        if node is None:
+            return
+        style = "dim" if stream == "stdout" else "bold #fbbf24"
+        node.add_leaf(Text(f"{stream}: {text}", style=style))
+        for n, tree in self._all_tool_nodes:
+            if n is node:
+                tree.refresh()
                 break
 
     def _do_append_text(self, text):
@@ -508,10 +528,25 @@ class PriyaApp(App):
                     payload = json.loads(line[len("<<TOOL_START>>"):])
                     name, detail = payload["name"], payload["detail"]
                 except (json.JSONDecodeError, KeyError):
+                    payload = {}
                     name, detail = "tool", "(unparsed)"
-                tool_id_counter += 1
-                pending_tool_ids.append(tool_id_counter)
-                self.ui_q.put(AddToolNode(tool_id_counter, name, detail))
+                tool_id = payload.get("id")
+                if tool_id is None:
+                    tool_id_counter += 1
+                    tool_id = f"local-{tool_id_counter}"
+                pending_tool_ids.append(tool_id)
+                self.ui_q.put(AddToolNode(tool_id, name, detail))
+                continue
+
+            if line.startswith("<<TOOL_LOG>>"):
+                try:
+                    payload = json.loads(line[len("<<TOOL_LOG>>"):])
+                    tool_id = payload["id"]
+                    stream = payload.get("stream", "stdout")
+                    text = payload["text"]
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                self.ui_q.put(AppendToolLog(tool_id, stream, text))
                 continue
 
             if line.startswith("<<TOOL_END>>"):
@@ -520,10 +555,17 @@ class PriyaApp(App):
                     result = payload["result"]
                     result_text = json.dumps(result, indent=2)
                 except (json.JSONDecodeError, KeyError):
+                    payload = {}
                     result = None
                     result_text = "(unparsed result)"
-                if pending_tool_ids:
+                tool_id = payload.get("id")
+                if tool_id in pending_tool_ids:
+                    pending_tool_ids.remove(tool_id)
+                elif pending_tool_ids:
                     tool_id = pending_tool_ids.popleft()
+                else:
+                    tool_id = None
+                if tool_id is not None:
                     stat = diff_stat(result)
                     # Hold the result until the model's next text is shown.
                     # Otherwise a tree refresh can consume the same Textual

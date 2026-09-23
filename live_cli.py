@@ -16,6 +16,9 @@ import json
 import asyncio
 import traceback
 import subprocess
+import queue
+import threading
+import time
 
 from google import genai
 from google.genai import types
@@ -122,22 +125,55 @@ bash_declaration = types.FunctionDeclaration(
 )
 
 
-def run_bash(args: dict) -> dict:
+def run_bash(args: dict, on_output=None) -> dict:
+    """Run a shell command and forward its stdout/stderr as it arrives."""
     command = args.get("command")
     if not command:
         return {"error": "bash requires 'command'"}
     timeout_s = args.get("timeout_s", 60)
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout_s,
+        proc = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
         )
+        events = queue.Queue()
+
+        def read_pipe(stream_name, stream):
+            for chunk in iter(stream.readline, ""):
+                events.put((stream_name, chunk))
+            events.put((stream_name, None))
+
+        for stream_name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+            threading.Thread(target=read_pipe, args=(stream_name, stream), daemon=True).start()
+
+        captured = {"stdout": "", "stderr": ""}
+        limits = {"stdout": 8000, "stderr": 4000}
+        closed_streams = 0
+        timed_out = False
+        deadline = time.monotonic() + timeout_s
+        while closed_streams < 2:
+            if not timed_out and time.monotonic() >= deadline:
+                proc.kill()
+                timed_out = True
+            try:
+                stream_name, chunk = events.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                closed_streams += 1
+                continue
+            captured[stream_name] = (captured[stream_name] + chunk)[-limits[stream_name]:]
+            if on_output is not None:
+                on_output(stream_name, chunk.rstrip("\r\n"))
+
+        returncode = proc.wait()
+        if timed_out:
+            return {"error": f"command timed out after {timeout_s}s"}
         return {
-            "exit_code": result.returncode,
-            "stdout": (result.stdout or "")[-8000:],
-            "stderr": (result.stderr or "")[-4000:],
+            "exit_code": returncode,
+            "stdout": captured["stdout"],
+            "stderr": captured["stderr"],
         }
-    except subprocess.TimeoutExpired:
-        return {"error": f"command timed out after {timeout_s}s"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -175,14 +211,18 @@ CONFIG = types.LiveConnectConfig(
 )
 
 PIPED = not sys.stdin.isatty()
+OUT_LOCK = threading.Lock()
 
 
 def out(line: str):
-    if PIPED:
-        sys.stdout.write(line.replace("\n", " ") + "\n")
-        sys.stdout.flush()
-    else:
-        print(line)
+    # Shell output is read on helper threads while the Live receiver also
+    # writes protocol events. Keep every protocol message on one stdout line.
+    with OUT_LOCK:
+        if PIPED:
+            sys.stdout.write(line.replace("\n", " ") + "\n")
+            sys.stdout.flush()
+        else:
+            print(line)
 
 
 def start_player():
@@ -229,6 +269,7 @@ class TextLoop:
         self.player = start_player() if TALK else None
         self.mic_queue = asyncio.Queue(maxsize=10) if MIC else None
         self.mic_stream = None
+        self._tool_event_id = 0
 
     async def listen_audio(self):
         """Reads mic PCM chunks off-thread and queues them for send_audio."""
@@ -299,17 +340,30 @@ class TextLoop:
                             saw_tool_call = True
                             function_responses = []
                             for fc in response.tool_call.function_calls:
+                                self._tool_event_id += 1
+                                tool_event_id = self._tool_event_id
                                 args_dict = dict(fc.args)
                                 detail = args_dict.get("command") or args_dict.get("task") or json.dumps(args_dict)
-                                out("<<TOOL_START>>" + json.dumps({"name": fc.name, "detail": detail}))
+                                out("<<TOOL_START>>" + json.dumps({
+                                    "id": tool_event_id, "name": fc.name, "detail": detail,
+                                }))
+
+                                def emit_tool_output(stream_name, text, event_id=tool_event_id):
+                                    if text:
+                                        out("<<TOOL_LOG>>" + json.dumps({
+                                            "id": event_id, "stream": stream_name, "text": text,
+                                        }))
+
                                 if fc.name == "agentjob":
                                     result = await asyncio.to_thread(run_agentjob, args_dict)
                                 elif fc.name == "bash":
-                                    result = await asyncio.to_thread(run_bash, args_dict)
+                                    result = await asyncio.to_thread(run_bash, args_dict, emit_tool_output)
                                 else:
                                     result = {"error": f"unknown tool {fc.name}"}
                                 print(f"TOOL CALL: {fc.name} {args_dict} -> {result}", file=sys.stderr)
-                                out("<<TOOL_END>>" + json.dumps({"name": fc.name, "result": result}))
+                                out("<<TOOL_END>>" + json.dumps({
+                                    "id": tool_event_id, "name": fc.name, "result": result,
+                                }))
                                 function_responses.append(
                                     types.FunctionResponse(
                                         id=fc.id, name=fc.name, response=result,
