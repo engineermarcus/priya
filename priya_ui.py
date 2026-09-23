@@ -1,13 +1,24 @@
 """
-Priya CLI — full-screen prompt_toolkit UI with collapsible tool-call
-output. Runs live_cli.py as a worker subprocess.
+Priya TUI — full-screen Textual app with a tree-shaped conversation log.
 
-Flow: you type at the "> " prompt -> an inline spinner appears in the
-scrollback exactly where the reply will land -> it's replaced in place
-by tool calls (rendered as Name(args) with a dropdown arrow revealing
-grayed output) and/or the model's streamed text. No speaker labels —
-your line and the model's line are told apart by color/weight only,
-and ">" only ever appears in the input line, never in the transcript.
+Each turn you send becomes a root node in the tree; tool calls made while
+answering that turn appear as expandable/collapsible child nodes (pencil
+icon, name(args), a diff-style +added/-removed stat when the tool result
+looks like a diff, and the raw JSON result revealed on expand); the
+model's streamed reply appears as a final text child under the same turn.
+
+This is a genuine full-screen (alt-screen) app: Textual owns the viewport,
+redraws the tree in place, and animates expand/collapse. Native terminal
+scrollback no longer applies here — scrolling is handled by the app's own
+scrollable tree view (mouse wheel / PageUp / j,k / arrow keys all work,
+routed through Textual instead of the terminal).
+
+Runs live_cli.py as a worker subprocess, using the same line-based
+protocol as the old plain-stdout UI:
+  <<TOOL_START>>{"name": ..., "detail": ...}
+  <<TOOL_END>>{"name": ..., "result": ...}
+  <<END>>
+  (any other line = streamed model text)
 """
 
 import os
@@ -17,15 +28,14 @@ import json
 import queue
 import subprocess
 import threading
-import time
 
-from prompt_toolkit import Application
-from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.filters import Condition
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Layout, HSplit, Window
-from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
-from prompt_toolkit.styles import Style
+from textual.app import App, ComposeResult
+from textual.containers import Vertical, VerticalScroll
+from textual.widgets import Tree, Input, Static
+from textual.widgets.tree import TreeNode
+from textual.reactive import reactive
+from textual import work
+from rich.text import Text
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(DIR, "live_cli.py")
@@ -33,163 +43,29 @@ MODEL_NAME = "gemini-3.8-live"
 
 SENTINEL = object()
 
-BANNER = r"""
- ____   ____  _____  __     __ _
-|  _ \ |  _ \|_ _\ \/ /   /\  \ \
-| |_) || |_) || | \  /   /  \  \ \
-|  __/ |  _ < | | /  \  / /\ \  \ \
-|_|    |_| \_\___/_/\_\/_/  \_\  \_\
-""".strip("\n")
-
+PENCIL = "\u270e"
+DOT = "\u25cf"
+CHECK = "\u2713"
 SPINNER_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c",
                    "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"]
 
-style = Style.from_dict({
-    "banner": "fg:#00afaf bold",
-    "dim": "fg:#666666",
-    "rule": "fg:#3a3a3a",
-
-    "text.you": "fg:#ffffff bold",
-    "text.ai": "fg:#b0b0b0",
-    "text.frozen": "fg:#555555 italic",
-
-    "input.idle": "fg:#ffffff",
-    "input.busy": "fg:#666666",
-
-    "spinner": "fg:#666666 italic",
-
-    "tool.name": "fg:#d7af00 bold",
-    "tool.arrow": "fg:#ffd75f bold",  # brighter + bold — this is the click/expand affordance
-    "tool.hint": "fg:#888888 italic",
-    "tool.dropdown": "fg:#555555",
-    "tool.output": "fg:#7a7a7a",
-    "tool.json.key": "fg:#5fafd7",
-    "tool.json.string": "fg:#87af5f",
-    "tool.json.number": "fg:#d78700",
-    "tool.json.bool": "fg:#d75f5f",
-    "tool.json.punct": "fg:#7a7a7a",
-
-    "prompt-gutter": "fg:#999999 bold",
-    "status-bar": "fg:#666666",
-})
-
-_KV_RE = re.compile(r'^(\s*)"((?:[^"\\]|\\.)*)"\s*:\s*(.*)$')
-_STR_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"(,?)$')
-_NUM_RE = re.compile(r'^(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(,?)$')
-_BOOL_RE = re.compile(r'^(true|false|null)(,?)$')
+_ADD_KEYS = ("added", "inserted", "lines_added", "additions")
+_DEL_KEYS = ("removed", "deleted", "lines_removed", "deletions")
 
 
-def colorize_json_value(value):
-    m = _STR_RE.match(value)
-    if m:
-        s, comma = m.groups()
-        return [
-            ("class:tool.json.punct", '"'),
-            ("class:tool.json.string", s),
-            ("class:tool.json.punct", '"' + comma),
-        ]
-    m = _NUM_RE.match(value)
-    if m:
-        n, comma = m.groups()
-        return [("class:tool.json.number", n), ("class:tool.json.punct", comma)]
-    m = _BOOL_RE.match(value)
-    if m:
-        b, comma = m.groups()
-        return [("class:tool.json.bool", b), ("class:tool.json.punct", comma)]
-    return [("class:tool.json.punct", value)] if value else []
-
-
-def colorize_json_line(line):
-    indent_len = len(line) - len(line.lstrip(" "))
-    indent, rest = line[:indent_len], line[indent_len:]
-    frags = [("class:tool.output", indent)] if indent else []
-
-    m = _KV_RE.match(rest)
-    if m:
-        _, key, value = m.groups()
-        frags.append(("class:tool.json.punct", '"'))
-        frags.append(("class:tool.json.key", key))
-        frags.append(("class:tool.json.punct", '": '))
-        frags.extend(colorize_json_value(value))
-        return frags
-
-    frags.extend(colorize_json_value(rest))
-    return frags
-
-
-class SpinnerEntry:
-    def __init__(self):
-        self.frame = 0
-        self.alive = True
-
-    def render(self):
-        f = SPINNER_FRAMES[self.frame % len(SPINNER_FRAMES)]
-        return [("class:spinner", f"{f} thinking\n")]
-
-
-class ToolEntry:
-    def __init__(self, name, detail_line):
-        # "bash" -> "Bash", "read_file" -> "Read_file" — first letter up.
-        self.label = (name[:1].upper() + name[1:]) if name else "Tool"
-        self.detail_line = detail_line
-        self.result = None
-        self.expanded = False
-
-    def render(self):
-        if self.expanded:
-            arrow, hint = "\u25be", "show less"  # ▾
-        else:
-            arrow, hint = "\u25b8", "show more"  # ▸
-        lines = [
-            ("class:tool.arrow", f"{arrow} "),
-            ("class:tool.name", f"{self.label}({self.detail_line})"),
-            ("class:tool.hint", f"  [{hint}]\n"),
-        ]
-        if self.expanded:
-            body = self.result if self.result is not None else "running..."
-            lines.append(("class:tool.dropdown", "  \u2514\u2500\n"))  # └─
-            for line in body.splitlines() or [""]:
-                lines.append(("class:tool.output", "     "))
-                lines.extend(colorize_json_line(line))
-                lines.append(("class:tool.output", "\n"))
-        return lines
-
-
-class ChatState:
-    def __init__(self):
-        self.entries = []  # list of ("static", frags) | ("tool", ToolEntry) | ("spinner", SpinnerEntry)
-
-    def add_static(self, frags):
-        self.entries.append(("static", frags))
-
-    def start_tool(self, name, detail_line):
-        entry = ToolEntry(name, detail_line)
-        self.entries.append(("tool", entry))
-        return entry
-
-    def start_spinner(self):
-        entry = SpinnerEntry()
-        self.entries.append(("spinner", entry))
-        return entry
-
-    def drop_spinner(self):
-        if self.entries and self.entries[-1][0] == "spinner":
-            self.entries.pop()
-
-    def last_of_kind(self, kind):
-        for k, e in reversed(self.entries):
-            if k == kind:
-                return e
+def diff_stat(result):
+    """If a tool result carries diff-like counts, return (added, removed).
+    Otherwise None. Looks for common key names; safe no-op otherwise."""
+    if not isinstance(result, dict):
         return None
-
-    def render_fragments(self):
-        frags = []
-        for kind, payload in self.entries:
-            if kind == "static":
-                frags.extend(payload)
-            else:
-                frags.extend(payload.render())
-        return frags
+    added = next((result[k] for k in _ADD_KEYS if k in result), None)
+    removed = next((result[k] for k in _DEL_KEYS if k in result), None)
+    if added is None and removed is None:
+        return None
+    try:
+        return int(added or 0), int(removed or 0)
+    except (TypeError, ValueError):
+        return None
 
 
 def reader_thread(proc, q):
@@ -198,262 +74,244 @@ def reader_thread(proc, q):
     q.put(SENTINEL)
 
 
-def spinner_thread(app, state):
-    while True:
-        entry = state.last_of_kind("spinner")
-        if entry is not None and entry.alive:
-            entry.frame += 1
-            app.invalidate()
-        time.sleep(0.1)
+class ToolNodeData:
+    """Attached to a tree node's .data for tool-call nodes."""
+    def __init__(self, name, detail):
+        self.name = name
+        self.detail = detail
+        self.result = None
+        self.stat = None
+        self.done = False
 
 
-def main():
-    talk = "--talk" in sys.argv[1:]
-    cmd = [sys.executable, WORKER] + (["--talk"] if talk else [])
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=open("/tmp/priya_worker.log", "w"),
-        text=True, bufsize=1,
-    )
+def tool_label(data, spinner_frame=None):
+    label = Text()
+    if data.done:
+        label.append(f"{PENCIL} ", style="bold white")
+    else:
+        frame = spinner_frame or SPINNER_FRAMES[0]
+        label.append(f"{frame} ", style="dim")
+    name = (data.name[:1].upper() + data.name[1:]) if data.name else "Tool"
+    label.append(f"{name}", style="bold white")
+    label.append(f"({data.detail})", style="dim")
+    if data.stat:
+        added, removed = data.stat
+        label.append("  ")
+        if added:
+            label.append(f"+{added} ", style="white")
+        if removed:
+            label.append(f"-{removed}", style="white")
+    return label
 
-    out_q = queue.Queue()
-    threading.Thread(target=reader_thread, args=(proc, out_q), daemon=True).start()
 
-    state = ChatState()
-    state.add_static([("class:banner", BANNER + "\n")])
-    state.add_static([("class:dim", f"  model: {MODEL_NAME}\n  cwd:   {os.getcwd()}\n")])
-    state.add_static([("class:rule", "  " + "-" * 60 + "\n\n")])
+class PriyaApp(App):
+    CSS = """
+    Screen {
+        background: transparent;
+    }
+    #convo {
+        height: 1fr;
+        border: none;
+        padding: 1 1 0 1;
+        scrollbar-size: 1 1;
+        scrollbar-color: transparent;
+        scrollbar-color-hover: transparent;
+        scrollbar-color-active: transparent;
+        scrollbar-background: transparent;
+        scrollbar-background-hover: transparent;
+        scrollbar-background-active: transparent;
+    }
+    .bubble-row {
+        width: 100%;
+        height: auto;
+        margin: 0 0 1 0;
+    }
+    .bubble {
+        width: auto;
+        max-width: 70%;
+        padding: 1 2;
+    }
+    .user-bubble {
+        background: #262626;
+        margin-left: 2;
+    }
+    .ai-bubble {
+        background: #1a1a1a;
+        margin-left: 6;
+    }
+    #tools {
+        height: auto;
+        max-height: 40%;
+        border: none;
+        padding: 0 1;
+        scrollbar-size: 1 1;
+        scrollbar-color: transparent;
+        scrollbar-color-hover: transparent;
+        scrollbar-color-active: transparent;
+        scrollbar-background: transparent;
+        scrollbar-background-hover: transparent;
+        scrollbar-background-active: transparent;
+    }
+    #inputbar {
+        dock: bottom;
+        height: 3;
+        border: none;
+        padding: 0 1;
+    }
+    #statusbar {
+        dock: bottom;
+        height: 1;
+        color: white;
+        padding: 0 1;
+    }
+    #keybar {
+        dock: bottom;
+        height: 1;
+        color: white;
+        background: transparent;
+        padding: 0 1;
+    }
+    """
 
-    input_buffer = Buffer(multiline=False)
-    status_text = ["ready"]
+    BINDINGS = [
+        ("ctrl+o", "toggle_last_tool", "Expand/collapse last tool call"),
+        ("ctrl+e", "expand_all", "Expand all"),
+        ("ctrl+r", "collapse_all", "Collapse all"),
+        ("ctrl+c", "quit", "Quit"),
+    ]
 
-    follow_bottom = [True]  # auto-scroll to newest content unless user paged up
-    app_ref = {}  # filled in once Application exists; refresh() closes over it
+    busy = reactive(False)
 
-    output_control = FormattedTextControl(lambda: state.render_fragments())
-    def get_vertical_scroll(window):
-        # Documented prompt_toolkit hook (see Window's get_vertical_scroll
-        # param): return the preferred scroll position each render. While
-        # following, pin to the bottom of the *previously measured*
-        # content/window height — the correct, clamp-respecting way to
-        # auto-scroll a cursor-less Window.
-        if follow_bottom[0]:
-            info = window.render_info
-            if info is not None:
-                return max(0, info.content_height - info.window_height)
-        return window.vertical_scroll
+    def __init__(self, talk=False):
+        super().__init__()
+        self.talk = talk
+        self.proc = None
+        self.out_q = queue.Queue()
+        self.tool_nodes = []          # flat list of TreeNode, in call order
+        self.spinner_i = 0
+        self._spinner_timer = None
 
-    output_window = Window(
-        content=output_control,
-        wrap_lines=True,
-        always_hide_cursor=True,
-        get_vertical_scroll=get_vertical_scroll,
-    )
+    def compose(self) -> ComposeResult:
+        convo = VerticalScroll(id="convo")
+        yield convo
+        tree: Tree = Tree("tools", id="tools")
+        tree.root.expand()
+        tree.show_root = False
+        tree.guide_depth = 3
+        yield tree
+        yield Static(f"model: {MODEL_NAME}   cwd: {os.getcwd()}", id="statusbar")
+        yield Input(placeholder="Type your message…  (Ctrl+O expands last tool call)",
+                     id="inputbar")
+        yield Static("^o expand/collapse   ^e expand all   ^r collapse all   ^c quit",
+                      id="keybar")
 
-    def refresh():
-        # Re-render; get_vertical_scroll() (passed to output_window above)
-        # handles pinning to the bottom while follow_bottom[0] is True.
-        if "app" in app_ref:
-            app_ref["app"].invalidate()
+    def on_mount(self):
+        cmd = [sys.executable, WORKER] + (["--talk"] if self.talk else [])
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=open("/tmp/priya_worker.log", "w"),
+            text=True, bufsize=1,
+        )
+        threading.Thread(target=reader_thread, args=(self.proc, self.out_q),
+                          daemon=True).start()
+        self.query_one("#inputbar", Input).focus()
+        self._spinner_timer = self.set_interval(0.1, self._tick_spinner)
 
-    busy = [False]  # True from send until <<END>> (or an Esc interrupt)
-    mouse_enabled = [False]  # off by default so native text selection/copy works;
-                              # toggle with F2 when you want the wheel to scroll
-
-    def input_style():
-        return "class:input.busy" if busy[0] else "class:input.idle"
-
-    # ">" lives here, and only here — get_line_prefix renders it as part
-    # of the input line itself, never written into the transcript.
-    # style grays out while busy[0] is True, per input_style() above.
-    input_window = Window(
-        content=BufferControl(buffer=input_buffer),
-        height=1,
-        get_line_prefix=lambda line_number, wrap_count: [("class:prompt-gutter", "> ")],
-        style=input_style,
-    )
-
-    status_window = Window(
-        content=FormattedTextControl(
-            lambda: [("class:status-bar", f"  {status_text[0]:<20} F2 toggle mouse/copy   Ctrl+O expand/collapse   Ctrl+S save transcript   Ctrl+C quit")]
-        ),
-        height=1,
-    )
-
-    root = HSplit([
-        output_window,
-        Window(height=1, char="\u2500", style="class:rule"),
-        input_window,
-        status_window,
-    ])
-
-    kb = KeyBindings()
-
-    @kb.add("c-o")
-    def _(event):
-        entry = state.last_of_kind("tool")
-        if entry is not None:
-            entry.expanded = not entry.expanded
-        event.app.invalidate()
-
-    @kb.add("c-s")
-    def _(event):
-        # Plain-text dump (no style/color codes) for pasting elsewhere —
-        # click-drag selection is unreliable now that mouse_support=True
-        # has the terminal handing mouse events to the app.
-        path = "/tmp/priya_transcript.txt"
-        try:
-            text = "".join(frag_text for _style, frag_text in state.render_fragments())
-            with open(path, "w") as f:
-                f.write(text)
-            status_text[0] = f"saved transcript -> {path}"
-        except Exception as e:
-            status_text[0] = f"transcript save failed: {e}"
-        event.app.invalidate()
-
-    @kb.add("c-c")
-    def _(event):
-        event.app.exit()
-
-    @kb.add("f2")
-    def _(event):
-        mouse_enabled[0] = not mouse_enabled[0]
-        status_text[0] = "mouse: ON (wheel scrolls)" if mouse_enabled[0] else "mouse: off (native copy)"
-        event.app.invalidate()
-
-    def _scroll(direction, count):
-        # output_window is not focused (input always is), so it doesn't
-        # get key events by default — drive it directly via the same
-        # _scroll_up/_scroll_down primitives prompt_toolkit's own
-        # mouse-wheel handling uses.
-        follow_bottom[0] = False  # manual scroll breaks auto-follow
-        step = output_window._scroll_up if direction == "up" else output_window._scroll_down
-        for _ in range(count):
-            step()
-
-    def _page_size():
-        info = output_window.render_info
-        return info.window_height if info is not None else 10
-
-    @kb.add("pageup")
-    def _(event):
-        _scroll("up", _page_size())
-        event.app.invalidate()
-
-    @kb.add("pagedown")
-    def _(event):
-        _scroll("down", _page_size())
-        event.app.invalidate()
-
-    @kb.add("c-u")
-    def _(event):
-        _scroll("up", 3)
-        event.app.invalidate()
-
-    @kb.add("c-d")
-    def _(event):
-        _scroll("down", 3)
-        event.app.invalidate()
-
-    @kb.add("up")
-    def _(event):
-        _scroll("up", 1)
-        event.app.invalidate()
-
-    @kb.add("down")
-    def _(event):
-        _scroll("down", 1)
-        event.app.invalidate()
-
-    @kb.add("enter")
-    def _(event):
-        text = input_buffer.text
-        input_buffer.text = ""
-        if not text.strip():
+    def _tick_spinner(self):
+        if not self.busy:
             return
-        if text.strip().lower() == "q":
-            event.app.exit()
+        self.spinner_i += 1
+        tree = self.query_one("#tools", Tree)
+        for node in self.tool_nodes:
+            data = node.data
+            if data and not data.done:
+                node.set_label(tool_label(data, SPINNER_FRAMES[self.spinner_i % len(SPINNER_FRAMES)]))
+        tree.refresh()
+
+    def action_toggle_last_tool(self):
+        if self.tool_nodes:
+            self.tool_nodes[-1].toggle()
+
+    def action_expand_all(self):
+        self.query_one("#tools", Tree).root.expand_all()
+
+    def action_collapse_all(self):
+        for node in self.tool_nodes:
+            node.collapse()
+
+    def on_unmount(self):
+        if self.proc is not None:
+            self.proc.terminate()
+
+    def add_bubble(self, text, role):
+        convo = self.query_one("#convo", VerticalScroll)
+        bubble_cls = "user-bubble" if role == "user" else "ai-bubble"
+        row = Vertical(classes="bubble-row")
+        convo.mount(row)
+        bubble = Static(text, classes=f"bubble {bubble_cls}")
+        row.mount(bubble)
+        convo.scroll_end(animate=False)
+        return bubble
+
+    def on_input_submitted(self, event: Input.Submitted):
+        text = event.value.strip()
+        event.input.value = ""
+        if not text:
             return
-
-        if busy[0]:
-            # Agent is still responding — don't send. Clear it from the
-            # input but show it "frozen" (grayed) in the transcript so
-            # it's clear it was blocked, not silently dropped.
-            state.add_static([("class:text.frozen", text + "  (not sent — press Esc to interrupt first)\n\n")])
-            follow_bottom[0] = True
-            refresh()
+        if text.lower() == "q":
+            self.exit()
             return
+        self.run_turn(text)
 
-        busy[0] = True
-        follow_bottom[0] = True
-        state.add_static([("class:text.you", text + "\n\n")])
-        state.start_spinner()
-        proc.stdin.write(text + "\n")
-        proc.stdin.flush()
-        status_text[0] = "thinking..."
-        refresh()
+    @work(exclusive=True, thread=True)
+    def run_turn(self, text):
+        tree = self.query_one("#tools", Tree)
 
-    @kb.add("escape")
-    def _(event):
-        if not busy[0]:
-            return
-        # Best-effort interrupt. live_cli.py's actual cancellation
-        # protocol is unknown to this file — if it expects something
-        # other than a "<<CANCEL>>" line (a signal, a different
-        # sentinel, etc.), tell me and I'll wire it to match.
-        try:
-            proc.stdin.write("<<CANCEL>>\n")
-            proc.stdin.flush()
-        except Exception:
-            pass
-        state.drop_spinner()
-        state.add_static([("class:dim", "(interrupted)\n\n")])
-        busy[0] = False
-        status_text[0] = "ready"
-        follow_bottom[0] = True
-        refresh()
+        self.call_from_thread(self.add_bubble, text, "user")
+        self.busy = True
 
-    app = Application(
-        layout=Layout(root, focused_element=input_window),
-        key_bindings=kb,
-        style=style,
-        full_screen=True,
-        mouse_support=Condition(lambda: mouse_enabled[0]),  # off by default; F2 to enable wheel-scroll
-    )
-    app_ref["app"] = app
-    threading.Thread(target=spinner_thread, args=(app, state), daemon=True).start()
+        self.proc.stdin.write(text + "\n")
+        self.proc.stdin.flush()
 
-    def poll_worker():
-        pending_tool = None
-        ai_line_open = False
+        pending_node = None
+        ai_text_parts = []
+        ai_bubble = None
 
-        def close_ai_line():
-            nonlocal ai_line_open
-            if ai_line_open:
-                state.add_static([("class:text.ai", "\n\n")])
-                ai_line_open = False
+        def flush_ai_text():
+            nonlocal ai_bubble
+            if ai_text_parts:
+                joined = " ".join(ai_text_parts).strip()
+                if ai_bubble is None:
+                    ai_bubble = self.call_from_thread(self.add_bubble, joined, "ai")
+                else:
+                    self.call_from_thread(ai_bubble.update, joined)
+                    convo = self.query_one("#convo", VerticalScroll)
+                    self.call_from_thread(convo.scroll_end, animate=False)
 
         while True:
-            item = out_q.get()
+            item = self.out_q.get()
             if item is SENTINEL:
-                status_text[0] = "worker closed the connection"
-                busy[0] = False
-                refresh()
-                break
+                self.busy = False
+                self.call_from_thread(self.add_bubble, "(worker closed the connection)", "ai")
+                return
 
             line = item.strip()
 
             if line.startswith("<<TOOL_START>>"):
-                state.drop_spinner()
                 try:
                     payload = json.loads(line[len("<<TOOL_START>>"):])
                     name, detail = payload["name"], payload["detail"]
                 except (json.JSONDecodeError, KeyError):
                     name, detail = "tool", "(unparsed)"
-                pending_tool = state.start_tool(name, detail)
-                status_text[0] = f"running {pending_tool.label}..."
-                refresh()
+                data = ToolNodeData(name, detail)
+
+                def add_tool_node(d=data):
+                    n = tree.root.add(tool_label(d), data=d)
+                    self.tool_nodes.append(n)
+                    return n
+
+                pending_node = self.call_from_thread(add_tool_node)
                 continue
 
             if line.startswith("<<TOOL_END>>"):
@@ -462,35 +320,38 @@ def main():
                     name, result = payload["name"], payload["result"]
                     result_text = json.dumps(result, indent=2)
                 except (json.JSONDecodeError, KeyError):
+                    result = None
                     result_text = "(unparsed result)"
-                if pending_tool is not None:
-                    pending_tool.result = result_text
-                pending_tool = None
-                status_text[0] = "thinking..."
-                refresh()
+                if pending_node is not None:
+                    data = pending_node.data
+                    data.done = True
+                    data.result = result_text
+                    data.stat = diff_stat(result)
+
+                    def finish_tool_node(n=pending_node, d=data, rt=result_text):
+                        n.set_label(tool_label(d))
+                        n.remove_children()
+                        for ln in (rt.splitlines() or [""]):
+                            n.add_leaf(Text(ln, style="dim"))
+
+                    self.call_from_thread(finish_tool_node)
+                pending_node = None
                 continue
 
             if line == "<<END>>":
-                state.drop_spinner()
-                close_ai_line()
-                busy[0] = False
-                status_text[0] = "ready"
-                refresh()
-                continue
+                flush_ai_text()
+                self.busy = False
+                return
 
             if line:
-                state.drop_spinner()
-                if not ai_line_open:
-                    ai_line_open = True
-                state.add_static([("class:text.ai", line + " ")])
-                refresh()
+                ai_text_parts.append(line)
+                flush_ai_text()
 
-    threading.Thread(target=poll_worker, daemon=True).start()
 
-    try:
-        app.run()
-    finally:
-        proc.terminate()
+def main():
+    talk = "--talk" in sys.argv[1:]
+    app = PriyaApp(talk=talk)
+    app.run()
 
 
 if __name__ == "__main__":

@@ -32,9 +32,7 @@ AGENTJOB_BIN = os.path.expanduser("~/agent/job_runner.py")
 
 agentjob_declaration = types.FunctionDeclaration(
     name="agentjob",
-    behavior="BLOCKING",  # gemini-3.8-live (non-extended-thinking) supports
-                          # BLOCKING; using it to avoid the async tool-call
-                          # path that was silently dropping calls.
+    behavior="BLOCKING",
     description=(
         "Manage a background coding subagent (Gemini 3.5 Flash Lite with shell access). "
         "Use 'spawn' to delegate a self-contained build/fix task - it runs in the "
@@ -97,7 +95,7 @@ def run_agentjob(args: dict) -> dict:
 
 bash_declaration = types.FunctionDeclaration(
     name="bash",
-    behavior="BLOCKING",  # see note on agentjob_declaration above.
+    behavior="BLOCKING",
     description=(
         "Run a bash command directly and return its output. Use this to read/write "
         "files, inspect a subagent's workdir, verify a subagent's claims, check "
@@ -181,22 +179,6 @@ def start_player():
 
 
 def emit_content(sc):
-    """Stream every text-bearing piece of a server_content chunk out,
-    in the order it actually arrived, regardless of whether it came in
-    as an audio transcription or as a text part of model_turn. This is
-    audio-first model (response_modalities=["AUDIO"]) so most or all of
-    what reaches here will be transcription text rather than model_turn
-    text parts — but both paths are checked every time so nothing that
-    does show up in either gets silently dropped.
-
-    If text still never appears in the UI after this, the transcription
-    itself is coming back empty from the API for this session — check
-    the RAW server_content dumps this file writes to stderr
-    (/tmp/priya_worker.log when run from priya_ui.py) to see whether
-    output_transcription.text is actually populated on the raw
-    response; if it's empty there too, this is a config/SDK-level
-    issue upstream of this function, not a UI or emission bug.
-    """
     if sc is None:
         return
 
@@ -284,7 +266,15 @@ class TextLoop:
                             if status in ("IDLE", "REQUIRES_ACTION"):
                                 idle = True
                     except StopAsyncIteration:
-                        pass
+                        # The turn's generator ended on its own — this IS
+                        # end-of-turn even when no interaction_status ever
+                        # arrived. Previously this was `pass`, which left
+                        # idle False and looped back into a second
+                        # self.session.receive() that then blocked up to
+                        # 90s waiting for a turn that was already over,
+                        # so <<END>> never fired and the UI stayed "busy"
+                        # forever after ordinary replies like "Pong!".
+                        idle = True
                     except asyncio.TimeoutError:
                         print("receive_text: stalled turn, forcing end", file=sys.stderr)
                         idle = True
