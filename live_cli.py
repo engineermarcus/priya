@@ -19,7 +19,6 @@ import subprocess
 import queue
 import threading
 import time
-from collections import deque
 
 from google import genai
 from google.genai import types
@@ -31,8 +30,7 @@ MIC = "--mic" in sys.argv[1:]
 if MIC:
     import pyaudio
     import webrtcvad
-    import numpy as np
-    from pywebrtc_audio import AudioProcessor
+    from filter import PlaybackEchoFilter
     FORMAT = pyaudio.paInt16
     CHANNELS = 1
     SEND_SAMPLE_RATE = 16000
@@ -47,6 +45,7 @@ client = genai.Client(
 )
 
 AGENTJOB_BIN = os.path.expanduser("~/agent/job_runner.py")
+INTERRUPT_COMMAND = "<<PRIYA_INTERRUPT>>"
 
 agentjob_declaration = types.FunctionDeclaration(
     name="agentjob",
@@ -214,6 +213,8 @@ CONFIG = types.LiveConnectConfig(
         "without checking its log or output yourself. If a tool call fails or errors, "
         "state the actual error message returned by the tool -- never say a generic "
         "'system error occurred'."
+        " The exact message '<<PRIYA_INTERRUPT>>' is an application control command, "
+        "not a user request: stop any response and produce no reply."
     ),
     speech_config=types.SpeechConfig(
         voice_config=types.VoiceConfig(
@@ -288,51 +289,22 @@ class MicrophoneProcessor:
 
     def __init__(self):
         self.vad = webrtcvad.Vad(3)
-        self.processor = AudioProcessor(
-            sample_rate=SEND_SAMPLE_RATE,
-            echo_cancellation=True,
-            noise_suppression=True,
-            high_pass_filter=True,
-            auto_gain_control=False,
-            ns_level=2,
-            stream_delay_ms=60,
-        )
-        self.far_24khz = deque()
-        self.far_16khz = deque()
+        self.filter = PlaybackEchoFilter(sample_rate=SEND_SAMPLE_RATE)
         self.speech_active = False
         self.silent_frames = 0
 
     def reset(self):
-        self.processor.reset()
-        self.far_24khz.clear()
-        self.far_16khz.clear()
+        self.filter.reset()
         self.speech_active = False
         self.silent_frames = 0
 
     def add_playback(self, pcm_24khz):
         """Add the PCM sent to aplay as the far-end AEC reference signal."""
-        self.far_24khz.extend(memoryview(pcm_24khz).cast("h"))
-        # Convert 24 kHz playback to 16 kHz for the microphone processor.
-        while len(self.far_24khz) >= 3:
-            first = self.far_24khz.popleft()
-            second = self.far_24khz.popleft()
-            third = self.far_24khz.popleft()
-            self.far_16khz.append(first)
-            self.far_16khz.append((second + third) // 2)
+        self.filter.add_playback_24khz(pcm_24khz)
 
     def process(self, microphone_pcm):
         """Return cleaned PCM and whether local VAD finalized an utterance."""
-        near = np.frombuffer(microphone_pcm, dtype="<i2")
-        if len(self.far_16khz) >= len(near):
-            far = np.fromiter(
-                (self.far_16khz.popleft() for _ in range(len(near))),
-                dtype=np.int16,
-                count=len(near),
-            )
-        else:
-            far = np.zeros(len(near), dtype=np.int16)
-        cleaned = self.processor.process(near, far)
-        cleaned_pcm = cleaned.astype("<i2", copy=False).tobytes()
+        cleaned_pcm = self.filter.process(microphone_pcm)
         voice = self.vad.is_speech(cleaned_pcm, SEND_SAMPLE_RATE)
 
         if voice:
@@ -357,6 +329,7 @@ class TextLoop:
         self.mic_stream = None
         self._tool_event_id = 0
         self.mic_processor = MicrophoneProcessor() if MIC else None
+        self._discard_until_idle = False
 
     def discard_playback(self):
         """Immediately drop audio queued in aplay after a server interruption."""
@@ -406,6 +379,20 @@ class TextLoop:
                 if speech_ended:
                     await self.session.send_realtime_input(audio_stream_end=True)
 
+    async def interrupt(self):
+        """Cut off the active Live generation without closing the session."""
+        self._discard_until_idle = True
+        self.discard_playback()
+        if self.mic_processor is not None:
+            self.mic_processor.reset()
+        if self.session is not None:
+            # Gemini 3.8 Live defines completed client content as an
+            # unconditional interruption of an active generation.
+            await self.session.send_client_content(
+                turns={"role": "user", "parts": [{"text": INTERRUPT_COMMAND}]},
+                turn_complete=True,
+            )
+
     async def send_text(self):
         while True:
             if PIPED:
@@ -416,6 +403,9 @@ class TextLoop:
             else:
                 text = await asyncio.to_thread(input, "message > ")
 
+            if text == INTERRUPT_COMMAND:
+                await self.interrupt()
+                continue
             if text.lower() == "q":
                 break
             if self.session is not None:
@@ -441,7 +431,9 @@ class TextLoop:
                         sc = response.server_content
                         print(f"RAW: {response}", file=sys.stderr)
 
-                        emit_input_transcription(sc)
+                        suppress_response = self._discard_until_idle
+                        if not suppress_response:
+                            emit_input_transcription(sc)
 
                         was_interrupted = bool(sc is not None and sc.interrupted)
                         if was_interrupted:
@@ -452,7 +444,7 @@ class TextLoop:
                             if self.mic_processor is not None:
                                 self.mic_processor.reset()
 
-                        if response.tool_call:
+                        if response.tool_call and not suppress_response:
                             saw_tool_call = True
                             function_responses = []
                             for fc in response.tool_call.function_calls:
@@ -489,9 +481,11 @@ class TextLoop:
                                 function_responses=function_responses
                             )
 
-                        emit_content(sc)
+                        if not suppress_response:
+                            emit_content(sc)
 
-                        if TALK and response.data and self.player is not None and not was_interrupted:
+                        if (TALK and response.data and self.player is not None
+                                and not was_interrupted and not suppress_response):
                             if self.mic_processor is not None:
                                 self.mic_processor.add_playback(response.data)
                             self.player.stdin.write(response.data)
@@ -499,6 +493,8 @@ class TextLoop:
 
                         status = getattr(sc, "interaction_status", None) if sc is not None else None
                         if status == "IDLE":
+                            if self._discard_until_idle:
+                                self._discard_until_idle = False
                             reached_idle = True
                             break
                 except StopAsyncIteration:

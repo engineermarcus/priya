@@ -236,6 +236,7 @@ class PriyaApp(App):
         ("ctrl+o", "toggle_last_tool", "Expand/collapse last tool"),
         ("ctrl+e", "expand_all", "Expand all"),
         ("ctrl+r", "collapse_all", "Collapse all"),
+        ("escape", "interrupt", "Stop response"),
         ("ctrl+c", "quit", "Quit"),
     ]
 
@@ -269,7 +270,7 @@ class PriyaApp(App):
         yield Static(f"  {MODEL_NAME}  \u00b7  {os.getcwd()}", id="statusbar")
         placeholder = "Type or speak your message\u2026" if self.mic else "Type your message\u2026"
         yield Input(placeholder=placeholder, id="inputbar")
-        yield Static("^o expand  ^e all  ^r collapse  ^c quit", id="keybar")
+        yield Static("esc stop  ^o expand  ^e all  ^r collapse  ^c quit", id="keybar")
 
     def on_mount(self):
         cmd = [sys.executable, WORKER]
@@ -465,6 +466,17 @@ class PriyaApp(App):
     def action_collapse_all(self):
         for node, tree in self._all_tool_nodes:
             node.collapse()
+
+    def action_interrupt(self):
+        """Ask the persistent Live worker to interrupt its current response."""
+        if self.proc is None or self.proc.stdin is None:
+            return
+        try:
+            with self._stdin_lock:
+                self.proc.stdin.write("<<PRIYA_INTERRUPT>>\n")
+                self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self.ui_q.put(WorkerClosed())
 
     # ── Input ────────────────────────────────────────────────────────────────
 
