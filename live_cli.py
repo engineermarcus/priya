@@ -20,7 +20,7 @@ import subprocess
 from google import genai
 from google.genai import types
 
-MODEL = "models/gemini-3.8-live"
+MODEL = "gemini-3.8-live-extended-thinking"
 TALK = "--talk" in sys.argv[1:]
 
 client = genai.Client(
@@ -32,7 +32,7 @@ AGENTJOB_BIN = os.path.expanduser("~/agent/job_runner.py")
 
 agentjob_declaration = types.FunctionDeclaration(
     name="agentjob",
-    behavior="BLOCKING",
+    behavior="NON_BLOCKING",
     description=(
         "Manage a background coding subagent (Gemini 3.5 Flash Lite with shell access). "
         "Use 'spawn' to delegate a self-contained build/fix task - it runs in the "
@@ -95,7 +95,7 @@ def run_agentjob(args: dict) -> dict:
 
 bash_declaration = types.FunctionDeclaration(
     name="bash",
-    behavior="BLOCKING",
+    behavior="NON_BLOCKING",
     description=(
         "Run a bash command directly and return its output. Use this to read/write "
         "files, inspect a subagent's workdir, verify a subagent's claims, check "
@@ -135,14 +135,16 @@ def run_bash(args: dict) -> dict:
 
 CONFIG = types.LiveConnectConfig(
     response_modalities=["AUDIO"],
-    output_audio_transcription={},
+    output_audio_transcription=types.AudioTranscriptionConfig(),
     system_instruction=(
-        "You are Priya, a helpful assistant. You have a 'bash' tool for direct shell "
+        "You are Priya. For ANY request that touches files, commands, code, processes, or system state, you MUST call the 'bash' or 'agentjob' tool before responding -- never answer from assumption, and never claim an error occurred unless a tool call actually returned one. You have a 'bash' tool for direct shell "
         "access, and an 'agentjob' tool to delegate self-contained coding tasks to a "
         "background subagent. Prefer spawning agentjob for substantial builds so you "
         "can keep talking with the user; use bash directly for quick checks, reading "
         "files, or verifying a subagent's work. Never trust a subagent's 'done' claim "
-        "without checking its log or output yourself."
+        "without checking its log or output yourself. If a tool call fails or errors, "
+        "state the actual error message returned by the tool -- never say a generic "
+        "'system error occurred'."
     ),
     speech_config=types.SpeechConfig(
         voice_config=types.VoiceConfig(
@@ -152,6 +154,7 @@ CONFIG = types.LiveConnectConfig(
         ),
         language_code="en-IN",
     ),
+    thinking_config=types.ThinkingConfig(thinking_level="medium"),
     context_window_compression=types.ContextWindowCompressionConfig(
         trigger_tokens=120000,
         sliding_window=types.SlidingWindow(target_tokens=60000),
@@ -229,7 +232,7 @@ class TextLoop:
                     turn = self.session.receive()
                     try:
                         while True:
-                            response = await asyncio.wait_for(turn.__anext__(), timeout=90)
+                            response = await asyncio.wait_for(turn.__anext__(), timeout=180)
                             sc = response.server_content
                             print(f"RAW: {response}", file=sys.stderr)
 
@@ -263,7 +266,7 @@ class TextLoop:
                                 self.player.stdin.flush()
 
                             status = getattr(sc, "interaction_status", None) if sc is not None else None
-                            if status in ("IDLE", "REQUIRES_ACTION"):
+                            if status == "IDLE":
                                 idle = True
                     except StopAsyncIteration:
                         # The turn's generator ended on its own — this IS
@@ -287,6 +290,7 @@ class TextLoop:
                 asyncio.TaskGroup() as tg,
             ):
                 self.session = session
+                await asyncio.sleep(0.1)
                 send_text_task = tg.create_task(self.send_text())
                 tg.create_task(self.receive_text())
                 await send_text_task

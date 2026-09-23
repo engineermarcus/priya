@@ -39,7 +39,7 @@ from rich.text import Text
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(DIR, "live_cli.py")
-MODEL_NAME = "gemini-3.8-live"
+MODEL_NAME = "gemini-3.8-live-extended-thinking"
 
 SENTINEL = object()
 
@@ -48,6 +48,10 @@ DOT = "\u25cf"
 CHECK = "\u2713"
 SPINNER_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c",
                    "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"]
+THINKING_FRAMES = ["\u280b thinking\u2026", "\u2819 thinking\u2026", "\u2839 thinking\u2026",
+                    "\u2838 thinking\u2026", "\u283c thinking\u2026", "\u2834 thinking\u2026",
+                    "\u2826 thinking\u2026", "\u2827 thinking\u2026", "\u2807 thinking\u2026",
+                    "\u280f thinking\u2026"]
 
 _ADD_KEYS = ("added", "inserted", "lines_added", "additions")
 _DEL_KEYS = ("removed", "deleted", "lines_removed", "deletions")
@@ -129,28 +133,22 @@ class PriyaApp(App):
     .bubble {
         width: auto;
         max-width: 70%;
-        padding: 1 2;
+        padding: 0 1;
+        border: none;
     }
     .user-bubble {
-        background: #262626;
+        background: #1b1b1b;
         margin-left: 2;
     }
     .ai-bubble {
-        background: #1a1a1a;
+        background: #111111;
         margin-left: 6;
     }
-    #tools {
+    .turn-tools {
         height: auto;
-        max-height: 40%;
         border: none;
-        padding: 0 1;
-        scrollbar-size: 1 1;
-        scrollbar-color: transparent;
-        scrollbar-color-hover: transparent;
-        scrollbar-color-active: transparent;
-        scrollbar-background: transparent;
-        scrollbar-background-hover: transparent;
-        scrollbar-background-active: transparent;
+        margin: 0 0 1 6;
+        padding: 0;
     }
     #inputbar {
         dock: bottom;
@@ -190,15 +188,11 @@ class PriyaApp(App):
         self.tool_nodes = []          # flat list of TreeNode, in call order
         self.spinner_i = 0
         self._spinner_timer = None
+        self._thinking_bubble = None
 
     def compose(self) -> ComposeResult:
         convo = VerticalScroll(id="convo")
         yield convo
-        tree: Tree = Tree("tools", id="tools")
-        tree.root.expand()
-        tree.show_root = False
-        tree.guide_depth = 3
-        yield tree
         yield Static(f"model: {MODEL_NAME}   cwd: {os.getcwd()}", id="statusbar")
         yield Input(placeholder="Type your message…  (Ctrl+O expands last tool call)",
                      id="inputbar")
@@ -222,27 +216,45 @@ class PriyaApp(App):
         if not self.busy:
             return
         self.spinner_i += 1
-        tree = self.query_one("#tools", Tree)
-        for node in self.tool_nodes:
+        refreshed = set()
+        for node, tree in self.tool_nodes:
             data = node.data
             if data and not data.done:
                 node.set_label(tool_label(data, SPINNER_FRAMES[self.spinner_i % len(SPINNER_FRAMES)]))
-        tree.refresh()
+            if id(tree) not in refreshed:
+                tree.refresh()
+                refreshed.add(id(tree))
+        if self._thinking_bubble is not None:
+            frame = THINKING_FRAMES[self.spinner_i % len(THINKING_FRAMES)]
+            self._thinking_bubble.update(frame)
 
     def action_toggle_last_tool(self):
         if self.tool_nodes:
-            self.tool_nodes[-1].toggle()
+            self.tool_nodes[-1][0].toggle()
 
     def action_expand_all(self):
-        self.query_one("#tools", Tree).root.expand_all()
+        for node, tree in self.tool_nodes:
+            tree.root.expand_all()
 
     def action_collapse_all(self):
-        for node in self.tool_nodes:
+        for node, tree in self.tool_nodes:
             node.collapse()
 
     def on_unmount(self):
         if self.proc is not None:
             self.proc.terminate()
+
+    def show_thinking(self):
+        convo = self.query_one("#convo", VerticalScroll)
+        bubble = Static(THINKING_FRAMES[0], classes="bubble ai-bubble thinking-bubble")
+        self._thinking_bubble = bubble
+        convo.mount(bubble)
+        convo.scroll_end(animate=False)
+
+    def hide_thinking(self):
+        if self._thinking_bubble is not None:
+            self._thinking_bubble.remove()
+            self._thinking_bubble = None
 
     def add_bubble(self, text, role):
         convo = self.query_one("#convo", VerticalScroll)
@@ -264,12 +276,22 @@ class PriyaApp(App):
             return
         self.run_turn(text)
 
+    def _make_turn_tree(self):
+        """Create a fresh inline Tree widget mounted into #convo for this turn."""
+        convo = self.query_one("#convo", VerticalScroll)
+        tree = Tree("", classes="turn-tools")
+        tree.root.expand()
+        tree.show_root = False
+        tree.guide_depth = 3
+        convo.mount(tree)
+        return tree
+
     @work(exclusive=True, thread=True)
     def run_turn(self, text):
-        tree = self.query_one("#tools", Tree)
-
         self.call_from_thread(self.add_bubble, text, "user")
         self.busy = True
+        self.call_from_thread(self.show_thinking)
+        turn_tree = self.call_from_thread(self._make_turn_tree)
 
         self.proc.stdin.write(text + "\n")
         self.proc.stdin.flush()
@@ -283,6 +305,7 @@ class PriyaApp(App):
             if ai_text_parts:
                 joined = " ".join(ai_text_parts).strip()
                 if ai_bubble is None:
+                    self.call_from_thread(self.hide_thinking)
                     ai_bubble = self.call_from_thread(self.add_bubble, joined, "ai")
                 else:
                     self.call_from_thread(ai_bubble.update, joined)
@@ -306,9 +329,9 @@ class PriyaApp(App):
                     name, detail = "tool", "(unparsed)"
                 data = ToolNodeData(name, detail)
 
-                def add_tool_node(d=data):
-                    n = tree.root.add(tool_label(d), data=d)
-                    self.tool_nodes.append(n)
+                def add_tool_node(d=data, tt=turn_tree):
+                    n = tt.root.add(tool_label(d), data=d)
+                    self.tool_nodes.append((n, tt))
                     return n
 
                 pending_node = self.call_from_thread(add_tool_node)
@@ -328,11 +351,12 @@ class PriyaApp(App):
                     data.result = result_text
                     data.stat = diff_stat(result)
 
-                    def finish_tool_node(n=pending_node, d=data, rt=result_text):
+                    def finish_tool_node(n=pending_node, d=data, rt=result_text, tt=turn_tree):
                         n.set_label(tool_label(d))
                         n.remove_children()
                         for ln in (rt.splitlines() or [""]):
                             n.add_leaf(Text(ln, style="dim"))
+                        tt.refresh()
 
                     self.call_from_thread(finish_tool_node)
                 pending_node = None
