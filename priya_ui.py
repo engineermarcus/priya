@@ -39,7 +39,7 @@ from rich.text import Text
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(DIR, "live_cli.py")
-MODEL_NAME = "gemini-3.8-live-extended-thinking"
+MODEL_NAME = "gemini-3.8-live"
 
 SENTINEL = object()
 

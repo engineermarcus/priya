@@ -20,7 +20,7 @@ import subprocess
 from google import genai
 from google.genai import types
 
-MODEL = "gemini-3.8-live-extended-thinking"
+MODEL = "gemini-3.8-live"
 TALK = "--talk" in sys.argv[1:]
 
 client = genai.Client(
@@ -154,7 +154,6 @@ CONFIG = types.LiveConnectConfig(
         ),
         language_code="en-IN",
     ),
-    thinking_config=types.ThinkingConfig(thinking_level="medium"),
     context_window_compression=types.ContextWindowCompressionConfig(
         trigger_tokens=120000,
         sliding_window=types.SlidingWindow(target_tokens=60000),
@@ -243,9 +242,9 @@ class TextLoop:
                                     detail = args_dict.get("command") or args_dict.get("task") or json.dumps(args_dict)
                                     out("<<TOOL_START>>" + json.dumps({"name": fc.name, "detail": detail}))
                                     if fc.name == "agentjob":
-                                        result = run_agentjob(args_dict)
+                                        result = await asyncio.to_thread(run_agentjob, args_dict)
                                     elif fc.name == "bash":
-                                        result = run_bash(args_dict)
+                                        result = await asyncio.to_thread(run_bash, args_dict)
                                     else:
                                         result = {"error": f"unknown tool {fc.name}"}
                                     print(f"TOOL CALL: {fc.name} {args_dict} -> {result}", file=sys.stderr)
