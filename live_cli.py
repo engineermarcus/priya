@@ -19,6 +19,7 @@ import subprocess
 import queue
 import threading
 import time
+from collections import deque
 
 from google import genai
 from google.genai import types
@@ -29,10 +30,13 @@ MIC = "--mic" in sys.argv[1:]
 
 if MIC:
     import pyaudio
+    import webrtcvad
     FORMAT = pyaudio.paInt16
     CHANNELS = 1
     SEND_SAMPLE_RATE = 16000
-    CHUNK_SIZE = 1024
+    # WebRTC VAD accepts 10, 20, or 30 ms frames. Thirty milliseconds gives
+    # low latency without treating tiny room sounds as a complete utterance.
+    CHUNK_SIZE = 480
     pya = pyaudio.PyAudio()
 
 client = genai.Client(
@@ -185,6 +189,17 @@ CONFIG = types.LiveConnectConfig(
     # text and tool activity are rendered alongside playback.
     input_audio_transcription=types.AudioTranscriptionConfig(),
     output_audio_transcription=types.AudioTranscriptionConfig(),
+    # Keep Gemini's automatic VAD as the authoritative fallback. The client
+    # also detects speech and sends audio_stream_end for faster finalization.
+    realtime_input_config=types.RealtimeInputConfig(
+        automatic_activity_detection=types.AutomaticActivityDetection(
+            disabled=False,
+            start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+            end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+            prefix_padding_ms=120,
+            silence_duration_ms=700,
+        )
+    ),
     system_instruction=(
         "You are Priya. For ANY request that touches files, commands, code, processes, or system state, you MUST call the 'bash' or 'agentjob' tool before responding -- never answer from assumption, and never claim an error occurred unless a tool call actually returned one. You have a 'bash' tool for direct shell "
         "access, and an 'agentjob' tool to delegate self-contained coding tasks to a "
@@ -263,6 +278,62 @@ def emit_input_transcription(sc):
         out("<<USER_SPEECH>>" + text)
 
 
+class MicrophoneGate:
+    """Reject non-speech and mark the end of local speech for hybrid VAD."""
+
+    def __init__(self):
+        self.vad = webrtcvad.Vad(3)
+        self.noise_floor = 80.0
+        self.pre_roll = deque(maxlen=7)  # 210 ms, preserves the first syllable
+        self.active = False
+        self.silent_frames = 0
+
+    @staticmethod
+    def rms(frame):
+        samples = memoryview(frame).cast("h")
+        if not samples:
+            return 0.0
+        return (sum(sample * sample for sample in samples) / len(samples)) ** 0.5
+
+    def reset(self):
+        self.pre_roll.clear()
+        self.active = False
+        self.silent_frames = 0
+
+    def process(self, frame):
+        """Return (frames_to_send, speech_ended) for one 30 ms PCM frame."""
+        level = self.rms(frame)
+        voice = level >= max(180.0, self.noise_floor * 2.5) and self.vad.is_speech(
+            frame, SEND_SAMPLE_RATE
+        )
+        if not voice:
+            self.noise_floor = self.noise_floor * 0.97 + level * 0.03
+
+        if not self.active:
+            self.pre_roll.append((frame, voice))
+            # Require three voiced frames in the most recent 120 ms. This
+            # rejects clicks, keyboard taps, fans, and short speaker echoes.
+            if sum(is_voice for _, is_voice in self.pre_roll) < 3:
+                return [], False
+            self.active = True
+            self.silent_frames = 0
+            frames = [saved_frame for saved_frame, _ in self.pre_roll]
+            self.pre_roll.clear()
+            return frames, False
+
+        if voice:
+            self.silent_frames = 0
+            return [frame], False
+
+        self.silent_frames += 1
+        # Retain a little natural pause in the stream, then promptly finalize
+        # through Gemini's hybrid VAD path.
+        if self.silent_frames <= 10:
+            return [frame], False
+        self.reset()
+        return [], True
+
+
 class TextLoop:
     def __init__(self):
         self.session = None
@@ -270,6 +341,8 @@ class TextLoop:
         self.mic_queue = asyncio.Queue(maxsize=10) if MIC else None
         self.mic_stream = None
         self._tool_event_id = 0
+        self.mic_gate = MicrophoneGate() if MIC else None
+        self.mic_muted_until = 0.0
 
     async def listen_audio(self):
         """Reads mic PCM chunks off-thread and queues them for send_audio."""
@@ -287,17 +360,25 @@ class TextLoop:
             data = await asyncio.to_thread(
                 self.mic_stream.read, CHUNK_SIZE, exception_on_overflow=False
             )
-            await self.mic_queue.put(data)
+            # Keep a capture timestamp: delayed frames recorded while Priya
+            # was speaking must not be sent after audio playback ends.
+            await self.mic_queue.put((time.monotonic(), data))
 
     async def send_audio(self):
-        """Streams queued mic chunks to the session. Server-side VAD handles turn
-        boundaries automatically -- no explicit activity_start/end needed."""
+        """Use local noise/VAD gating with Gemini's automatic VAD as fallback."""
         while True:
-            data = await self.mic_queue.get()
+            captured_at, data = await self.mic_queue.get()
+            if captured_at < self.mic_muted_until:
+                self.mic_gate.reset()
+                continue
+            frames, speech_ended = self.mic_gate.process(data)
             if self.session is not None:
-                await self.session.send_realtime_input(
-                    audio={"data": data, "mime_type": "audio/pcm;rate=16000"}
-                )
+                for frame in frames:
+                    await self.session.send_realtime_input(
+                        audio={"data": frame, "mime_type": "audio/pcm;rate=16000"}
+                    )
+                if speech_ended:
+                    await self.session.send_realtime_input(audio_stream_end=True)
 
     async def send_text(self):
         while True:
@@ -378,6 +459,14 @@ class TextLoop:
                         if TALK and response.data:
                             self.player.stdin.write(response.data)
                             self.player.stdin.flush()
+                            # The microphone can pick up speakers in the same
+                            # room. Do not feed model audio back as user speech;
+                            # the tail also absorbs the aplay device buffer.
+                            playback_seconds = len(response.data) / (24000 * 2)
+                            self.mic_muted_until = max(
+                                self.mic_muted_until,
+                                time.monotonic() + playback_seconds + 0.45,
+                            )
 
                         status = getattr(sc, "interaction_status", None) if sc is not None else None
                         if status == "IDLE":

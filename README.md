@@ -37,6 +37,10 @@ python priya.py --mic
 `--talk` plays the model's live audio response. `--mic` captures microphone
 audio, displays the final speech transcription as a user message, and enables
 model audio playback while retaining streamed text and tool results in the UI.
+Microphone mode uses local WebRTC voice activity detection, drops background
+noise, and mutes microphone frames captured during Priya's playback to prevent
+speaker echo from becoming a new model turn. Headphones remain the most robust
+audio setup.
 
 Press `Ctrl+C` to exit. In the input field, enter `q` to quit.
 
