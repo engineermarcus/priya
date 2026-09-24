@@ -53,6 +53,15 @@ SPINNER_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c",
                    "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"]
 THINKING_FRAMES = [f + " thinking\u2026" for f in SPINNER_FRAMES]
 
+LOGO_ART = r"""    ▄▄█▀▓████░    ▄▄█▀▓████░ ▓████░ ▓████░ ░████▓    ▄▄░▀▓▄▄
+ ▄▄██▓ ▓████░  ▄▄██▓ ▒████▒ ▒████░ ▒████░ ▒████▒  ▄▄██░ ▓██▄▄
+▐████▓ ▒████▒ ▐████▓ ░████▓ ▄▄▄▄▄▄ ░█████▄█████░ ▐████▒ ▒████▌
+░████▓ ░████▓ ░████▓ ▄▄▄▄▄▄ ░████▒ ▄▄▄▄▄▄ ▒█████ ░████▒ ▒████░
+▒█████▄█████░ ▒████▒ ▓████░ ▒████▓ ▒████▒ ▒████░ ▒████▓ ▒████▒
+▒████▒        ▒████▒ ▒████▒ ▒████▓ ▐▒███░ ▓███▒▌ ▒████▓ ░████▒
+▓████░        ▓████░ ░████▒ ▓█████  ▀▓██░ ▓██▓▀  ▓█████ ░████▓
+▓████░        ▓████░ ░████▓ ▓█████    ▀▀█▄█▀▀    ▓█████ ░████▓"""
+
 _ADD_KEYS = ("added", "inserted", "lines_added", "additions")
 _DEL_KEYS = ("removed", "deleted", "lines_removed", "deletions")
 _URL_PATTERN = re.compile(r"https?://[^\s<>\]\[\"']+")
@@ -282,6 +291,15 @@ class PriyaApp(App):
         scrollbar-background: transparent;
     }
 
+    #logo {
+        width: 100%;
+        height: auto;
+        padding: 0 2;
+        color: #60a5fa;
+        background: transparent;
+        border-bottom: double #315a8f;
+    }
+
     .turn {
         width: 100%;
         height: auto;
@@ -449,6 +467,7 @@ class PriyaApp(App):
         self._background_job_status = None
 
     def compose(self) -> ComposeResult:
+        yield Static(LOGO_ART, id="logo")
         yield VerticalScroll(id="convo")
         yield Static(f"  {MODEL_NAME}  \u00b7  {os.getcwd()}", id="statusbar")
         placeholder = "Type or speak your message\u2026" if self.mic else "Type your message\u2026"
