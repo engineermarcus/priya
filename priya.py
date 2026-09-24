@@ -640,16 +640,8 @@ class PriyaApp(App):
         data.result = result_text
         data.stat = stat
         node.set_label(tool_label(data))
-        if data.name == "agentjob":
-            # A spawned job keeps appending live milestones to this completed
-            # tool call. The raw spawn/status JSON is internal bookkeeping and
-            # makes the useful narrative hard to find.
-            node.add_leaf(Text("Live milestones below", style="dim #64748b"))
-        else:
-            if node.children:
-                node.add_leaf(Text("result", style="bold #94a3b8"))
-            for ln in (result_text.splitlines() or [""]):
-                node.add_leaf(colorize_tool_text(ln, result=True))
+        # Tool results remain available to Priya internally, while the
+        # expandable transcript stays focused on useful streamed log entries.
         if self._cur_tool_node is node:
             self._cur_tool_node = None
         for n, t in self._all_tool_nodes:
