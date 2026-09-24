@@ -93,7 +93,11 @@ def diff_stat(result):
 
 def colorize_tool_text(value, stream="stdout", *, result=False):
     """Return a compact terminal-style Rich label without altering log text."""
-    base = "#aeb8c8" if stream == "stdout" else "#fbbf24"
+    base = {
+        "stdout": "#7c8798",
+        "stderr": "#a18a66",
+        "agentjob": "#8b93a7",
+    }.get(stream, "#7c8798")
     text = Text(value, style=base)
 
     if result:
@@ -119,11 +123,16 @@ def colorize_tool_text(value, stream="stdout", *, result=False):
 
 
 def tool_log_label(stream, value):
-    """Render live logs quietly; final results retain richer status colors."""
+    """Render compact, muted logs with color reserved for meaningful tokens."""
     label = Text()
-    label.append(f"{stream}", style="dim #64748b")
+    stream_style = {
+        "stdout": "dim #64748b",
+        "stderr": "dim #d6a56e",
+        "agentjob": "dim #a5b4fc",
+    }.get(stream, "dim #64748b")
+    label.append(f"{stream}", style=stream_style)
     label.append(" │ ", style="dim #475569")
-    label.append(value, style="dim #7c8798")
+    label.append_text(colorize_tool_text(value, stream))
     return label
 
 
@@ -147,6 +156,10 @@ class PriyaInput(Input):
     def _on_paste(self, event: Paste) -> None:
         # Textual Input's default handler keeps only the first pasted line.
         # Flatten line breaks so a pasted prompt remains one complete message.
+        # This class handler runs in addition to Input's default handler unless
+        # it is explicitly suppressed, which otherwise inserts the first line
+        # a second time.
+        event.prevent_default()
         pasted = " ".join(event.text.splitlines())
         if pasted:
             selection = self.selection
@@ -342,11 +355,14 @@ class PriyaApp(App):
     .turn-tools {
         width: 100%;
         height: auto;
+        min-height: 1;
+        max-height: 12;
         margin: 0 0 1 2;
         padding: 0;
         border: none;
+        background: transparent;
     }
-    .turn-tools Tree {
+    .turn-tools {
         background: transparent;
     }
     .turn-tools .tree--label {
