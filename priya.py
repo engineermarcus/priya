@@ -278,7 +278,7 @@ class AgentJobResult(Msg):
 class PriyaApp(App):
     CSS = """
     Screen {
-        background: #0a0a0a;
+        background: #121212;
     }
 
     #convo {
@@ -419,17 +419,18 @@ class PriyaApp(App):
         height: 3;
         border: none;
         padding: 0 2;
-        background: #0a0a0a;
+        background: #242424;
     }
     #inputbar Input {
         border: none;
+        background: #242424;
     }
     #inputbar Input:focus {
         border: none;
     }
     #inputbar.-disabled {
         color: #525252;
-        background: #111111;
+        background: #242424;
     }
     """
 
