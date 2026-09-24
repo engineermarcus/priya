@@ -11,7 +11,7 @@ automatically, so the user sees narration and bash-like output while they can
 continue chatting normally.
 
 - `agentjob spawn "<task>" [workdir]` → `{job_id, workdir}`. Without a workdir,
-  it works in the repository root.
+  it works in Priya's starting directory.
 - `agentjob status <job_id>` → `{status, reason, turn, workdir, ...}`.
 - `agentjob log <job_id> [cursor]` → structured journal events after a cursor,
   with `next_cursor` for the next incremental poll. Live UI tailing is automatic.
@@ -117,16 +117,85 @@ for the user's approval; cancelling leaves the file untouched.
 - Edits reject missing or ambiguous old text, stale reads, and changes made
   while approval is pending.
 
+# IMPLEMENTED: GLOB
+
+`Glob` discovers files from the live filesystem in Priya's current working
+directory. It returns canonical paths for files only, without reading or
+modifying their contents. Relative patterns honor the active WorkTree scope
+and it remains available in Plan Mode.
+
+- `Glob {patterns, max_results?}` → `{files, count, truncated, workdir}`.
+- `**` crosses any number of directory levels; `*` stays within one level;
+  `?` matches one character; `{js,ts}` matches either alternative.
+- Prefix a pattern with `!` to exclude it. Include at least one positive
+  pattern, for example `['src/**/*.{js,ts}', '!**/node_modules/**']`.
+- Results are sorted, default to at most 1,000 returned files, and can be
+  capped with `max_results` (up to 10,000).
+
+# IMPLEMENTED: GREP
+
+`Grep` searches live file contents with ripgrep-compatible regular expressions.
+It is a read-only tool for debugging reported failures and checking that an
+implementation was applied consistently. It is available in Plan Mode and
+honors the active WorkTree scope.
+
+- `Grep {pattern, path?, case_sensitive?, max_results?}` →
+  `{matches: [{path, line_number, line}], count, truncated, scope}`.
+- `path` limits the search to a file or directory inside the current working
+  directory; it defaults to the whole current scope.
+- Matching is case-sensitive by default. Set `case_sensitive: false` for a
+  case-insensitive search. Results are live and capped at 1,000 by default,
+  configurable up to 10,000.
+- Searches respect ripgrep's normal ignore rules, such as `.gitignore`.
+
+# IMPLEMENTED: LSP
+
+`LSP` owns a persistent Language Server Protocol process per active workspace
+and language, synchronizing source content before every semantic query.
+
+- `LSP {action: 'definition'|'references'|'hover', path, line, character?}`
+  resolves a symbol at one-based `line` and zero-based `character`.
+- `LSP {action: 'document_symbols'|'diagnostics', path}` returns a semantic
+  outline or language-server diagnostics. `workspace_symbols` additionally
+  accepts `query` and a source `path` to choose the language server.
+- `LSP {action: 'status'}` reports running servers. Python, JavaScript/
+  TypeScript, Go, and Rust are auto-detected; if the needed executable is not
+  installed, the tool returns its concrete name instead of falling back to text
+  matching.
+
+# IMPLEMENTED: LISTMCPRESOURCESTOOL
+
+`ListMcpResourcesTool` discovers the live resource catalog of every configured
+stdio MCP server. MCP definitions come from `PRIYA_MCP_SERVERS` (a JSON object)
+or `.priya/mcp_servers.json` in the active workspace. Each server definition
+uses `command`, optional `args`, optional `cwd`, and optional string `env`.
+
+- `ListMcpResourcesTool {}` → `{servers, resources, resource_templates, count,
+  template_count}`. Every resource/template is annotated with its `server`,
+  alongside server-supplied URI, name, MIME type, description, and metadata.
+- Connections are initialized once and persist for the active workspace.
+  Listings paginate dynamically, so each call reflects current server state.
+- An absent configuration returns an empty catalog. One failed server is
+  reported in `servers` without hiding resources from healthy servers.
+
+# IMPLEMENTED: PLAN MODE AND WORKTREE SCOPE
+
+These are session-state controls. They do not edit files directly; they change
+what later tools are allowed to do and where they operate.
+
+- `EnterPlanMode {}` → enables read-only planning. `Read`, `CronList`, and the
+  state controls still work, but `bash`, `Edit`, `agentjob`, `artifact`, and
+  Cron mutations are blocked until Plan Mode exits.
+- `ExitPlanMode {}` → returns Priya to normal executable mode.
+- `EnterWorkTree {path}` → scopes relative `Read`, `Edit`, `bash`, and new
+  `agentjob spawn` calls to an existing git worktree directory. Switching scope
+  clears prior Read approvals so edits cannot reuse stale reads from another
+  tree.
+- `ExitWorkTree {}` → returns Priya to the directory from which it was started and
+  clears prior Read approvals again.
+
 # COMING SOON
 
-- EnterPlanMode
-- EnterWorktree
-- ExitPlanMode
-- ExitWorktree
-- Glob
-- Grep
-- LSP
-- ListMcpResourcesTool
 - Monitor
 - PushNotification
 - ReadMcpResourceTool

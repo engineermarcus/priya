@@ -46,7 +46,11 @@ Press `Ctrl+C` to exit. In the input field, enter `q` to quit.
 
 ## Tools
 
-The model can call `bash` for local shell work and `agentjob` for non-trivial
+Priya takes intent, not tool instructions: it discovers relevant files,
+searches code, inspects project state, implements changes, and verifies results
+without requiring you to supply paths, glob patterns, shell commands, or a
+step-by-step plan. It can call `Glob` for file discovery, `Grep` for content
+search, `Read` for exact text, `bash` for local shell work, and `agentjob` for non-trivial
 front-end implementation in this repository, including pages, components,
 layouts, styles, and browser interactions. `agentjob` runs in the background,
 so Priya can continue a normal conversation while it works. Its agent narrates
@@ -56,6 +60,27 @@ Priya still inspects and verifies the changed files before reporting completion.
 `agentjob` uses the repository-local runner at `tools/job_runner.py`. Its
 transient job state and append-only event journal live under `.priya/jobs/`
 (ignored by Git).
+
+Priya also keeps Language Server Protocol (LSP) processes alive per active
+workspace and language. The `LSP` tool resolves definitions and references,
+inspects hover/type information and diagnostics, and lists semantic symbols.
+It synchronizes each source file from disk before querying, so its answers
+track edits made during the session. Install `pyright-langserver` or `pylsp`
+for Python, `typescript-language-server` for JavaScript/TypeScript, `gopls`
+for Go, or `rust-analyzer` for Rust.
+
+For connected services, `ListMcpResourcesTool` discovers the live resources
+provided by configured stdio MCP servers before Priya reasons about a database,
+API, or other external system. Configure servers with a `PRIYA_MCP_SERVERS`
+JSON object or `.priya/mcp_servers.json` in the active workspace; each entry
+contains a `command` and optional `args`, `cwd`, and string `env` map.
+
+For builds, fixes, and project handoffs, Priya's normal finish line is a
+working project, not merely changed files. It discovers the project's setup and
+run commands, reviews the result, runs relevant tests and smoke checks, and
+adds focused coverage where needed. It keeps useful tests and removes only
+temporary verification files it created itself; existing tests and user files
+are never cleanup targets.
 
 For a development server, watcher, or other long-running local command, Priya
 can run `bash` in background mode. It immediately returns the process ID and

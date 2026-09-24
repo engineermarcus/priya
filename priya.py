@@ -278,6 +278,7 @@ class PriyaApp(App):
         scrollbar-size: 1 1;
         scrollbar-color: #333;
         scrollbar-background: transparent;
+        background: #121212;
     }
 
     #logo {
@@ -285,7 +286,7 @@ class PriyaApp(App):
         height: auto;
         padding: 0 2;
         color: #60a5fa;
-        background: transparent;
+        background: #121212;
     }
 
     #logo-divider {
@@ -293,7 +294,7 @@ class PriyaApp(App):
         height: 3;
         margin: 0;
         padding: 0;
-        background: transparent;
+        background: #121212;
         border-top: heavy #4b4b4b;
         border-bottom: heavy #4b4b4b;
     }
@@ -376,13 +377,16 @@ class PriyaApp(App):
         margin: 0 0 1 2;
         padding: 0;
         border: none;
-        background: transparent;
+        background: #121212;
     }
     .turn-tools {
-        background: transparent;
+        background: #121212;
     }
     .turn-tools .tree--label {
         color: white;
+    }
+    .turn-tools Tree {
+        background: #121212;
     }
     .turn-tools .tree--guides {
         color: #333;
@@ -599,6 +603,7 @@ class PriyaApp(App):
         tree.root.expand()
         tree.show_root = False
         tree.guide_depth = 2
+        tree.styles.display = "none"
         turn.mount(tree)
 
         ai_bubble = Static("", classes="bubble ai-bubble")
@@ -621,6 +626,7 @@ class PriyaApp(App):
     def _do_add_tool_node(self, tool_id, name, detail):
         if self._cur_tree is None:
             return
+        self._cur_tree.styles.display = "block"
         data = ToolNodeData(name, detail)
         node = self._cur_tree.root.add(tool_label(data), data=data)
         self._node_registry[tool_id] = node
@@ -792,6 +798,11 @@ class PriyaApp(App):
         return True
 
     def _do_end_turn(self):
+        # Each turn starts with an empty tree placeholder so tools can stream
+        # into it. Remove that placeholder for ordinary replies with no tools;
+        # otherwise its default surface can look like a stray black block.
+        if self._cur_tree is not None and not self._cur_tree.root.children:
+            self._cur_tree.remove()
         self.busy = False
         if self._interrupted:
             self._set_status("  ⊘  Interrupted", "#666666")
@@ -863,6 +874,7 @@ class PriyaApp(App):
         tree.root.expand()
         tree.show_root = False
         tree.guide_depth = 2
+        tree.styles.display = "none"
         ai_bubble = Static("", classes="bubble ai-bubble")
         # Child widgets must be supplied while the container is constructed;
         # mounting them into an unattached Vertical raises Textual MountError.

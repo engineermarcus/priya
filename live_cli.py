@@ -12,6 +12,9 @@ import uuid
 import difflib
 import hashlib
 import shlex
+import glob
+from tools.lsp import LspManager
+from tools.mcp import McpManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -40,6 +43,9 @@ client = genai.Client(
 )
 
 DIR = os.path.dirname(os.path.abspath(__file__))
+# Keep Priya's own helpers anchored to DIR, but make user work start where
+# Priya was invoked rather than where it happened to be installed.
+SESSION_DIR = os.path.realpath(os.getcwd())
 AGENTJOB_BIN = os.path.join(DIR, "tools", "job_runner.py")
 ARTIFACT_BIN = os.path.join(DIR, "tools", "artifact.py")
 INTERRUPT_COMMAND = "<<PRIYA_INTERRUPT>>"
@@ -160,7 +166,7 @@ agentjob_declaration = types.FunctionDeclaration(
         "properties": {
             "action": {"type": "STRING", "enum": ["spawn", "status", "log", "send", "stop"], "description": "Use spawn for non-trivial repository front-end implementation; Priya automatically relays live agent narration and command output. log returns new journal events after cursor."},
             "task": {"type": "STRING", "description": "For spawn: concrete UI requirements, relevant paths, constraints, and requested verification."},
-            "workdir": {"type": "STRING", "description": "Optional project directory; omit to use Priya's repository root."},
+            "workdir": {"type": "STRING", "description": "Optional project directory; omit to use Priya's starting directory."},
             "job_id": {"type": "STRING", "description": "Job ID returned by spawn; required for status/log/send/stop."},
             "message": {"type": "STRING", "description": "Required for send; instructions for the running agent's next turn."},
             "cursor": {"type": "INTEGER", "description": "Optional log cursor. Return only events after this cursor; use next_cursor from a prior log response."},
@@ -214,6 +220,50 @@ def run_agentjob(args: dict, on_output=None) -> dict:
         return {"error": "agentjob call itself timed out (30s)"}
     except Exception as e:
         return {"error": str(e)}
+
+
+enter_plan_mode_declaration = types.FunctionDeclaration(
+    name="EnterPlanMode",
+    description=(
+        "Enter read-only planning mode. In this mode Priya may read files and "
+        "reason about changes, but write-capable tools and shell commands are "
+        "blocked until ExitPlanMode is called."
+    ),
+    parameters={"type": "OBJECT", "properties": {}},
+)
+
+
+exit_plan_mode_declaration = types.FunctionDeclaration(
+    name="ExitPlanMode",
+    description="Leave read-only planning mode so write-capable tools may run again.",
+    parameters={"type": "OBJECT", "properties": {}},
+)
+
+
+enter_worktree_declaration = types.FunctionDeclaration(
+    name="EnterWorkTree",
+    description=(
+        "Scope Priya's file reads, edits, shell commands, and newly spawned "
+        "agent jobs to an existing git worktree directory."
+    ),
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "path": {
+                "type": "STRING",
+                "description": "Path to an existing git worktree directory.",
+            },
+        },
+        "required": ["path"],
+    },
+)
+
+
+exit_worktree_declaration = types.FunctionDeclaration(
+    name="ExitWorkTree",
+    description="Return Priya's tool scope to the directory from which it was started.",
+    parameters={"type": "OBJECT", "properties": {}},
+)
 
 
 _AGENTJOB_PROGRESS_KINDS = {
@@ -364,6 +414,109 @@ read_declaration = types.FunctionDeclaration(
 )
 
 
+glob_declaration = types.FunctionDeclaration(
+    name="Glob",
+    description=(
+        "List files matching one or more Unix-style patterns in Priya's current "
+        "working directory. Use ** for recursive directories, * for one path "
+        "segment, ? for one character, and {js,ts} for alternatives. Patterns "
+        "beginning with ! exclude matches from positive patterns. Results are "
+        "evaluated live and contain files only."
+    ),
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "patterns": {
+                "type": "ARRAY",
+                "items": {"type": "STRING"},
+                "description": (
+                    "One or more relative patterns, for example "
+                    "['src/**/*.{js,ts}', '!**/node_modules/**']."
+                ),
+            },
+            "max_results": {
+                "type": "INTEGER",
+                "description": "Maximum files to return; defaults to 1000 and may not exceed 10000.",
+            },
+        },
+        "required": ["patterns"],
+    },
+)
+
+
+grep_declaration = types.FunctionDeclaration(
+    name="Grep",
+    description=(
+        "Search file contents with a ripgrep-compatible regular expression. "
+        "Return live matches with file paths, line numbers, and line text. "
+        "Optionally limit the search to a file or directory within Priya's "
+        "current working directory."
+    ),
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "pattern": {
+                "type": "STRING",
+                "description": "Regular expression to search for.",
+            },
+            "path": {
+                "type": "STRING",
+                "description": "Optional relative file or directory to search; defaults to the current working directory.",
+            },
+            "case_sensitive": {
+                "type": "BOOLEAN",
+                "description": "Whether matching is case-sensitive; defaults to true.",
+            },
+            "max_results": {
+                "type": "INTEGER",
+                "description": "Maximum matches to return; defaults to 1000 and may not exceed 10000.",
+            },
+        },
+        "required": ["pattern"],
+    },
+)
+
+
+lsp_declaration = types.FunctionDeclaration(
+    name="LSP",
+    description=(
+        "Query the active project's persistent Language Server Protocol semantic model. "
+        "Unlike Grep, this resolves symbols by scope and type. Use definition to find "
+        "a symbol's declaration, references to find all uses, hover for type/signature "
+        "information, document_symbols for a file outline, workspace_symbols to search "
+        "semantic symbols, diagnostics for current language-server errors, and status "
+        "to inspect running servers. line is one-based; character is zero-based. Files "
+        "are synchronized from disk before each query, including edits made this session."
+    ),
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "action": {"type": "STRING", "enum": ["status", "definition", "references", "hover", "document_symbols", "workspace_symbols", "diagnostics"], "description": "Semantic query to run."},
+            "path": {"type": "STRING", "description": "Source file path. Required except for status; workspace_symbols uses it to choose a language server."},
+            "line": {"type": "INTEGER", "description": "One-based source line for definition, references, and hover."},
+            "character": {"type": "INTEGER", "description": "Zero-based character offset; defaults to 0."},
+            "include_declaration": {"type": "BOOLEAN", "description": "Include the declaration in references; defaults to true."},
+            "query": {"type": "STRING", "description": "Symbol query for workspace_symbols."},
+        },
+        "required": ["action"],
+    },
+)
+
+
+list_mcp_resources_declaration = types.FunctionDeclaration(
+    name="ListMcpResourcesTool",
+    description=(
+        "Discover the live catalog exposed by configured MCP servers before attempting "
+        "work that may require an external database, API, cloud service, or third-party "
+        "tool. Returns structured resources and resource templates with server identity, "
+        "URI, name, MIME type, description, and any server-provided metadata. Call this "
+        "on your own initiative when local files cannot answer the task; do not ask the "
+        "user to name an MCP server or resource first."
+    ),
+    parameters={"type": "OBJECT", "properties": {}},
+)
+
+
 edit_declaration = types.FunctionDeclaration(
     name="Edit",
     behavior="BLOCKING",
@@ -472,7 +625,7 @@ def bound_plain_cat(command: str) -> str:
     return f"head -n {MAX_FILE_PREVIEW_LINES} -- {paths}"
 
 
-def run_bash(args: dict, on_output=None, cancel_event=None) -> dict:
+def run_bash(args: dict, on_output=None, cancel_event=None, cwd=None) -> dict:
     """Run a shell command and forward its stdout/stderr as it arrives."""
     command = args.get("command")
     if not command:
@@ -495,7 +648,7 @@ def run_bash(args: dict, on_output=None, cancel_event=None) -> dict:
             try:
                 proc = subprocess.Popen(
                     command, shell=True, stdout=stdout_log, stderr=stderr_log,
-                    text=True, start_new_session=True,
+                    text=True, start_new_session=True, cwd=cwd,
                 )
             finally:
                 stdout_log.close()
@@ -504,6 +657,7 @@ def run_bash(args: dict, on_output=None, cancel_event=None) -> dict:
                 "process_id": process_id,
                 "pid": proc.pid,
                 "command": command,
+                "cwd": cwd or os.getcwd(),
                 "started_at": time.time(),
                 "stdout_log": stdout_path,
                 "stderr_log": stderr_path,
@@ -517,7 +671,7 @@ def run_bash(args: dict, on_output=None, cancel_event=None) -> dict:
     try:
         proc = subprocess.Popen(
             command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1, start_new_session=True,
+            text=True, bufsize=1, start_new_session=True, cwd=cwd,
         )
         events = queue.Queue()
 
@@ -579,9 +733,12 @@ def run_bash(args: dict, on_output=None, cancel_event=None) -> dict:
 
 SYSTEM_INSTRUCTION = """
 You are Priya, a capable local coding assistant. You have tools and are expected
-to use them proactively. Do not give a guess, a hypothetical command, or a
-generic answer when the user's request can be answered by inspecting or acting
-on their local workspace.
+to use them proactively. The user is responsible only for communicating their
+intent, not for naming files, paths, patterns, commands, tools, or an execution
+plan. Infer the needed work, discover the relevant project context yourself,
+and carry it through until the actual requested outcome is achieved. Do not
+give a guess, a hypothetical command, or a generic answer when the user's
+request can be answered by inspecting or acting on their local workspace.
 
 Tool-use policy:
 - Before answering any request about files, code, configuration, tests, Git,
@@ -589,6 +746,23 @@ Tool-use policy:
   use a relevant tool. Inspect first when facts are unknown; after a change,
   verify it in proportion to the risk. Base claims about local state only on
   tool output from this conversation.
+- Choose tools yourself from the user's intent. Never require the user to
+  provide a filename, glob, regular expression, command, or tool selection
+  when `Glob`, `Grep`, `LSP`, `Read`, or other available tools can discover it. Use
+  `Glob` to map an unknown file set, `Grep` to locate symbols, behavior, errors,
+  or verify changes, `Read` for exact content, and `bash` for broader local
+  inspection, execution, and verification. Chain as many tool calls as the
+  task needs; tools are working memory, not an exceptional escalation.
+- For any request that builds, changes, repairs, or hands over a project,
+  treat a functioning, reviewed project as the default completion criterion
+  unless the user explicitly narrows the scope. Discover its setup and run
+  commands, install or prepare only what the project documents require, run
+  the relevant checks, review the implementation for obvious regressions, and
+  verify the result in the real project context. When existing coverage is
+  insufficient, write focused test or smoke-test code as needed and run it.
+  Keep worthwhile coverage in the project; remove only temporary verification
+  files that you created specifically for this session after they have served
+  their purpose. Never delete pre-existing tests, fixtures, or user files.
 - `bash` is your direct local shell. Use it for fast inspection (for example
   listing files, reading code, searching, Git status), editing, running tests,
   builds, commands, and verifying work. It runs in Priya's current directory.
@@ -598,10 +772,10 @@ Tool-use policy:
   block the conversation; it returns immediately with a PID and log paths.
   Keep finite checks such as tests and builds in the foreground when their
   result is needed before you reply.
-  Use the full shell inspection toolkit deliberately. Prefer `rg --files`,
-  `rg -n`, `rg -l`, and `rg -g` for file discovery and content search; use
-  `grep -n`, `grep -R`, or `find` when `rg` is unavailable, and `fd` when it
-  is installed. Use `git status`, `git diff`, `git log`, and `git show` for
+  Use the full shell inspection toolkit deliberately. Prefer `Glob` and `Grep`
+  for file discovery and content search; use `rg --files`, `rg -n`, `rg -l`,
+  `rg -g`, `grep -n`, `grep -R`, or `find` when the shell is better suited, and
+  `fd` when it is installed. Use `git status`, `git diff`, `git log`, and `git show` for
   repository history; `ls -la`, `stat`, `file`, `du -sh`, and `wc -l` for
   filesystem facts; and `diff -u` or `cmp` to compare files. For structured
   extraction, use `sed`, `awk`, `cut`, `sort`, `uniq`, `tr`, `jq`, and `yq`
@@ -633,6 +807,34 @@ Tool-use policy:
   times. If its status is still failed after those retries, take over the task
   yourself using Priya's local tools; do not leave the user with an unfinished
   implementation or ask them to restart the same failed job unless they ask.
+- `EnterPlanMode` switches Priya into a read-only analytical state. In Plan
+  Mode, use `Read` to inspect files and produce a reviewable plan, but
+  `bash`, `Edit`, `agentjob`, `artifact`, Cron mutations, and other
+  write-capable actions are blocked. Call `ExitPlanMode` when the user has
+  approved the plan or asks to leave planning.
+- `EnterWorkTree` scopes relative `Read`, `Edit`, `bash`, and newly spawned
+  `agentjob` work to an existing git worktree directory. `ExitWorkTree`
+  returns Priya to the directory from which it was started. Plan Mode and WorkTree
+  are independent controls.
+- `Glob` lists files matching live filesystem patterns. Use it to discover
+  relevant files before reading them; it supports recursive `**`, alternatives
+  such as `{js,ts}`, and `!` exclusions.
+- `Grep` searches live file contents with regular expressions and returns file
+  paths, line numbers, and matching text. Use it for debugging and to verify
+  that an implementation landed consistently.
+- `LSP` queries a persistent semantic model for the active project. Prefer it
+  over Grep when a question is about a definition, references, type/signature,
+  symbols, diagnostics, scope, or the effect of a rename. Give its source
+  location as one-based line and zero-based character. It synchronizes files
+  from disk before each query, and returns a specific installation error when
+  that language's server is not present; do not pretend a Grep match is an LSP
+  answer.
+- `ListMcpResourcesTool` discovers the live resources and resource templates
+  exposed by this session's configured MCP servers. Use it before claiming an
+  external database, API, infrastructure provider, or other connected service
+  is unavailable, or before selecting a resource from an unfamiliar MCP
+  server. It is read-only and returns an empty catalog when no servers are
+  configured.
 - `artifact` creates a standalone browser deliverable rather than changing this
   repository's website or application. Use it when the user wants a one-off
   interactive visual result opened in a browser; do not use it for implementing
@@ -678,6 +880,15 @@ Working style:
   For a request to build, fix, change, investigate, or verify, make the needed
   tool calls before replying. For a purely conversational or general knowledge
   question, answer directly unless a local check would improve correctness.
+- Do not stop at a plan, a diagnosis, a first plausible file, or a partial
+  implementation when the user asked for an outcome. Continue discovering,
+  implementing, setting up, running, reviewing, testing, recovering from
+  ordinary tool failures, and verifying until it is done. A build or codebase
+  handoff is not done merely because files exist: bring the project to a
+  working state and exercise it unless the user says not to. Ask the user only
+  when a genuine unresolved decision would materially change the result or when
+  external authority is required; never ask merely because you have not yet
+  investigated enough.
 - Select the suitable tool: `bash` for inspection and direct non-front-end
   work; `agentjob` for non-trivial front-end implementation in the repository;
   `artifact` for standalone browser deliverables; and `askUserQuestion` for a
@@ -731,7 +942,11 @@ CONFIG = types.LiveConnectConfig(
         agentjob_declaration, artifact_declaration, bash_declaration,
         ask_user_question_declaration, cron_create_declaration,
         cron_delete_declaration, cron_list_declaration,
-        read_declaration, edit_declaration,
+        enter_plan_mode_declaration, exit_plan_mode_declaration,
+        enter_worktree_declaration, exit_worktree_declaration,
+        read_declaration, glob_declaration, grep_declaration, lsp_declaration,
+        list_mcp_resources_declaration,
+        edit_declaration,
     ])],
 )
 
@@ -842,6 +1057,12 @@ class TextLoop:
         self._edit_event_id = 0
         self._pending_edit = None
         self._read_files = {}
+        self._base_workdir = SESSION_DIR
+        self._current_workdir = self._base_workdir
+        # Servers retain their project index across semantic queries in this workspace.
+        self._lsp = LspManager(self._current_workdir)
+        self._mcp = McpManager(self._current_workdir)
+        self._plan_mode = False
         self._active_bash_cancel = None
         self.mic_processor = MicrophoneProcessor() if MIC else None
         self._discard_until_idle = False
@@ -1132,11 +1353,273 @@ class TextLoop:
         if pending is not None and not pending["future"].done():
             pending["future"].set_result(approval)
 
-    @staticmethod
-    def _edit_path(path):
+    def _tool_blocked_by_plan_mode(self, tool_name):
+        if not self._plan_mode:
+            return None
+        allowed = {
+            "EnterPlanMode", "ExitPlanMode", "EnterWorkTree", "ExitWorkTree",
+            "Read", "Glob", "Grep", "LSP", "ListMcpResourcesTool", "CronList", "askUserQuestion",
+        }
+        if tool_name in allowed:
+            return None
+        return {
+            "error": (
+                f"{tool_name} is blocked in Plan Mode. Use Read for inspection, "
+                "then call ExitPlanMode before running commands or making changes."
+            ),
+            "plan_mode": True,
+        }
+
+    def _resolve_tool_path(self, path, tool_name="path"):
         if not isinstance(path, str) or not path.strip():
-            raise ValueError("Edit requires a non-empty path")
-        return os.path.realpath(os.path.abspath(path))
+            raise ValueError(f"{tool_name} requires a non-empty path")
+        expanded = os.path.expanduser(path)
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(self._current_workdir, expanded)
+        return os.path.realpath(os.path.abspath(expanded))
+
+    def _edit_path(self, path):
+        return self._resolve_tool_path(path, "Edit")
+
+    @staticmethod
+    def _expand_glob_braces(pattern):
+        """Expand basic comma-separated brace alternatives without a shell."""
+        start = pattern.find("{")
+        if start == -1:
+            return [pattern]
+        depth = 0
+        for index in range(start, len(pattern)):
+            character = pattern[index]
+            if character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    body = pattern[start + 1:index]
+                    choices = body.split(",")
+                    if not all(choices):
+                        return [pattern]
+                    expanded = []
+                    for choice in choices:
+                        expanded.extend(TextLoop._expand_glob_braces(
+                            pattern[:start] + choice + pattern[index + 1:]
+                        ))
+                    return expanded
+        return [pattern]
+
+    def _validate_glob_pattern(self, pattern):
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ValueError("Glob patterns must be non-empty strings")
+        if os.path.isabs(pattern) or any(part == ".." for part in pattern.split("/")):
+            raise ValueError("Glob patterns must be relative and cannot contain '..'")
+        return pattern
+
+    def _glob_matches(self, pattern):
+        matches = set()
+        for expanded in self._expand_glob_braces(pattern):
+            search_pattern = os.path.join(self._current_workdir, expanded)
+            for candidate in glob.glob(search_pattern, recursive=True):
+                resolved = os.path.realpath(os.path.abspath(candidate))
+                try:
+                    in_scope = os.path.commonpath([self._current_workdir, resolved]) == self._current_workdir
+                except ValueError:
+                    in_scope = False
+                if in_scope and os.path.isfile(resolved):
+                    matches.add(resolved)
+        return matches
+
+    async def glob_files(self, args):
+        patterns = args.get("patterns")
+        max_results = args.get("max_results", 1000)
+        if not isinstance(patterns, list) or not patterns:
+            return {"error": "Glob requires a non-empty patterns array"}
+        if (not isinstance(max_results, int) or isinstance(max_results, bool)
+                or not 1 <= max_results <= 10000):
+            return {"error": "max_results must be an integer from 1 to 10000"}
+        try:
+            positive_patterns = []
+            negative_patterns = []
+            for raw_pattern in patterns:
+                is_negative = isinstance(raw_pattern, str) and raw_pattern.startswith("!")
+                pattern = raw_pattern[1:] if is_negative else raw_pattern
+                pattern = self._validate_glob_pattern(pattern)
+                (negative_patterns if is_negative else positive_patterns).append(pattern)
+        except ValueError as error:
+            return {"error": str(error)}
+        if not positive_patterns:
+            return {"error": "Glob requires at least one non-negated pattern"}
+
+        files = set()
+        for pattern in positive_patterns:
+            files.update(self._glob_matches(pattern))
+        for pattern in negative_patterns:
+            files.difference_update(self._glob_matches(pattern))
+        files = sorted(files)
+        return {
+            "files": files[:max_results],
+            "count": len(files),
+            "truncated": len(files) > max_results,
+            "workdir": self._current_workdir,
+        }
+
+    def _resolve_grep_scope(self, path):
+        if path is None:
+            return self._current_workdir
+        resolved = self._resolve_tool_path(path, "Grep path")
+        try:
+            in_scope = os.path.commonpath([self._current_workdir, resolved]) == self._current_workdir
+        except ValueError:
+            in_scope = False
+        if not in_scope:
+            raise ValueError("Grep path must be inside the current working directory")
+        if not os.path.exists(resolved):
+            raise ValueError(f"Grep path does not exist: {resolved}")
+        return resolved
+
+    def _run_grep(self, pattern, scope, case_sensitive, max_results):
+        command = ["rg", "--json", "--no-messages"]
+        if not case_sensitive:
+            command.append("--ignore-case")
+        command.extend(["--", pattern, scope])
+        matches = []
+        truncated = False
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=self._current_workdir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as error:
+            return {"error": f"could not start Grep: {error}"}
+
+        try:
+            for raw_event in process.stdout:
+                event = json.loads(raw_event)
+                if event.get("type") != "match":
+                    continue
+                data = event.get("data", {})
+                path_text = data.get("path", {}).get("text")
+                line_text = data.get("lines", {}).get("text")
+                line_number = data.get("line_number")
+                if not isinstance(path_text, str) or not isinstance(line_text, str):
+                    continue
+                path = self._resolve_tool_path(path_text, "Grep result")
+                matches.append({
+                    "path": path,
+                    "line_number": line_number,
+                    "line": line_text.rstrip("\r\n"),
+                })
+                if len(matches) > max_results:
+                    matches.pop()
+                    truncated = True
+                    process.terminate()
+                    break
+            stderr = process.stderr.read()
+            returncode = process.wait()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait()
+            process.stdout.close()
+            process.stderr.close()
+
+        if returncode > 1 and not truncated:
+            return {"error": stderr.strip() or "Grep failed"}
+        return {
+            "matches": matches,
+            "count": len(matches),
+            "truncated": truncated,
+            "scope": scope,
+        }
+
+    async def grep_files(self, args):
+        pattern = args.get("pattern")
+        case_sensitive = args.get("case_sensitive", True)
+        max_results = args.get("max_results", 1000)
+        if not isinstance(pattern, str) or not pattern:
+            return {"error": "Grep requires a non-empty pattern"}
+        if not isinstance(case_sensitive, bool):
+            return {"error": "case_sensitive must be true or false"}
+        if (not isinstance(max_results, int) or isinstance(max_results, bool)
+                or not 1 <= max_results <= 10000):
+            return {"error": "max_results must be an integer from 1 to 10000"}
+        try:
+            scope = self._resolve_grep_scope(args.get("path"))
+        except ValueError as error:
+            return {"error": str(error)}
+        return await asyncio.to_thread(
+            self._run_grep, pattern, scope, case_sensitive, max_results
+        )
+
+    async def lsp_query(self, args):
+        """Run a persistent semantic query without blocking the Live receive loop."""
+        action = args.get("action")
+        if not isinstance(action, str):
+            return {"error": "LSP requires an action"}
+        try:
+            return await asyncio.to_thread(self._lsp.query, args, self._resolve_tool_path)
+        except (ValueError, OSError, RuntimeError, UnicodeDecodeError) as error:
+            return {"error": str(error)}
+
+    async def list_mcp_resources(self, _args):
+        """Return the current MCP catalog without blocking the Live receive loop."""
+        return await asyncio.to_thread(self._mcp.list_resources)
+
+    def _resolve_worktree_path(self, path):
+        resolved = self._resolve_tool_path(path, "EnterWorkTree")
+        if not os.path.isdir(resolved):
+            raise ValueError(f"worktree does not exist: {resolved}")
+        try:
+            inside = subprocess.run(
+                ["git", "-C", resolved, "rev-parse", "--is-inside-work-tree"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception as error:
+            raise ValueError(f"could not inspect worktree {resolved}: {error}")
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            detail = inside.stderr.strip() or inside.stdout.strip() or "not a git worktree"
+            raise ValueError(f"{resolved} is not a git worktree: {detail}")
+        return resolved
+
+    async def enter_plan_mode(self, _args):
+        self._plan_mode = True
+        return {
+            "plan_mode": True,
+            "workdir": self._current_workdir,
+            "message": "Priya is now in read-only Plan Mode.",
+        }
+
+    async def exit_plan_mode(self, _args):
+        self._plan_mode = False
+        return {
+            "plan_mode": False,
+            "workdir": self._current_workdir,
+            "message": "Priya has left Plan Mode.",
+        }
+
+    async def enter_worktree(self, args):
+        try:
+            path = self._resolve_worktree_path(args.get("path"))
+        except ValueError as error:
+            return {"error": str(error)}
+        self._current_workdir = path
+        self._read_files = {}
+        self._lsp.reset(path)
+        self._mcp.reset(path)
+        return {"worktree": path, "workdir": path, "plan_mode": self._plan_mode}
+
+    async def exit_worktree(self, _args):
+        self._current_workdir = self._base_workdir
+        self._read_files = {}
+        self._lsp.reset(self._base_workdir)
+        self._mcp.reset(self._base_workdir)
+        return {
+            "worktree": None,
+            "workdir": self._current_workdir,
+            "plan_mode": self._plan_mode,
+        }
 
     @staticmethod
     def _read_text_file(path):
@@ -1174,6 +1657,9 @@ class TextLoop:
             self._pending_edit = None
 
     async def edit_file(self, args):
+        blocked = self._tool_blocked_by_plan_mode("Edit")
+        if blocked is not None:
+            return blocked
         path_arg = args.get("path")
         old_string = args.get("old_string")
         new_string = args.get("new_string")
@@ -1253,13 +1739,27 @@ class TextLoop:
 
     async def run_active_bash(self, args, on_output):
         """Run one foreground shell call that can be cancelled by Esc."""
+        blocked = self._tool_blocked_by_plan_mode("bash")
+        if blocked is not None:
+            return blocked
         cancel_event = threading.Event()
         self._active_bash_cancel = cancel_event
         try:
-            return await asyncio.to_thread(run_bash, args, on_output, cancel_event)
+            return await asyncio.to_thread(
+                run_bash, args, on_output, cancel_event, self._current_workdir
+            )
         finally:
             if self._active_bash_cancel is cancel_event:
                 self._active_bash_cancel = None
+
+    async def run_agentjob_tool(self, args, on_output):
+        blocked = self._tool_blocked_by_plan_mode("agentjob")
+        if blocked is not None:
+            return blocked
+        scoped_args = dict(args)
+        if scoped_args.get("action") == "spawn" and not scoped_args.get("workdir"):
+            scoped_args["workdir"] = self._current_workdir
+        return await asyncio.to_thread(run_agentjob, scoped_args, on_output)
 
     @staticmethod
     def _cron_job_view(job):
@@ -1295,6 +1795,9 @@ class TextLoop:
         self._cancelled_queued_cron_jobs.discard(job_id)
 
     async def cron_create(self, args):
+        blocked = self._tool_blocked_by_plan_mode("CronCreate")
+        if blocked is not None:
+            return blocked
         cron = args.get("cron")
         prompt = args.get("prompt")
         recurring = args.get("recurring", True)
@@ -1327,6 +1830,9 @@ class TextLoop:
         return self._cron_job_view(job)
 
     async def cron_delete(self, args):
+        blocked = self._tool_blocked_by_plan_mode("CronDelete")
+        if blocked is not None:
+            return blocked
         job_id = args.get("job_id")
         if not isinstance(job_id, str) or not job_id:
             return {"error": "CronDelete requires job_id"}
@@ -1372,7 +1878,10 @@ class TextLoop:
                     f"reason: {job.get('reason')}; error: {job.get('error')}; "
                     f"workdir: {job.get('workdir')}. "
                     f"Original task: {job.get('task')}\n"
-                    "Inspect the job's changed files and verify the requested work. "
+                    "This is an execution continuation, not a status conversation: do not ask "
+                    "the user what to do next. Inspect the job's changed files, review the "
+                    "project, and run the relevant setup, tests, and verification for the "
+                    "requested work. "
                     "If it failed or did not finish the task, take over now using your "
                     "local tools and complete the task yourself. Then report the actual result to the user. ]"
                 )
@@ -1486,8 +1995,11 @@ class TextLoop:
                                             "id": event_id, "stream": stream_name, "text": text,
                                         }))
 
-                                if fc.name == "agentjob":
-                                    result = await asyncio.to_thread(run_agentjob, args_dict, emit_tool_output)
+                                blocked = self._tool_blocked_by_plan_mode(fc.name)
+                                if blocked is not None:
+                                    result = blocked
+                                elif fc.name == "agentjob":
+                                    result = await self.run_agentjob_tool(args_dict, emit_tool_output)
                                     if args_dict.get("action") == "spawn":
                                         self.start_agentjob_watcher(result.get("job_id"), tool_event_id)
                                 elif fc.name == "artifact":
@@ -1502,8 +2014,24 @@ class TextLoop:
                                     result = await self.cron_delete(args_dict)
                                 elif fc.name == "CronList":
                                     result = await self.cron_list(args_dict)
+                                elif fc.name == "EnterPlanMode":
+                                    result = await self.enter_plan_mode(args_dict)
+                                elif fc.name == "ExitPlanMode":
+                                    result = await self.exit_plan_mode(args_dict)
+                                elif fc.name == "EnterWorkTree":
+                                    result = await self.enter_worktree(args_dict)
+                                elif fc.name == "ExitWorkTree":
+                                    result = await self.exit_worktree(args_dict)
                                 elif fc.name == "Read":
                                     result = await self.read_file(args_dict)
+                                elif fc.name == "Glob":
+                                    result = await self.glob_files(args_dict)
+                                elif fc.name == "Grep":
+                                    result = await self.grep_files(args_dict)
+                                elif fc.name == "LSP":
+                                    result = await self.lsp_query(args_dict)
+                                elif fc.name == "ListMcpResourcesTool":
+                                    result = await self.list_mcp_resources(args_dict)
                                 elif fc.name == "Edit":
                                     result = await self.edit_file(args_dict)
                                 else:
@@ -1590,6 +2118,8 @@ class TextLoop:
         except ExceptionGroup as EG:
             traceback.print_exception(EG)
         finally:
+            self._lsp.reset()
+            self._mcp.reset()
             if self.player is not None:
                 try:
                     self.player.stdin.close()

@@ -7,6 +7,7 @@ Git; the runner itself is versioned in ``tools/``.
 """
 
 import json
+import hashlib
 import os
 import queue
 import re
@@ -29,6 +30,88 @@ MAX_FILE_PREVIEW_LINES = 16
 MAX_EVENT_MESSAGE_CHARS = 4000
 MAX_API_RETRIES = 3
 JOB_IDLE_TIMEOUT_SECONDS = 300
+_DONE_SIGNAL = re.compile(r"(?im)^\s*DONE\s*$")
+
+# A background coding job must leave evidence that it reviewed and exercised
+# its own changes.  Prompting alone is too easy for a fast model to skip.
+_REVIEW_COMMAND = re.compile(r"\b(?:git\s+(?:diff|status)|diff\s+-|git\s+show)\b", re.IGNORECASE)
+_VERIFY_COMMAND = re.compile(
+    r"\b(?:pytest|unittest|tox|nox|npm\s+(?:test|run\s+(?:test|build|lint|check|typecheck))|"
+    r"pnpm\s+(?:test|run\s+(?:test|build|lint|check|typecheck))|yarn\s+(?:test|build|lint|check)|"
+    r"(?:bun|just)\s+(?:test|check|lint|build)|make\s+(?:test|check|lint|build)|"
+    r"cargo\s+(?:test|check|clippy|build)|go\s+test|dotnet\s+test|bundle\s+exec\s+rspec|"
+    r"php\s+artisan\s+test|playwright\s+test|(?:vitest|jest)\b|"
+    r"(?:python|python3)\s+-m\s+(?:pytest|unittest|compileall)|ruff\b|mypy\b|"
+    r"eslint\b|tsc\b|gradle\s+(?:test|check|build)|mvn\s+(?:test|verify|package))\b",
+    re.IGNORECASE,
+)
+_IGNORED_SNAPSHOT_DIRS = {
+    ".git", ".hg", ".svn", ".priya", "node_modules", ".venv", "venv",
+    "__pycache__", "target", "dist", "build", ".next", ".pytest_cache",
+}
+
+
+def project_snapshot(root):
+    """Hash ordinary project files so shell-based edits cannot evade review."""
+    snapshot = {}
+    root = Path(root)
+    for current, dirs, files in os.walk(root):
+        dirs[:] = sorted(name for name in dirs if name not in _IGNORED_SNAPSHOT_DIRS)
+        for name in files:
+            path = Path(current) / name
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                digest = hashlib.sha256()
+                with path.open("rb") as source:
+                    for chunk in iter(lambda: source.read(65536), b""):
+                        digest.update(chunk)
+                snapshot[str(path.relative_to(root))] = digest.digest()
+            except OSError:
+                # A concurrently changing file is checked again on the next turn.
+                continue
+    return snapshot
+
+
+class CompletionEvidence:
+    """Tracks checks made after the most recent job mutation."""
+
+    def __init__(self):
+        self.changed = False
+        self.changed_paths = set()
+        self.reviewed_paths = set()
+        self.review_command_succeeded = False
+        self.verified = False
+
+    def record_change(self, paths):
+        self.changed = True
+        self.changed_paths.update(paths)
+        self.reviewed_paths.clear()
+        self.review_command_succeeded = False
+        self.verified = False
+
+    def record_read(self, path):
+        if self.changed and path in self.changed_paths:
+            self.reviewed_paths.add(path)
+
+    def record_command(self, command, exit_code, *, changed_paths=()):
+        if changed_paths:
+            self.record_change(changed_paths)
+        if exit_code == 0 and self.changed and _REVIEW_COMMAND.search(command):
+            self.review_command_succeeded = True
+        if exit_code == 0 and self.changed and _VERIFY_COMMAND.search(command):
+            self.verified = True
+
+    def missing(self):
+        if not self.changed:
+            return []
+        missing = []
+        if (not self.review_command_succeeded
+                and self.changed_paths - self.reviewed_paths):
+            missing.append("review every changed file with Read or inspect the Git diff/status")
+        if not self.verified:
+            missing.append("run a relevant test, build, lint, type check, or smoke check")
+        return missing
 
 
 def paths(job_id):
@@ -232,6 +315,11 @@ def bound_plain_cat(command):
     return f"head -n {MAX_FILE_PREVIEW_LINES} -- {paths}"
 
 
+def has_done_signal(response_text):
+    """Require an explicit final DONE line, not a passing mention of the word."""
+    return bool(_DONE_SIGNAL.search(response_text or ""))
+
+
 def worker(job_id):
     from google import genai
     from google.genai import errors as genai_errors
@@ -274,14 +362,23 @@ def worker(job_id):
         "dump a whole file. Preview only 16 lines at a time with `head -n 16 PATH`, "
         "`tail -n 16 PATH`, or `sed -n 'START,ENDp' PATH`; locate relevant symbols first, "
         "then page through large files in narrow ranges. Do not use `cat`, `less`, or "
-        "`more` for source inspection. Complete the task, verify it, then say DONE."
+        "`more` for source inspection. Do not stop at implemented files: for a build, "
+        "fix, or handed-over project, discover the documented setup and run commands, "
+        "bring it to a working state, review the changed behavior, and run relevant "
+        "tests and smoke checks before saying DONE. If existing tests do not cover the "
+        "risk, create focused test code and run it. Keep durable, useful coverage; "
+        "remove only temporary verification files you created for this job, never "
+        "pre-existing tests, fixtures, or user files. Complete the task, verify it, "
+        "then say DONE."
     )
     contents = [types.Content(role="user", parts=[types.Part(text=state["task"])])]
+    completion_evidence = CompletionEvidence()
 
     def run_shell(command, timeout=SHELL_TIMEOUT_SECONDS):
         """Bash equivalent with incremental output recorded to the event journal."""
         try:
             command = bound_plain_cat(command)
+            before_snapshot = project_snapshot(workdir)
             record_event(job_id, "command", f"$ {command}")
             proc = subprocess.Popen(command, shell=True, cwd=workdir, text=True, bufsize=1,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -307,6 +404,12 @@ def worker(job_id):
                 captured[stream_name] = (captured[stream_name] + line)[-8000:]
                 record_event(job_id, "command_output", line.rstrip("\r\n"), stream=stream_name)
             code = proc.wait()
+            after_snapshot = project_snapshot(workdir)
+            changed_paths = {
+                path for path in before_snapshot.keys() | after_snapshot.keys()
+                if before_snapshot.get(path) != after_snapshot.get(path)
+            }
+            completion_evidence.record_command(command, code, changed_paths=changed_paths)
             record_event(job_id, "command_result", f"Command exited {code}", exit_code=code)
             return f"[exit {code}]\n{captured['stdout']}{captured['stderr']}"
         except subprocess.TimeoutExpired:
@@ -355,7 +458,21 @@ def worker(job_id):
             if response_text.strip():
                 record_event(job_id, "agent_message", response_text.strip()[-2000:])
             if not calls:
-                if "DONE" in response_text.upper():
+                if has_done_signal(response_text):
+                    missing = completion_evidence.missing()
+                    if missing:
+                        required = "; then ".join(missing)
+                        message = (
+                            "Completion is not accepted yet. This job changed files, but it has "
+                            f"not shown that it completed the required checks. Now {required}. "
+                            "Use the tool output to resolve any failures, narrate the result, and "
+                            "only then reply DONE. Do not ask the user what to do next."
+                        )
+                        record_event(job_id, "verification_required", message)
+                        contents.append(types.Content(
+                            role="user", parts=[types.Part(text=message)]
+                        ))
+                        continue
                     write_status(job_id, status="done", reason=None)
                     record_event(job_id, "done", "Agent reported completion")
                     return
@@ -374,13 +491,18 @@ def worker(job_id):
                     output = run_shell(args.get("command", ""), args.get("timeout_s", SHELL_TIMEOUT_SECONDS))
                 elif call.name == "Read":
                     try:
-                        output = (workdir / args.get("path", "")).read_text(encoding="utf-8")[-12000:]
+                        read_path = Path(args.get("path", ""))
+                        resolved_read_path = (workdir / read_path).resolve()
+                        relative_read_path = str(resolved_read_path.relative_to(workdir.resolve()))
+                        output = resolved_read_path.read_text(encoding="utf-8")[-12000:]
+                        completion_evidence.record_read(relative_read_path)
                         record_event(job_id, "read", f"Read {args.get('path')}")
                     except Exception as exc:
                         output = f"[ERROR: {exc}]"
                 elif call.name == "Edit":
                     try:
-                        path = workdir / args.get("path", "")
+                        path = (workdir / args.get("path", "")).resolve()
+                        relative_path = str(path.relative_to(workdir.resolve()))
                         source = path.read_text(encoding="utf-8")
                         old, new = args.get("old_string", ""), args.get("new_string", "")
                         count = source.count(old)
@@ -391,6 +513,7 @@ def worker(job_id):
                         else:
                             path.write_text(source.replace(old, new, -1 if args.get("replace_all") else 1), encoding="utf-8")
                             output = f"Edited {path} ({count if args.get('replace_all') else 1} replacement)"
+                            completion_evidence.record_change({relative_path})
                             record_event(job_id, "edit", output, path=str(path))
                     except Exception as exc:
                         output = f"[ERROR: {exc}]"
