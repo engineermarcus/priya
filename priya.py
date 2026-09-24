@@ -18,6 +18,7 @@ Protocol (same as original):
   <<ASK_USER_QUESTION>>{"id": ..., "questions": [...]}
   <<EDIT_APPROVAL>>{"id": ..., "path": ..., "diff": ...}
   <<SCHEDULED_TASK>>{"job_id": ..., "prompt": ...}
+  <<AGENTJOB_RESULT>>{"job_id": ..., "status": ...}
   <<END>>
   (any other line = streamed model text)
 """
@@ -34,6 +35,7 @@ from collections import deque
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Tree, Input, Static, OptionList, Link
+from textual.events import Paste
 from textual.widgets.option_list import Option
 from textual.reactive import reactive
 from textual import work
@@ -79,6 +81,14 @@ def extract_urls(value):
 def diff_stat(result):
     if not isinstance(result, dict):
         return None
+    added = next((result[k] for k in _ADD_KEYS if k in result), None)
+    removed = next((result[k] for k in _DEL_KEYS if k in result), None)
+    if added is None and removed is None:
+        return None
+    try:
+        return int(added or 0), int(removed or 0)
+    except (TypeError, ValueError):
+        return None
 
 
 def colorize_tool_text(value, stream="stdout", *, result=False):
@@ -99,10 +109,6 @@ def colorize_tool_text(value, stream="stdout", *, result=False):
         for match in _PATH_PATTERN.finditer(value):
             text.stylize("#67e8f9", match.start(), match.end())
 
-    for url in extract_urls(value):
-        start = value.find(url)
-        if start >= 0:
-            text.stylize(f"underline #60a5fa link {url}", start, start + len(url))
     for match in _WARNING_PATTERN.finditer(value):
         text.stylize("bold #facc15", match.start(), match.end())
     for match in _SUCCESS_PATTERN.finditer(value):
@@ -119,14 +125,36 @@ def tool_log_label(stream, value):
     label.append(" │ ", style="dim #475569")
     label.append(value, style="dim #7c8798")
     return label
-    added = next((result[k] for k in _ADD_KEYS if k in result), None)
-    removed = next((result[k] for k in _DEL_KEYS if k in result), None)
-    if added is None and removed is None:
-        return None
-    try:
-        return int(added or 0), int(removed or 0)
-    except (TypeError, ValueError):
-        return None
+
+
+def colorize_diff(value):
+    """Color additions green and deletions red, including +++/--- headers."""
+    rendered = Text()
+    for line in value.splitlines(keepends=True):
+        if line.startswith(("+++", "+")):
+            style = "#4ade80"
+        elif line.startswith(("---", "-")):
+            style = "#fb7185"
+        else:
+            style = "#d1d5db"
+        rendered.append(line, style=style)
+    return rendered
+
+
+class PriyaInput(Input):
+    """Single-line prompt that accepts complete multiline terminal pastes."""
+
+    def _on_paste(self, event: Paste) -> None:
+        # Textual Input's default handler keeps only the first pasted line.
+        # Flatten line breaks so a pasted prompt remains one complete message.
+        pasted = " ".join(event.text.splitlines())
+        if pasted:
+            selection = self.selection
+            if selection.is_empty:
+                self.insert_text_at_cursor(pasted)
+            else:
+                self.replace(pasted, *selection)
+        event.stop()
 
 
 def reader_thread(proc, q):
@@ -221,6 +249,10 @@ class EndTurn(Msg):
 
 class WorkerClosed(Msg):
     pass
+
+class AgentJobResult(Msg):
+    def __init__(self, result):
+        self.result = result
 
 
 class PriyaApp(App):
@@ -398,12 +430,13 @@ class PriyaApp(App):
         self._edit_approval_state = None
         self._interrupted = False
         self._worker_restart_count = 0
+        self._background_job_status = None
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="convo")
         yield Static(f"  {MODEL_NAME}  \u00b7  {os.getcwd()}", id="statusbar")
         placeholder = "Type or speak your message\u2026" if self.mic else "Type your message\u2026"
-        yield Input(placeholder=placeholder, id="inputbar")
+        yield PriyaInput(placeholder=placeholder, id="inputbar")
         yield Static("esc stop  ^o expand  ^e all  ^r collapse  ^c quit", id="keybar")
 
     def on_mount(self):
@@ -451,11 +484,16 @@ class PriyaApp(App):
         bar.update(text)
 
     def _tick_spinner(self):
-        if not self.busy:
-            return
         self._spinner_i += 1
         frame = SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]
-        self._set_status(f"  {frame}  {MODEL_NAME} is working\u2026")
+        if not self.busy:
+            if self._background_job_status:
+                self._set_status(f"  {frame}  {self._background_job_status}", "#a5b4fc")
+            return
+        status = f"  {frame}  {MODEL_NAME} is working\u2026"
+        if self._background_job_status:
+            status += f"  ·  {self._background_job_status[:90]}"
+        self._set_status(status)
         if self._cur_thinking is not None:
             tf = THINKING_FRAMES[self._spinner_i % len(THINKING_FRAMES)]
             self._cur_thinking.update(tf)
@@ -506,6 +544,8 @@ class PriyaApp(App):
             self._do_end_turn()
         elif isinstance(msg, WorkerClosed):
             self._do_worker_closed()
+        elif isinstance(msg, AgentJobResult):
+            self._do_agentjob_result(msg.result)
 
     # ── UI operations (UI thread only, called from _drain_ui_q) ─────────────
 
@@ -565,28 +605,39 @@ class PriyaApp(App):
         data.result = result_text
         data.stat = stat
         node.set_label(tool_label(data))
-        if node.children:
-            node.add_leaf(Text("result", style="bold #94a3b8"))
-        for ln in (result_text.splitlines() or [""]):
-            node.add_leaf(colorize_tool_text(ln, result=True))
+        if data.name == "agentjob":
+            # A spawned job keeps appending live milestones to this completed
+            # tool call. The raw spawn/status JSON is internal bookkeeping and
+            # makes the useful narrative hard to find.
+            node.add_leaf(Text("Live milestones below", style="dim #64748b"))
+        else:
+            if node.children:
+                node.add_leaf(Text("result", style="bold #94a3b8"))
+            for ln in (result_text.splitlines() or [""]):
+                node.add_leaf(colorize_tool_text(ln, result=True))
         if self._cur_tool_node is node:
             self._cur_tool_node = None
         for n, t in self._all_tool_nodes:
             if n is node:
                 t.refresh()
                 break
-        self._mount_links(result_text)
 
     def _do_append_tool_log(self, tool_id, stream, text):
         node = self._node_registry.get(tool_id)
         if node is None:
             return
         node.add_leaf(tool_log_label(stream, text))
+        if stream == "agentjob":
+            self._background_job_status = f"Agent job running · {text[:100]}"
+            self._set_status(f"  {SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]}  {self._background_job_status}", "#a5b4fc")
+            if text.startswith("Job done:"):
+                self._background_job_status = f"Agent job complete · {text}"
+            elif text.startswith(("Job failed:", "Job stopped:")):
+                self._background_job_status = f"Agent job ended · {text}"
         for n, tree in self._all_tool_nodes:
             if n is node:
                 tree.refresh()
                 break
-        self._mount_links(text)
 
     def _do_append_text(self, text):
         if self._cur_ai_bubble is None:
@@ -598,7 +649,7 @@ class PriyaApp(App):
         convo.scroll_end(animate=False)
 
     def _mount_links(self, text):
-        """Add actual Link widgets, which Textual opens on click or Enter."""
+        """Expose URLs only when they are part of Priya's visible reply."""
         if self._cur_turn is None:
             return
         for url in extract_urls(text):
@@ -683,7 +734,7 @@ class PriyaApp(App):
         card = Vertical(
             Static("Review edit", classes="ask-header"),
             Static(path, classes="ask-prompt"),
-            Static(Text(diff or "(no textual diff)"), classes="edit-diff"),
+            Static(colorize_diff(diff) if diff else Text("(no textual diff)"), classes="edit-diff"),
             options,
             Static("↑/↓ then Enter to approve or cancel", classes="ask-help"),
             classes="ask-question",
@@ -702,9 +753,10 @@ class PriyaApp(App):
         options = state["options"]
         if options is not None:
             options.remove()
-        state["card"].mount(Static(
-            "Edit approved" if approved else "Edit cancelled", classes="ask-answer",
-        ))
+        # The approval UI has served its purpose; remove the whole review card
+        # immediately instead of leaving a completed panel in the transcript.
+        if state["card"] is not None:
+            state["card"].remove()
         payload = {"id": state["id"], "approved": approved}
         self._edit_approval_state = None
         self.query_one("#inputbar", Input).disabled = True
@@ -762,6 +814,46 @@ class PriyaApp(App):
         self._do_hide_thinking()
         if self._cur_ai_bubble is not None:
             self._cur_ai_bubble.update("(worker closed the connection)")
+
+    def _do_agentjob_result(self, result):
+        job_id = result.get("job_id", "unknown")
+        status = result.get("status", "unknown")
+        reason = result.get("reason")
+        if status == "done":
+            message, color = f"Agent job {job_id} finished. Priya is reviewing its changes.", "#4ade80"
+        else:
+            detail = reason or status
+            message, color = f"Agent job {job_id} ended ({detail}). Priya is taking over and checking the work.", "#fbbf24"
+        if result.get("handoff_error"):
+            message += f" Completion handoff error: {result['handoff_error']}"
+        # The original user turn has closed. Mount a dedicated review turn so
+        # Priya's automatic follow-up transcription and any review tools have
+        # active UI targets instead of being silently dropped.
+        self.busy = True
+        self.query_one("#inputbar", Input).disabled = True
+        convo = self.query_one("#convo", VerticalScroll)
+        tree = Tree("", classes="turn-tools")
+        tree.root.expand()
+        tree.show_root = False
+        tree.guide_depth = 2
+        ai_bubble = Static("", classes="bubble ai-bubble")
+        # Child widgets must be supplied while the container is constructed;
+        # mounting them into an unattached Vertical raises Textual MountError.
+        review_turn = Vertical(
+            Static(message, classes="bubble ai-bubble"), tree, ai_bubble,
+            classes="turn",
+        )
+        convo.mount(review_turn)
+        convo.scroll_end(animate=False)
+        self._cur_tree = tree
+        self._cur_turn = review_turn
+        self._cur_ai_bubble = ai_bubble
+        self._cur_ai_text = ""
+        self._cur_thinking = None
+        self._cur_tool_node = None
+        self._cur_links = set()
+        self._background_job_status = message
+        self._set_status(f"  {message}", color)
 
     # ── Key bindings ─────────────────────────────────────────────────────────
 
@@ -909,6 +1001,16 @@ class PriyaApp(App):
                     pending_tool_ids.clear()
                     thinking_hidden = False
                     deferred_tool_finishes.clear()
+                continue
+
+            if line.startswith("<<AGENTJOB_RESULT>>"):
+                try:
+                    result = json.loads(line[len("<<AGENTJOB_RESULT>>"):])
+                    if not isinstance(result, dict):
+                        raise ValueError("result is not an object")
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                self.ui_q.put(AgentJobResult(result))
                 continue
 
             if line.startswith("<<USER_SPEECH>>"):

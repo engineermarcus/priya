@@ -9,6 +9,8 @@ Git; the runner itself is versioned in ``tools/``.
 import json
 import os
 import queue
+import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -23,8 +25,10 @@ PYTHON = sys.executable
 MODEL = "gemini-3.5-flash-lite"
 MAX_TURNS = 60
 SHELL_TIMEOUT_SECONDS = 120
+MAX_FILE_PREVIEW_LINES = 16
 MAX_EVENT_MESSAGE_CHARS = 4000
 MAX_API_RETRIES = 3
+JOB_IDLE_TIMEOUT_SECONDS = 300
 
 
 def paths(job_id):
@@ -51,7 +55,7 @@ def emit(value):
     print(json.dumps(value), flush=True)
 
 
-def record_event(job_id, kind, message, **extra):
+def record_event(job_id, kind, message, *, echo=None, **extra):
     """Append one durable, UI-friendly progress event.
 
     The worker's stdout is deliberately still retained as a human-readable
@@ -69,7 +73,12 @@ def record_event(job_id, kind, message, **extra):
         events.write(json.dumps(event) + "\n")
         events.flush()
     write_status(job_id, event_cursor=cursor, last_event=message)
-    print(f"[{kind}] {message}", flush=True)
+    # CLI commands return a single JSON document.  Only the detached worker
+    # writes the human-readable journal line to its stdout transcript.
+    if echo is None:
+        echo = os.environ.get("PRIYA_AGENT_JOB_ID") == job_id
+    if echo:
+        print(f"[{kind}] {message}", flush=True)
     return event
 
 
@@ -106,7 +115,47 @@ def status(job_id):
     if not p["status"].exists():
         emit({"error": "no such job"})
         return
-    emit(json.loads(p["status"].read_text()))
+    emit(refresh_status(job_id))
+
+
+def refresh_status(job_id):
+    """Detect a dead or stalled detached worker so callers never wait forever."""
+    p = paths(job_id)
+    state = json.loads(p["status"].read_text())
+    if state.get("status") != "running":
+        return state
+
+    # `spawn` writes the PID immediately after starting the detached process.
+    # Until it is available, preserve the running state rather than treating a
+    # short startup race (or a journal-only consumer) as a failed worker.
+    if not p["pid"].exists():
+        return state
+    pid = None
+    try:
+        pid = int(p["pid"].read_text().strip())
+        os.kill(pid, 0)
+        # A zombie still answers kill(pid, 0), but cannot update status.
+        proc_stat = Path(f"/proc/{pid}/stat")
+        if proc_stat.exists() and proc_stat.read_text().split()[2] == "Z":
+            pid = None
+    except (ValueError, OSError):
+        pid = None
+    if pid is None:
+        reason = "worker_exited"
+        message = "Agent worker exited without recording a final status"
+    elif time.time() - state.get("updated_at", time.time()) > JOB_IDLE_TIMEOUT_SECONDS:
+        reason = "stalled_timeout"
+        message = f"Agent made no progress for {JOB_IDLE_TIMEOUT_SECONDS}s; stopping the stalled worker"
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except OSError:
+            pass
+    else:
+        return state
+
+    write_status(job_id, status="failed", reason=reason, error=message)
+    record_event(job_id, "failed", message)
+    return json.loads(p["status"].read_text())
 
 
 def log(job_id, after=0):
@@ -119,6 +168,7 @@ def log(job_id, after=0):
     except (TypeError, ValueError):
         emit({"error": "after must be a non-negative cursor"})
         return
+    state = refresh_status(job_id)
     events = []
     if p["events"].exists():
         for line in p["events"].read_text(encoding="utf-8").splitlines():
@@ -128,8 +178,10 @@ def log(job_id, after=0):
                 continue
             if event.get("cursor", 0) > after:
                 events.append(event)
-    state = json.loads(p["status"].read_text())
-    emit({"job_id": job_id, "status": state.get("status"), "events": events,
+    emit({"job_id": job_id, "status": state.get("status"),
+          "reason": state.get("reason"), "error": state.get("error"),
+          "workdir": state.get("workdir"),
+          "task": state.get("task"), "events": events,
           "cursor": after, "next_cursor": state.get("event_cursor", after)})
 
 
@@ -164,6 +216,22 @@ def queued_messages(p):
     return messages
 
 
+def bound_plain_cat(command):
+    """Prevent common accidental full-file dumps without changing shell IO."""
+    if not isinstance(command, str):
+        return command
+    if any(token in command for token in ("|", ";", "&", ">", "<", "`", "$", "\n")):
+        return command
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+    if len(parts) < 2 or parts[0] != "cat" or any(part.startswith("-") for part in parts[1:]):
+        return command
+    paths = " ".join(shlex.quote(part) for part in parts[1:])
+    return f"head -n {MAX_FILE_PREVIEW_LINES} -- {paths}"
+
+
 def worker(job_id):
     from google import genai
     from google.genai import errors as genai_errors
@@ -182,7 +250,7 @@ def worker(job_id):
     string = lambda description: types.Schema(type=types.Type.STRING, description=description)
     boolean = lambda description: types.Schema(type=types.Type.BOOLEAN, description=description)
     agent_tools = types.Tool(function_declarations=[
-        declaration("bash", "Run a bash command in the project workdir. Use it for search, files, tests, and verification.",
+        declaration("bash", "Run a bash command in the project workdir. Use it for search, files, tests, and verification. Never dump files with cat: preview at most 16 lines using head -n 16 or sed -n 'START,ENDp'.",
                     {"command": string("Command to execute."), "timeout_s": types.Schema(type=types.Type.INTEGER, description="Optional timeout in seconds.")}, ["command"]),
         declaration("Read", "Read a UTF-8 text file relative to the project workdir.", {"path": string("File path.")}, ["path"]),
         declaration("Edit", "Make a precise replacement in a UTF-8 text file. Use bash for new files or broader generated output.",
@@ -195,13 +263,25 @@ def worker(job_id):
         f"{workdir}. You have bash, Read, Edit, and narrate. Call narrate with "
         "a concise milestone before investigating, before making changes, and after "
         "verification; Priya relays those updates live to the user. Use bash output "
-        "and tests as evidence. Complete the task, verify it, then say DONE."
+        "and tests as evidence. Use the shell inspection toolkit deliberately: prefer "
+        "`rg --files`, `rg -n`, `rg -l`, and `rg -g` for discovery/search; use `grep -n`, "
+        "`grep -R`, or `find` if rg is unavailable, and `fd` when installed. Use `git "
+        "status`, `git diff`, `git log`, and `git show` for repository facts; `ls -la`, "
+        "`stat`, `file`, `du -sh`, and `wc -l` for filesystem facts; `diff -u` or `cmp` "
+        "for comparisons; and `sed`, `awk`, `cut`, `sort`, `uniq`, `tr`, `jq`, and `yq` "
+        "for extraction. Use `xargs` only with safely delimited input (`-print0` / `-0`) "
+        "and `tee` only for intentional writes. For file inspection, never use cat or "
+        "dump a whole file. Preview only 16 lines at a time with `head -n 16 PATH`, "
+        "`tail -n 16 PATH`, or `sed -n 'START,ENDp' PATH`; locate relevant symbols first, "
+        "then page through large files in narrow ranges. Do not use `cat`, `less`, or "
+        "`more` for source inspection. Complete the task, verify it, then say DONE."
     )
     contents = [types.Content(role="user", parts=[types.Part(text=state["task"])])]
 
     def run_shell(command, timeout=SHELL_TIMEOUT_SECONDS):
         """Bash equivalent with incremental output recorded to the event journal."""
         try:
+            command = bound_plain_cat(command)
             record_event(job_id, "command", f"$ {command}")
             proc = subprocess.Popen(command, shell=True, cwd=workdir, text=True, bufsize=1,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -263,10 +343,11 @@ def worker(job_id):
                         write_status(job_id, status="failed", reason="api_error", error=str(exc), api_retries=retry)
                         record_event(job_id, "failed", f"Agent API failed after {MAX_API_RETRIES} retries: {exc}")
                         return
-                    delay = 2 ** (retry + 1)
+                    retry_hint = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", str(exc), re.IGNORECASE)
+                    delay = min(60, float(retry_hint.group(1))) if retry_hint else 2 ** (retry + 1)
                     write_status(job_id, api_retries=retry + 1, last_api_error=str(exc))
                     record_event(job_id, "retry", f"Agent API failed; retrying ({retry + 1}/{MAX_API_RETRIES}) in {delay}s")
-                    time.sleep(delay)
+                    time.sleep(max(1, delay))
 
             contents.append(types.Content(role="model", parts=model_parts))
             response_text = "".join(text)

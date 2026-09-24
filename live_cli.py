@@ -11,6 +11,7 @@ import signal
 import uuid
 import difflib
 import hashlib
+import shlex
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -215,6 +216,24 @@ def run_agentjob(args: dict, on_output=None) -> dict:
         return {"error": str(e)}
 
 
+_AGENTJOB_PROGRESS_KINDS = {
+    "narration", "retry", "command_error", "failed", "stopped",
+}
+
+
+def agentjob_progress_message(event: dict) -> str | None:
+    """Return only user-facing journal events for the live tool log.
+
+    The full journal remains available through `agentjob log`; the expanded
+    live node should show milestones and lifecycle events, not every command,
+    file read, edit, or raw agent message.
+    """
+    if event.get("kind") not in _AGENTJOB_PROGRESS_KINDS:
+        return None
+    message = event.get("message")
+    return message if isinstance(message, str) and message else None
+
+
 artifact_declaration = types.FunctionDeclaration(
     name="artifact",
     behavior="NON_BLOCKING",
@@ -412,8 +431,11 @@ bash_declaration = types.FunctionDeclaration(
         "files, inspect a subagent's workdir, verify a subagent's claims, check "
         "processes, or do anything else yourself. Set background=true for a "
         "long-running server, watcher, or process that must not hold up the current "
-        "conversation; it returns its PID and log paths immediately. Runs with your "
-        "current user's permissions, no sandboxing."
+        "conversation; it returns its PID and log paths immediately. For file inspection, "
+        "never use cat to dump a file: start with `sed -n '1,16p' PATH` or `head -n 16 PATH`; "
+        "use `rg -n PATTERN PATH` then `sed -n 'START,ENDp' PATH` for a specific section, "
+        "and `tail -n 16 PATH` for the end. Keep every file preview to 16 lines or fewer. "
+        "Runs with your current user's permissions, no sandboxing."
     ),
     parameters={
         "type": "OBJECT",
@@ -427,11 +449,35 @@ bash_declaration = types.FunctionDeclaration(
 )
 
 
+MAX_FILE_PREVIEW_LINES = 16
+
+
+def bound_plain_cat(command: str) -> str:
+    """Convert a simple `cat file` inspection into a bounded preview.
+
+    Shell constructs are deliberately left alone: changing redirects,
+    pipelines, or substitutions could alter file-writing behavior.
+    """
+    if not isinstance(command, str):
+        return command
+    if any(token in command for token in ("|", ";", "&", ">", "<", "`", "$", "\n")):
+        return command
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+    if len(parts) < 2 or parts[0] != "cat" or any(part.startswith("-") for part in parts[1:]):
+        return command
+    paths = " ".join(shlex.quote(part) for part in parts[1:])
+    return f"head -n {MAX_FILE_PREVIEW_LINES} -- {paths}"
+
+
 def run_bash(args: dict, on_output=None, cancel_event=None) -> dict:
     """Run a shell command and forward its stdout/stderr as it arrives."""
     command = args.get("command")
     if not command:
         return {"error": "bash requires 'command'"}
+    command = bound_plain_cat(command)
     if cancel_event is not None and cancel_event.is_set():
         return {"error": "command interrupted"}
     if args.get("background"):
@@ -552,6 +598,19 @@ Tool-use policy:
   block the conversation; it returns immediately with a PID and log paths.
   Keep finite checks such as tests and builds in the foreground when their
   result is needed before you reply.
+  Use the full shell inspection toolkit deliberately. Prefer `rg --files`,
+  `rg -n`, `rg -l`, and `rg -g` for file discovery and content search; use
+  `grep -n`, `grep -R`, or `find` when `rg` is unavailable, and `fd` when it
+  is installed. Use `git status`, `git diff`, `git log`, and `git show` for
+  repository history; `ls -la`, `stat`, `file`, `du -sh`, and `wc -l` for
+  filesystem facts; and `diff -u` or `cmp` to compare files. For structured
+  extraction, use `sed`, `awk`, `cut`, `sort`, `uniq`, `tr`, `jq`, and `yq`
+  when applicable. Use `xargs` only with safely delimited input (prefer
+  `-print0` / `-0`), and use `tee` only when an intentional write is needed.
+  Keep source output deliberately small: never use `cat`, `less`, or `more`
+  to dump a file. Read no more than 16 source lines at a time with `head -n
+  16`, `tail -n 16`, or `sed -n 'START,ENDp'`; locate a symbol first, then
+  read a narrow range and page through large files only as needed.
 - `agentjob` is Priya's implementation path for non-trivial front-end changes
   in this repository. When the user asks to build or substantially change a
   browser UI, page, component, layout, styling, responsive behavior, or
@@ -802,6 +861,7 @@ class TextLoop:
         # journal tailers here so the UI receives progress even while Priya is
         # answering an unrelated user message.
         self._agentjob_watchers = {}
+        self._completed_agentjobs = asyncio.Queue()
 
     async def watch_agentjob(self, job_id, tool_event_id):
         """Relay a job's append-only journal to its existing tool node."""
@@ -812,18 +872,32 @@ class TextLoop:
                     "action": "log", "job_id": job_id, "cursor": cursor,
                 })
                 if result.get("error"):
+                    await self._completed_agentjobs.put({
+                        "job_id": job_id, "status": "failed",
+                        "reason": "monitor_error", "error": result["error"],
+                    })
                     out("<<TOOL_LOG>>" + json.dumps({
                         "id": tool_event_id, "stream": "agentjob", "text": result["error"],
                     }))
                     return
                 for event in result.get("events", []):
-                    message = event.get("message")
-                    if isinstance(message, str) and message:
+                    message = agentjob_progress_message(event)
+                    if message:
                         out("<<TOOL_LOG>>" + json.dumps({
                             "id": tool_event_id, "stream": "agentjob", "text": message,
                         }))
                 cursor = result.get("next_cursor", cursor)
                 if result.get("status") != "running":
+                    outcome = {
+                        "job_id": job_id, "status": result.get("status"),
+                        "reason": result.get("reason"), "error": result.get("error"),
+                        "workdir": result.get("workdir"), "task": result.get("task"),
+                    }
+                    out("<<TOOL_LOG>>" + json.dumps({
+                        "id": tool_event_id, "stream": "agentjob",
+                        "text": f"Job {result.get('status')}: {result.get('reason') or 'finished'}",
+                    }))
+                    await self._completed_agentjobs.put(outcome)
                     return
                 await asyncio.sleep(.35)
         except Exception as error:
@@ -833,6 +907,10 @@ class TextLoop:
             out("<<TOOL_LOG>>" + json.dumps({
                 "id": tool_event_id, "stream": "agentjob", "text": f"Progress tailer error: {error}",
             }))
+            await self._completed_agentjobs.put({
+                "job_id": job_id, "status": "failed",
+                "reason": "monitor_error", "error": str(error),
+            })
         finally:
             self._agentjob_watchers.pop(job_id, None)
 
@@ -1282,7 +1360,34 @@ class TextLoop:
                         del self._cron_jobs[job_id]
                 else:
                     del self._cron_jobs[job_id]
-            if self.session is not None and not self._generation_active and not self._scheduled_prompts.empty():
+            if self.session is not None and not self._generation_active and not self._completed_agentjobs.empty():
+                job = await self._completed_agentjobs.get()
+                if not job.get("ui_notified"):
+                    out("<<AGENTJOB_RESULT>>" + json.dumps(job))
+                    job["ui_notified"] = True
+                self._generation_active = True
+                self._ready_for_input.clear()
+                instruction = (
+                    f"[Agent job {job['job_id']} finished with status {job['status']}; "
+                    f"reason: {job.get('reason')}; error: {job.get('error')}; "
+                    f"workdir: {job.get('workdir')}. "
+                    f"Original task: {job.get('task')}\n"
+                    "Inspect the job's changed files and verify the requested work. "
+                    "If it failed or did not finish the task, take over now using your "
+                    "local tools and complete the task yourself. Then report the actual result to the user. ]"
+                )
+                try:
+                    await self._send_client_content(
+                        turns={"role": "user", "parts": [{"text": instruction}]},
+                        turn_complete=True,
+                    )
+                except Exception as error:
+                    self._generation_active = False
+                    self._ready_for_input.set()
+                    print(f"agentjob completion could not be delivered: {error}", file=sys.stderr)
+                    await self._completed_agentjobs.put(job)
+                    await asyncio.sleep(5)
+            elif self.session is not None and not self._generation_active and not self._scheduled_prompts.empty():
                 job = self._scheduled_prompts.get_nowait()
                 cancelled = job["job_id"] in self._cancelled_queued_cron_jobs
                 self._finish_queued_cron_job(job["job_id"])
@@ -1365,7 +1470,12 @@ class TextLoop:
                                 self._tool_event_id += 1
                                 tool_event_id = self._tool_event_id
                                 args_dict = dict(fc.args)
-                                detail = args_dict.get("command") or args_dict.get("task") or json.dumps(args_dict)
+                                if fc.name == "agentjob":
+                                    # The task can be a multi-paragraph prompt the user already
+                                    # supplied. Keep this node a compact progress surface.
+                                    detail = f"{args_dict.get('action', 'run')} · background coding job"
+                                else:
+                                    detail = args_dict.get("command") or args_dict.get("task") or json.dumps(args_dict)
                                 out("<<TOOL_START>>" + json.dumps({
                                     "id": tool_event_id, "name": fc.name, "detail": detail,
                                 }))

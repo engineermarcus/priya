@@ -69,6 +69,21 @@ class AgentJobJournalTests(unittest.TestCase):
 
         asyncio.run(verify())
 
+    def test_agentjob_progress_hides_internal_journal_events(self):
+        self.assertEqual(
+            live_cli.agentjob_progress_message({"kind": "narration", "message": "Checking the layout"}),
+            "Checking the layout",
+        )
+        self.assertIsNone(live_cli.agentjob_progress_message({"kind": "command", "message": "$ npm test"}))
+        self.assertIsNone(live_cli.agentjob_progress_message({"kind": "read", "message": "Read App.jsx"}))
+        self.assertIsNone(live_cli.agentjob_progress_message({"kind": "started", "message": "Coding job started"}))
+        self.assertIsNone(live_cli.agentjob_progress_message({"kind": "done", "message": "Agent reported completion"}))
+
+    def test_plain_cat_is_bounded_to_a_small_preview(self):
+        self.assertEqual(live_cli.bound_plain_cat("cat src/App.jsx"), "head -n 16 -- src/App.jsx")
+        self.assertEqual(job_runner.bound_plain_cat("cat 'a file.txt'"), "head -n 16 -- 'a file.txt'")
+        self.assertEqual(live_cli.bound_plain_cat("cat source.txt | wc -l"), "cat source.txt | wc -l")
+
 
 if __name__ == "__main__":
     unittest.main()
