@@ -25,7 +25,7 @@ class LinkRenderingTests(unittest.TestCase):
         rendered = colorize_tool_text('error: failed at ./src/app.py; retry', "stderr")
         self.assertEqual(rendered.plain, 'error: failed at ./src/app.py; retry')
         self.assertTrue(rendered.spans)
-        self.assertEqual(tool_log_label("stdout", "done").plain, "stdout │ done")
+        self.assertEqual(tool_log_label("stdout", "done").plain, "done")
 
     def test_multiline_paste_is_inserted_as_one_input_line(self):
         class PasteInput(PriyaInput):

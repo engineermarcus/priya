@@ -130,17 +130,8 @@ def colorize_tool_text(value, stream="stdout", *, result=False):
 
 
 def tool_log_label(stream, value):
-    """Render compact, muted logs with color reserved for meaningful tokens."""
-    label = Text()
-    stream_style = {
-        "stdout": "dim #64748b",
-        "stderr": "dim #d6a56e",
-        "agentjob": "dim #a5b4fc",
-    }.get(stream, "dim #64748b")
-    label.append(f"{stream}", style=stream_style)
-    label.append(" │ ", style="dim #475569")
-    label.append_text(colorize_tool_text(value, stream))
-    return label
+    """Show the log message itself without a redundant stream-name prefix."""
+    return colorize_tool_text(value, stream)
 
 
 def colorize_diff(value):
