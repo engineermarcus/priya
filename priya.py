@@ -55,10 +55,8 @@ THINKING_FRAMES = [f + " thinking\u2026" for f in SPINNER_FRAMES]
 
 LOGO_ART = r"""    ▄▄█▀▓████░    ▄▄█▀▓████░ ▓████░ ▓████░ ░████▓    ▄▄░▀▓▄▄
  ▄▄██▓ ▓████░  ▄▄██▓ ▒████▒ ▒████░ ▒████░ ▒████▒  ▄▄██░ ▓██▄▄
-▐████▓ ▒████▒ ▐████▓ ░████▓ ▄▄▄▄▄▄ ░█████▄█████░ ▐████▒ ▒████▌
 ░████▓ ░████▓ ░████▓ ▄▄▄▄▄▄ ░████▒ ▄▄▄▄▄▄ ▒█████ ░████▒ ▒████░
 ▒█████▄█████░ ▒████▒ ▓████░ ▒████▓ ▒████▒ ▒████░ ▒████▓ ▒████▒
-▒████▒        ▒████▒ ▒████▒ ▒████▓ ▐▒███░ ▓███▒▌ ▒████▓ ░████▒
 ▓████░        ▓████░ ░████▒ ▓█████  ▀▓██░ ▓██▓▀  ▓█████ ░████▓
 ▓████░        ▓████░ ░████▓ ▓█████    ▀▀█▄█▀▀    ▓█████ ░████▓"""
 
@@ -297,7 +295,16 @@ class PriyaApp(App):
         padding: 0 2;
         color: #60a5fa;
         background: transparent;
-        border-bottom: double #315a8f;
+    }
+
+    #logo-divider {
+        width: 100%;
+        height: 3;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        border-top: heavy #4b4b4b;
+        border-bottom: heavy #4b4b4b;
     }
 
     .turn {
@@ -468,6 +475,7 @@ class PriyaApp(App):
 
     def compose(self) -> ComposeResult:
         yield Static(LOGO_ART, id="logo")
+        yield Static("", id="logo-divider")
         yield VerticalScroll(id="convo")
         yield Static(f"  {MODEL_NAME}  \u00b7  {os.getcwd()}", id="statusbar")
         placeholder = "Type or speak your message\u2026" if self.mic else "Type your message\u2026"
