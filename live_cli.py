@@ -1,5 +1,4 @@
 """
-live_cli.py — Mistral text-based agent (migrated from Gemini Live).
 
 Model: mistral-large-latest (streaming chat completions, tool calling).
 Protocol to priya.py is unchanged:
@@ -294,7 +293,7 @@ TOOLS = [
 ]
 
 SYSTEM_INSTRUCTION = """
-You are Priya, a capable local coding assistant. You have tools and are expected
+You are Priya, a capable coding assistant. You have tools and are expected
 to use them proactively. The user is responsible only for communicating their
 intent, not for naming files, paths, patterns, commands, tools, or an execution
 plan. Infer the needed work, discover the relevant project context yourself,
@@ -568,8 +567,6 @@ class TextLoop:
         # conversation history sent to Mistral on every turn
         self._messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
 
-        self._conversation_id = None
-        self._pending_inputs = []
 
     # ── agentjob watcher ──────────────────────────────────────────
 
@@ -1123,117 +1120,189 @@ class TextLoop:
 
     async def _call_mistral_and_dispatch(self, user_text: str):
         """
-        Add user_text to history, call Mistral with streaming, handle tool calls,
-        and emit the priya.py protocol lines.
+        Stream from /v1/conversations via SSE (Mistral Conversations API).
+        Text chunks reach the UI immediately; tool calls accumulate then execute.
         """
         self._messages.append({"role": "user", "content": user_text})
-        self._pending_inputs = [{"role": "user", "content": user_text}]
 
         while True:
-            # ── Call one model turn via /v1/conversations ───────────
-            text_buf = []
-            tool_calls_buf = {}   # index → {id, name, arguments_str}
+            text_chunks    = []
+            tool_calls_acc = {}   # tool_call_id → {id, name, arguments}
+            line_buf       = ""
 
-            # First call in this process: start a conversation.
-            # Subsequent turns: append to the existing conversation_id.
-            # We still keep self._messages updated (used elsewhere / for
-            # local bookkeeping), but only the LAST user/tool entries are
-            # sent to .append(), since Mistral holds prior turns server-side.
-            import requests as _requests
+            # Extract system message → instructions, convert history → inputs
+            instructions = ""
+            inputs = []
+            for msg in self._messages:
+                role = msg.get("role")
+                if role == "system":
+                    instructions = msg.get("content") or ""
+                elif role == "assistant" and msg.get("tool_calls"):
+                    # assistant tool call → one function.call entry per call
+                    for tc in msg["tool_calls"]:
+                        inputs.append({
+                            "type": "function.call",
+                            "tool_call_id": tc["id"],
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"],
+                        })
+                elif role == "tool":
+                    # tool result → function.result (result not content)
+                    inputs.append({
+                        "type": "function.result",
+                        "tool_call_id": msg["tool_call_id"],
+                        "result": msg["content"],
+                    })
+                elif role == "assistant":
+                    inputs.append({"type": "message.output", "role": "assistant", "content": msg.get("content") or ""})
+                else:
+                    inputs.append(msg)
+
             _headers = {
                 "Content-Type": "application/json",
+                "Accept": "text/event-stream",
                 "Authorization": f"Bearer {os.environ.get('MISTRAL_API_KEY', '')}",
             }
-            if getattr(self, "_conversation_id", None) is None:
-                _body = {
-                    "model": MODEL,
-                    "inputs": [m for m in self._messages if m["role"] != "system"],
-                    "instructions": SYSTEM_INSTRUCTION,
-                    "tools": TOOLS,
-                    "completion_args": {"temperature": 0.7, "max_tokens": 2048},
-                }
-                _resp = await asyncio.to_thread(
-                    lambda h=_headers, b=_body: _requests.post(
-                        "https://api.mistral.ai/v1/conversations",
-                        headers=h,
-                        json=b,
-                    )
-                )
-                _resp.raise_for_status()
-                response = _resp.json()
-                self._conversation_id = response["conversation_id"]
-            else:
-                _body = {
-                    "inputs": self._pending_inputs,
-                }
-                _resp = await asyncio.to_thread(
-                    lambda h=_headers, b=_body, cid=self._conversation_id: _requests.post(
-                        f"https://api.mistral.ai/v1/conversations/{cid}",
-                        headers=h,
-                        json=b,
-                    )
-                )
-                _resp.raise_for_status()
-                response = _resp.json()
+            _body = {
+                "model": MODEL,
+                "inputs": inputs,
+                "instructions": instructions,
+                "tools": TOOLS,
+                "stream": True,
+                "completion_args": {
+                    "temperature": 0.7,
+                    "max_tokens": 2048,
+                    "top_p": 1,
+                },
+            }
 
-            if self._interrupt_event.is_set():
-                pass  # conversations API is non-streaming here; nothing to break mid-flight
+            # Bridge blocking SSE iterator → asyncio queue
+            event_q: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
 
-            # Parse response.outputs: entries are either message.output (text)
-            # or function.call (tool call request).
-            idx = 0
-            for entry in response.get("outputs", []):
-                entry_type = entry.get("type")
-                if entry_type == "message.output":
-                    text = entry.get("content", "") or ""
-                    if text:
-                        text_buf.append(text)
-                        out(text)
-                elif entry_type == "function.call":
-                    tool_calls_buf[idx] = {
-                        "id": entry.get("tool_call_id") or entry.get("id") or f"call-{idx}",
-                        "name": entry.get("name", "") or "",
-                        "arguments_str": entry.get("arguments", "") or "",
-                    }
-                    idx += 1
+            def _do_stream(h=_headers, b=_body):
+                import requests as _req
+                delay = 1.0
+                for _attempt in range(8):
+                    try:
+                        resp = _req.post(
+                            "https://api.mistral.ai/v1/conversations",
+                            headers=h, json=b, stream=True, timeout=120,
+                        )
+                        if resp.status_code == 429:
+                            wait = float(resp.headers.get("Retry-After") or delay)
+                            print(f"[rate-limit] 429, retry in {wait:.1f}s", file=sys.stderr)
+                            time.sleep(wait)
+                            delay = min(delay * 2, 30.0)
+                            continue
+                        resp.raise_for_status()
+                        for raw in resp.iter_lines():
+                            if raw:
+                                loop.call_soon_threadsafe(event_q.put_nowait, ("line", raw))
+                        break
+                    except Exception as exc:
+                        loop.call_soon_threadsafe(event_q.put_nowait, ("error", str(exc)))
+                        return
+                loop.call_soon_threadsafe(event_q.put_nowait, ("error", "Rate limit: all 8 retries exhausted"))
 
-            if self._interrupt_event.is_set():
-                self._interrupt_event.clear()
-                out("<<END>>")
-                return
+            threading.Thread(target=_do_stream, daemon=True).start()
 
-            full_text = "".join(text_buf)
+            while True:
+                if self._interrupt_event.is_set():
+                    self._interrupt_event.clear()
+                    if line_buf.strip():
+                        out(line_buf)
+                    out("<<END>>")
+                    return
 
-            # ── No tool calls → end of turn ────────────────────────
-            if not tool_calls_buf:
+                kind, data = await event_q.get()
+
+                if kind == "error":
+                    raise RuntimeError(data)
+                if kind == "done":
+                    break
+
+                if not data.startswith(b"data: "):
+                    continue
+                payload = data[6:]
+                if payload == b"[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = chunk.get("type", "")
+
+                # Text delta — conversations API
+                if event_type == "message.output.delta":
+                    text_piece = chunk.get("content") or ""
+                    if isinstance(text_piece, list):
+                        text_piece = "".join(
+                            c.get("text", "") if isinstance(c, dict) else str(c)
+                            for c in text_piece
+                        )
+                    if text_piece:
+                        text_chunks.append(text_piece)
+                        line_buf += text_piece
+                        while "\n" in line_buf:
+                            nl = line_buf.index("\n")
+                            out(line_buf[:nl])
+                            line_buf = line_buf[nl + 1:]
+
+                # Function/tool call delta — conversations API
+                elif event_type == "function.call.delta":
+                    tc_id = chunk.get("tool_call_id") or chunk.get("id") or ""
+                    if tc_id not in tool_calls_acc:
+                        tool_calls_acc[tc_id] = {"id": tc_id, "name": "", "arguments": ""}
+                    if chunk.get("name"):
+                        tool_calls_acc[tc_id]["name"] = chunk["name"]
+                    if chunk.get("arguments"):
+                        tool_calls_acc[tc_id]["arguments"] += chunk["arguments"]
+
+                elif event_type == "conversation.response.done":
+                    break
+
+                elif event_type == "conversation.response.error":
+                    raise RuntimeError(chunk.get("message", "conversation error"))
+
+            # Flush any trailing partial line
+            if line_buf.strip():
+                out(line_buf)
+
+            full_text = "".join(text_chunks)
+
+            # No tool calls → turn is done
+            if not tool_calls_acc:
                 if full_text:
                     self._messages.append({"role": "assistant", "content": full_text})
                 out("<<END>>")
                 return
 
-            # ── Tool calls → execute them, then continue ───────────
-            # Add the assistant message with tool_calls to history
-            assistant_tool_calls = []
-            for idx in sorted(tool_calls_buf.keys()):
-                tc = tool_calls_buf[idx]
-                assistant_tool_calls.append({
-                    "id": tc["id"],
+            # Tool calls → append to history, execute, loop
+            assistant_tool_calls = [
+                {
+                    "id": tc["id"] or f"call-{i}",
                     "type": "function",
-                    "function": {"name": tc["name"], "arguments": tc["arguments_str"]},
-                })
+                    "function": {
+                        "name":      tc["name"],
+                        "arguments": tc["arguments"],
+                    },
+                }
+                for i, tc in enumerate(tool_calls_acc.values())
+            ]
             self._messages.append({
                 "role": "assistant",
                 "content": full_text or None,
                 "tool_calls": assistant_tool_calls,
             })
 
-            # Execute each tool call and collect responses
             tool_results = []
-            for idx in sorted(tool_calls_buf.keys()):
-                tc = tool_calls_buf[idx]
+            for tc in tool_calls_acc.values():
                 name = tc["name"]
                 try:
-                    args_dict = json.loads(tc["arguments_str"] or "{}")
+                    args_dict = json.loads(tc["arguments"] or "{}")
                 except json.JSONDecodeError:
                     args_dict = {}
 
@@ -1246,7 +1315,9 @@ class TextLoop:
 
                 def emit_tool_output(stream_name, text, event_id=tool_event_id):
                     if text:
-                        out("<<TOOL_LOG>>" + json.dumps({"id": event_id, "stream": stream_name, "text": text}))
+                        out("<<TOOL_LOG>>" + json.dumps({
+                            "id": event_id, "stream": stream_name, "text": text,
+                        }))
 
                 blocked = self._tool_blocked_by_plan_mode(name)
                 if blocked is not None:
@@ -1292,18 +1363,18 @@ class TextLoop:
 
                 print(f"TOOL: {name} → {json.dumps(result)[:200]}", file=sys.stderr)
                 out("<<TOOL_END>>" + json.dumps({"id": tool_event_id, "name": name, "result": result}))
+
+                # chat completions format uses role="tool"
                 tool_results.append({
-                    "type": "function.result",
-                    "object": "entry",
-                    "tool_call_id": tc["id"],
-                    "result": json.dumps(result),
+                    "role": "tool",
+                    "tool_call_id": tc["id"] or f"call-{i}",
+                    "content": json.dumps(result),
                 })
 
-            # Append tool results and loop for the next model turn
             self._messages.extend(tool_results)
-            self._pending_inputs = tool_results
+            await asyncio.sleep(0.5)
 
-    # ── Scheduler ─────────────────────────────────────────────────
+        # ── Scheduler ─────────────────────────────────────────────────
 
     async def scheduler_loop(self):
         while True:

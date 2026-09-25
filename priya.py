@@ -371,7 +371,15 @@ class Screen:
                 lines.append("  " + C_USER + l + RESET)
             lines.append("")
 
-            # Tool nodes
+            # AI text first — reasoning appears above tool calls
+            if turn.ai_lines:
+                lines.append("  " + C_DIM + "╭─ priya " + "─" * max(0, w - 11) + RESET)
+                for al in turn.ai_lines:
+                    for ll in wrap_text(al, w - 4, indent=0):
+                        lines.append("  " + C_AI + ll + RESET)
+                lines.append("")
+
+            # Tool nodes below the reasoning
             for tid in turn.tool_order:
                 node = turn.tool_nodes[tid]
                 tc = TOOL_COLORS.get(node.name.lower(), C_AI)
@@ -389,14 +397,6 @@ class Screen:
                         for ll in wrap_text(text, w - 6, indent=0):
                             lines.append(f"    {lc}{ll}{RESET}")
             if turn.tool_order:
-                lines.append("")
-
-            # AI text
-            if turn.ai_lines:
-                lines.append("  " + C_DIM + "╭─ priya " + "─" * max(0, w - 11) + RESET)
-                for al in turn.ai_lines:
-                    for ll in wrap_text(al, w - 4, indent=0):
-                        lines.append("  " + C_AI + ll + RESET)
                 lines.append("")
 
             # Question
@@ -553,8 +553,9 @@ def read_key(fd):
     """Read one keypress from raw terminal fd. Returns a string token."""
     ch = os.read(fd, 1)
     if ch == b"\x1b":
-        # Try to read escape sequence
+        # 20ms gap so the full escape sequence arrives before non-blocking read
         try:
+            time.sleep(0.02)
             fcntl.fcntl(fd, fcntl.F_SETFL, os.O_NONBLOCK)
             rest = b""
             try:
@@ -608,6 +609,7 @@ class PriyaApp:
         self.proc = None
         self._stdin_lock = threading.Lock()
         self._busy = False
+        self._tool_active = False   # True while tool calls are executing
         self._question_state = None
         self._edit_state = None
         self._interrupted = False
@@ -641,8 +643,12 @@ class PriyaApp:
             self.screen.tick_spinner()
             if self._busy:
                 frame = SPINNER[self.screen.spinner_i % len(SPINNER)]
-                self.screen.set_status(
-                    f"  {frame}  {MODEL_NAME} is working…", C_STATUS)
+                if self._tool_active:
+                    self.screen.set_status(
+                        f"  {frame}  {MODEL_NAME} is working…", C_STATUS)
+                else:
+                    self.screen.set_status(
+                        f"  {frame}  {MODEL_NAME}  ·  …", C_STATUS)
             self.screen.redraw()
             time.sleep(0.1)
 
@@ -669,6 +675,7 @@ class PriyaApp:
                     p = json.loads(line[len("<<TOOL_START>>"):])
                     tid = p.get("id", f"t{id(p)}")
                     self.screen.add_tool_node(tid, p["name"], p.get("detail",""))
+                    self._tool_active = True
                 except Exception:
                     pass
                 continue
@@ -740,6 +747,7 @@ class PriyaApp:
                     self.screen.finish_tool_node(tid, rt)
                 deferred_finishes.clear()
                 self._busy = False
+                self._tool_active = False
                 self._interrupted = False
                 self.screen.set_busy(False)
                 self.screen.end_turn()
@@ -878,7 +886,7 @@ class PriyaApp:
         self.screen.new_turn(text)
         self.screen.set_busy(True)
         self.screen.set_status(
-            f"  {SPINNER[0]}  {MODEL_NAME} is working…", C_STATUS)
+            f"  {SPINNER[0]}  {MODEL_NAME}  ·  …", C_STATUS)
         threading.Thread(target=self._send_line, args=(text,), daemon=True).start()
 
     def _do_interrupt(self):
