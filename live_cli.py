@@ -1012,8 +1012,8 @@ class MicrophoneProcessor:
         self.speech_active = False
         self.silent_frames = 0
 
-    def reset(self):
-        self.filter.reset()
+    def reset(self, keep_hangover_ms=0):
+        self.filter.reset(keep_hangover_ms=keep_hangover_ms)
         self.speech_active = False
         self.silent_frames = 0
 
@@ -1065,6 +1065,13 @@ class TextLoop:
         self._plan_mode = False
         self._active_bash_cancel = None
         self.mic_processor = MicrophoneProcessor() if MIC else None
+        # Hard-mute countdown (in mic samples). While > 0, outgoing
+        # audio is replaced with silence regardless of what the mic
+        # actually captured. Covers the driver-dependent window where
+        # ALSA can keep physically playing already-queued PCM after
+        # aplay has been killed on an interrupt -- that window can't be
+        # timed from software, so we just guarantee silence instead.
+        self._mic_mute_samples_remaining = 0
         self._discard_until_idle = False
         # A completed client-content interruption is asynchronous. Hold a
         # follow-up typed message until Gemini has acknowledged that turn.
@@ -1200,6 +1207,16 @@ class TextLoop:
         while True:
             data = await self.mic_queue.get()
             cleaned_audio, speech_ended = self.mic_processor.process(data)
+            if self._mic_mute_samples_remaining > 0:
+                # Still inside the post-interrupt hard-mute window: send
+                # silence instead of the (possibly echo-contaminated)
+                # cleaned audio, and don't let it trigger local VAD either.
+                sample_count = len(cleaned_audio) // 2  # 16-bit PCM
+                self._mic_mute_samples_remaining = max(
+                    0, self._mic_mute_samples_remaining - sample_count
+                )
+                cleaned_audio = b"\x00\x00" * sample_count
+                speech_ended = False
             if self.session is not None:
                 await self._send_realtime_input(
                     audio={"data": cleaned_audio, "mime_type": "audio/pcm;rate=16000"}
@@ -1213,12 +1230,19 @@ class TextLoop:
         self._discard_until_idle = True
         self._ready_for_input.clear()
         self.discard_playback()
+        if self.mic_processor is not None:
+            self._mic_mute_samples_remaining = int(SEND_SAMPLE_RATE * 0.4)  # 400ms
         if self._active_bash_cancel is not None:
             self._active_bash_cancel.set()
         self._resolve_pending_question({"cancelled": True})
         self._resolve_pending_edit({"cancelled": True})
         if self.mic_processor is not None:
-            self.mic_processor.reset()
+            # Barge-in: the old aplay process is being torn down but its
+            # ALSA buffer may still be physically playing out audio for a
+            # short window, right while the user is actively speaking into
+            # the mic. Keep the real AEC engine engaged through that window
+            # instead of dropping to NS-only at the worst possible moment.
+            self.mic_processor.reset(keep_hangover_ms=300)
         if self.session is not None:
             # Gemini 3.8 Live defines completed client content as an
             # unconditional interruption of an active generation.
@@ -1964,8 +1988,9 @@ class TextLoop:
                             # cleared here. Without this, queued speech keeps
                             # reaching the microphone after the turn ends.
                             self.discard_playback()
+                            self._mic_mute_samples_remaining = int(SEND_SAMPLE_RATE * 0.4)  # 400ms
                             if self.mic_processor is not None:
-                                self.mic_processor.reset()
+                                self.mic_processor.reset(keep_hangover_ms=300)
                             # This is Gemini's acknowledgement that it has
                             # stopped the active generation. A queued next
                             # user message can now be sent safely.
