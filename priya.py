@@ -491,7 +491,28 @@ class Screen:
                 lines.append("  " + C_USER + l + RESET)
             lines.append("")
 
-            # AI text first — reasoning appears above tool calls
+            # Tool nodes first
+            for tid in turn.tool_order:
+                node = turn.tool_nodes[tid]
+                tc = TOOL_COLORS.get(node.name.lower(), C_AI)
+                spinner_f = SPINNER[self.spinner_i % len(SPINNER)]
+                icon_c = C_OK if node.done else C_DIM
+                detail_s = f"({node.detail})" if node.detail else ""
+                # Header: ToolName(detail):
+                lines.append(
+                    f"  {BOLD}{tc}{node.name}{RESET}"
+                    f"{C_DIM}{detail_s}:{RESET}"
+                )
+                # Logs indented beneath, right-aligned look
+                for stream, log_text in node.logs[-40:]:
+                    lc = C_STDOUT if stream == "stdout" else C_STDERR
+                    for ll in wrap_text(log_text, w - 10, indent=0):
+                        lines.append(f"          {lc}{ll}{RESET}")
+                if not node.done:
+                    lines.append(f"          {C_DIM}{spinner_f}{RESET}")
+                lines.append("")
+
+            # AI text after tool calls
             if turn.ai_lines:
                 if turn is not self.cur_turn:
                     # Turn complete — render markdown
@@ -503,26 +524,6 @@ class Screen:
                     for al in turn.ai_lines:
                         for ll in wrap_text(al, w - 4, indent=0):
                             lines.append("  " + C_AI + ll + RESET)
-                lines.append("")
-
-            # Tool nodes below the reasoning
-            for tid in turn.tool_order:
-                node = turn.tool_nodes[tid]
-                tc = TOOL_COLORS.get(node.name.lower(), C_AI)
-                spinner_f = SPINNER[self.spinner_i % len(SPINNER)]
-                icon = "✓" if node.done else spinner_f
-                icon_c = C_OK if node.done else C_DIM
-                detail_s = node.detail[:w-20] if node.detail else ""
-                lines.append(
-                    f"  {icon_c}{icon}{RESET} {BOLD}{tc}{node.name}{RESET}"
-                    f"  {C_DIM}{detail_s}{RESET}"
-                )
-                if node.expanded or not node.done:
-                    for stream, text in node.logs[-40:]:   # cap at 40 log lines
-                        lc = C_STDOUT if stream == "stdout" else C_STDERR
-                        for ll in wrap_text(text, w - 6, indent=0):
-                            lines.append(f"    {lc}{ll}{RESET}")
-            if turn.tool_order:
                 lines.append("")
 
             # Question
