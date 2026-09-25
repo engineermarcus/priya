@@ -109,13 +109,67 @@ TOOL_COLORS = {
 }
 
 LOGO = [
-    "    ▄▄█▀▓████░    ▄▄█▀▓████░ ▓████░ ▓████░ ░████▓    ▄▄░▀▓▄▄",
-    " ▄▄██▓ ▓████░  ▄▄██▓ ▒████▒ ▒████░ ▒████░ ▒████▒  ▄▄██░ ▓██▄▄",
-    "░████▓ ░████▓ ░████▓ ▄▄▄▄▄▄ ░████▒ ▄▄▄▄▄▄ ▒█████ ░████▒ ▒████░",
-    "▒█████▄█████░ ▒████▒ ▓████░ ▒████▓ ▒████▒ ▒████░ ▒████▓ ▒████▒",
-    "▓████░        ▓████░ ░████▒ ▓█████  ▀▓██░ ▓██▓▀  ▓█████ ░████▓",
-    "▓████░        ▓████░ ░████▓ ▓█████    ▀▀█▄█▀▀    ▓█████ ░████▓",
+    " ▄▓▀▄   ▄▓▀▄   ▄▓  ▄▓ ▄   ▄▓▀▄ ",
+    "█▓▒ ▒▓ █▓▒ ▒▓ █▓▒ █▓▒ ▒▓ █▓▒ ▒▓",
+    "▓▒░▄▀  ▓▒░▄▀  ▀▄▀ ▀▒░▄░▒ ▓▒░▄░▒",
+    "▒░     ▒░  █▄ ▒░  ▄▄▄  ░ ▒░   ░",
+    "░ ░    ░ ░ ░  ░ ░ ░ ░ ░  ░ ░ ░ ",
+    " ░▒     ░▒ ▒░  ░▒  ░▒ ▒░  ░▒ ▒░",
+    "▀▒▓    ▀▒▓ ▓█ ▀▒▓ ▀▒▓ ▓▀ ▀▒▓ ▓▀",
+    "  ▀      ▀ ▒    ▀   ▀▀▒    ▀ ▒ ",
 ]
+
+VERSION = "v0.156.1"
+
+def build_splash(w, model_name, cwd):
+    """Render the splash box. Returns list of ANSI lines (each fills exactly w chars)."""
+    inner = w - 2
+    logo_w = max(len(l) for l in LOGO)
+
+    def box_line(content_ansi, content_plain):
+        pad = max(0, inner - len(content_plain))
+        return C_BORDER + "│" + RESET + content_ansi + " " * pad + C_BORDER + "│" + RESET
+
+    out = []
+
+    # top border
+    out.append(C_BORDER + "╭" + "─" * inner + "╮" + RESET)
+
+    # title
+    title_plain = f" >_ Priya  ({VERSION})"
+    out.append(box_line(BOLD + C_HEAD + title_plain + RESET, title_plain))
+
+    # blank
+    out.append(box_line("", ""))
+
+    # logo (centred)
+    pad_left = max(0, (inner - logo_w) // 2)
+    for row in LOGO:
+        plain = " " * pad_left + row
+        out.append(box_line(C_HEAD + plain + RESET, plain))
+
+    # blank
+    out.append(box_line("", ""))
+
+    # metadata
+    meta = [
+        ("model",       model_name, "/model to change"),
+        ("directory",   cwd,        ""),
+        ("permissions", "YOLO mode", ""),
+    ]
+    key_w = max(len(k) for k, _, _ in meta)
+    for key, val, hint in meta:
+        hint_ansi  = ("  " + C_DIM + hint + RESET) if hint else ""
+        hint_plain = ("  " + hint) if hint else ""
+        label = f"{key}:".ljust(key_w + 1)
+        ansi  = f"  {C_DIM}{label}{RESET}  {C_AI}{val}{RESET}{hint_ansi}"
+        plain = f"  {label}  {val}{hint_plain}"
+        out.append(box_line(ansi, plain))
+
+    # bottom border
+    out.append(C_BORDER + "╰" + "─" * inner + "╯" + RESET)
+
+    return out
 
 # ── Terminal size ─────────────────────────────────────────────────────────────
 
@@ -228,22 +282,17 @@ class Screen:
         w, h = terminal_size()
         self._w = w
         self._h = h
-        # Layout: logo(8) + border(1) + convo(rest) + status(1) + input(1)
-        self._convo_h = max(4, h - 8 - 1 - 1 - 1)
+        # Logo is scrollable content now, not a fixed block at top
+        # Reserve only: status(1) + border-top(1) + input(1) + border-bot(1) = 4
+        self._convo_h = max(4, h - 4)
         self._cache_dirty = True
 
     # ── Logo ──────────────────────────────────────────────────────
 
     def _draw_logo(self):
-        buf = []
-        buf.append(cup(1, 1))
-        for i, line in enumerate(LOGO):
-            buf.append(cup(i + 1, 1) + el() + BG_MAIN + C_HEAD + line + RESET)
-        # divider
-        row = len(LOGO) + 1
-        buf.append(cup(row, 1) + el() + BG_MAIN + C_BORDER + ("─" * self._w) + RESET)
-        self._write("".join(buf))
-        self._logo_rows = len(LOGO) + 1  # rows consumed by logo + divider
+        # Logo is now part of scrollable content — just clear screen on init
+        self._write(BG_MAIN + ed(2))
+        self._logo_rows = 0
 
     # ── Full redraw ───────────────────────────────────────────────
 
@@ -252,14 +301,8 @@ class Screen:
         buf = []
         buf.append(BG_MAIN)
 
-        # Logo
-        for i, line in enumerate(LOGO):
-            buf.append(cup(i + 1, 1) + el() + C_HEAD + line + RESET + BG_MAIN)
-        logo_end = len(LOGO) + 1
-        buf.append(cup(logo_end, 1) + el() + C_BORDER + ("─" * self._w) + RESET + BG_MAIN)
-
-        # Convo area
-        convo_start = logo_end + 1
+        # Convo area fills full screen (logo scrolls inside it)
+        convo_start = 1
         lines = self._get_lines()
         visible_start = max(0, len(lines) - self._convo_h - self.scroll_offset)
         visible = lines[visible_start: visible_start + self._convo_h]
@@ -282,23 +325,25 @@ class Screen:
         buf.append(truncate(self.status_text, self._w))
         buf.append(RESET)
 
-        # Input bar
-        input_row = status_row + 1
-        prompt = C_PROMPT + BOLD + " > " + RESET + BG_INPUT
+        # Input bar — top border / prompt line / bottom border
+        border_top_row = status_row + 1
+        input_row      = border_top_row + 1
+        border_bot_row = input_row + 1
+
+        border = C_BORDER + ("─" * self._w) + RESET
+        buf.append(cup(border_top_row, 1) + el() + BG_MAIN + border)
+
+        prompt = C_PROMPT + BOLD + "> " + RESET + BG_MAIN
         display_text = self.input_text
-        max_input = self._w - 4
+        max_input = self._w - 3
         if len(display_text) > max_input:
             display_text = display_text[len(display_text) - max_input:]
-        buf.append(cup(input_row, 1) + el() + BG_INPUT)
+        buf.append(cup(input_row, 1) + el() + BG_MAIN)
         buf.append(prompt + C_AI + display_text + RESET)
 
-        # Key hint bar
-        hint_row = input_row + 1
-        hints = "  esc:stop  ctrl+u:clear  ctrl+l:redraw  ↑↓:scroll  ctrl+c:quit"
-        buf.append(cup(hint_row, 1) + el() + BG_STATUS + C_DIM + truncate(hints, self._w) + RESET)
+        buf.append(cup(border_bot_row, 1) + el() + BG_MAIN + border)
 
-        # Cursor in input
-        cursor_col = 4 + min(self.input_cursor, max_input)  # " > " = 3 + 1 space
+        cursor_col = 3 + min(self.input_cursor, max_input)
         buf.append(cup(input_row, cursor_col))
         buf.append(show_cursor())
 
@@ -311,6 +356,12 @@ class Screen:
             return self._lines_cache
         lines = []
         w = self._w - 2  # side margin
+
+        # Logo as scrollable header — tied to chat, scrolls up with it
+        splash = build_splash(self._w, MODEL_NAME, os.getcwd())
+        for line in splash:
+            lines.append(BG_MAIN + line + RESET)
+        lines.append("")  # breathing room before first turn
 
         for turn in self.turns:
             # User message
