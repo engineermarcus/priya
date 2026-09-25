@@ -1065,14 +1065,23 @@ class TextLoop:
         self._plan_mode = False
         self._active_bash_cancel = None
         self.mic_processor = MicrophoneProcessor() if MIC else None
-        # Hard-mute countdown (in mic samples). While > 0, outgoing
-        # audio is replaced with silence regardless of what the mic
-        # actually captured. Covers the driver-dependent window where
-        # ALSA can keep physically playing already-queued PCM after
-        # aplay has been killed on an interrupt -- that window can't be
-        # timed from software, so we just guarantee silence instead.
-        self._mic_mute_samples_remaining = 0
+        # --- mic gated on playback, VAD-driven self-interrupt removed ---
+        # True while the AI has audio actively queued/playing. The mic
+        # is fully muted whenever this is True -- ESC (interrupt()) is
+        # the only way to cut in, so there is no local VAD decision to
+        # make and no way for Priya's own voice to reach Gemini as
+        # input, echo-cancelled or not.
+        self._ai_speaking = False
         self._discard_until_idle = False
+        # --- interrupt is turn-taking, not a kill: generation-scoped suppression ---
+        # Bumped on every interrupt(). A response stream captures the
+        # value at its own start; if it no longer matches (a newer
+        # interrupt happened since), that stream is stale and gets
+        # suppressed -- but a BRAND NEW stream started after an
+        # interrupt captures the current value and is never suppressed
+        # by it, regardless of whether the old stream ever reports a
+        # clean completion.
+        self._generation = 0
         # A completed client-content interruption is asynchronous. Hold a
         # follow-up typed message until Gemini has acknowledged that turn.
         self._ready_for_input = asyncio.Event()
@@ -1203,35 +1212,35 @@ class TextLoop:
             await self.mic_queue.put(data)
 
     async def send_audio(self):
-        """Use local noise/VAD gating with Gemini's automatic VAD as fallback."""
+        """Mute the mic while the AI is talking; ESC (interrupt()) is the
+        only way to cut in, so there is no local VAD decision left to make.
+        Gemini's own server-side VAD ends turns from the live stream."""
         while True:
             data = await self.mic_queue.get()
-            cleaned_audio, speech_ended = self.mic_processor.process(data)
-            if self._mic_mute_samples_remaining > 0:
-                # Still inside the post-interrupt hard-mute window: send
-                # silence instead of the (possibly echo-contaminated)
-                # cleaned audio, and don't let it trigger local VAD either.
-                sample_count = len(cleaned_audio) // 2  # 16-bit PCM
-                self._mic_mute_samples_remaining = max(
-                    0, self._mic_mute_samples_remaining - sample_count
-                )
-                cleaned_audio = b"\x00\x00" * sample_count
-                speech_ended = False
+            if self._ai_speaking:
+                # Fully muted: send nothing at all rather than silence, so
+                # there is zero chance of Priya's own trailing audio (echo
+                # or otherwise) reaching Gemini as a user turn.
+                continue
             if self.session is not None:
                 await self._send_realtime_input(
-                    audio={"data": cleaned_audio, "mime_type": "audio/pcm;rate=16000"}
+                    audio={"data": data, "mime_type": "audio/pcm;rate=16000"}
                 )
-                if speech_ended:
-                    self._generation_active = True
-                    await self._send_realtime_input(audio_stream_end=True)
 
     async def interrupt(self):
-        """Cut off the active Live generation without closing the session."""
+        """Cut off the active Live generation without closing the session.
+
+        This is turn-taking, not a kill switch: the mic and normal
+        text/tool output must both come back on their own shortly after,
+        whether or not the interrupted stream ever reports a clean
+        completion signal.
+        """
+        self._ai_speaking = False
+        self._generation += 1
+        my_generation = self._generation
         self._discard_until_idle = True
         self._ready_for_input.clear()
         self.discard_playback()
-        if self.mic_processor is not None:
-            self._mic_mute_samples_remaining = int(SEND_SAMPLE_RATE * 0.4)  # 400ms
         if self._active_bash_cancel is not None:
             self._active_bash_cancel.set()
         self._resolve_pending_question({"cancelled": True})
@@ -1253,6 +1262,17 @@ class TextLoop:
                 )
             except Exception as error:
                 out(f"Priya could not interrupt the current response: {error}")
+        # Safety net: don't depend on the killed stream ever reporting a
+        # clean IDLE/turn_complete/end signal to unstick things. If nothing
+        # else has cleared suppression/mute by the time a new interrupt
+        # hasn't superseded this one, force it open.
+        async def _release_after_grace(generation):
+            await asyncio.sleep(0.5)
+            if self._generation == generation:
+                self._discard_until_idle = False
+                self._ai_speaking = False
+                self._ready_for_input.set()
+        asyncio.create_task(_release_after_grace(my_generation))
 
     async def send_text(self):
         while True:
@@ -1971,6 +1991,7 @@ class TextLoop:
                 saw_tool_call = False
                 reached_idle = False
                 timed_out = False
+                stream_generation = self._generation
                 turn = self.session.receive()
                 try:
                     while True:
@@ -1978,17 +1999,26 @@ class TextLoop:
                         sc = response.server_content
                         print(f"RAW: {response}", file=sys.stderr)
 
-                        suppress_response = self._discard_until_idle
+                        # Only suppress output that belongs to a stream
+                        # that was already stale when it started (i.e.
+                        # an interrupt happened before or during this
+                        # exact stream). A stream started fresh after
+                        # the interrupt is never suppressed, so text
+                        # and tool calls always resume on the next turn.
+                        suppress_response = (
+                            self._discard_until_idle
+                            and stream_generation == self._generation
+                        )
                         if not suppress_response:
                             emit_input_transcription(sc)
 
                         was_interrupted = bool(sc is not None and sc.interrupted)
                         if was_interrupted:
+                            self._ai_speaking = False
                             # Gemini documents that client playback must be
                             # cleared here. Without this, queued speech keeps
                             # reaching the microphone after the turn ends.
                             self.discard_playback()
-                            self._mic_mute_samples_remaining = int(SEND_SAMPLE_RATE * 0.4)  # 400ms
                             if self.mic_processor is not None:
                                 self.mic_processor.reset(keep_hangover_ms=300)
                             # This is Gemini's acknowledgement that it has
@@ -2079,14 +2109,14 @@ class TextLoop:
 
                         if (TALK and response.data and self.player is not None
                                 and not was_interrupted and not suppress_response):
-                            if self.mic_processor is not None:
-                                self.mic_processor.add_playback(response.data)
+                            self._ai_speaking = True
                             self.player.stdin.write(response.data)
                             self.player.stdin.flush()
 
                         status = getattr(sc, "interaction_status", None) if sc is not None else None
                         turn_complete = bool(getattr(sc, "turn_complete", False)) if sc is not None else False
                         if status == "IDLE" or turn_complete:
+                            self._ai_speaking = False
                             # It is now safe to send the next typed turn.  In
                             # particular, this releases messages queued while
                             # a tool response was being written.
@@ -2098,9 +2128,13 @@ class TextLoop:
                             reached_idle = True
                             break
                 except StopAsyncIteration:
+                    # --- _ai_speaking cleared on every stream-exit path, not just IDLE ---
                     # Current Live streams commonly end without the legacy
                     # interaction_status=IDLE event. Their exhaustion is a
-                    # valid completion boundary as well.
+                    # valid completion boundary as well -- and, whether or
+                    # not this stream carried a tool call, if it wrote any
+                    # audio the mic must not stay muted past this point.
+                    self._ai_speaking = False
                     if not saw_tool_call:
                         self._ready_for_input.set()
                     if self._discard_until_idle:
@@ -2110,6 +2144,7 @@ class TextLoop:
                 except asyncio.TimeoutError:
                     print("receive_text: stalled turn, forcing end", file=sys.stderr)
                     timed_out = True
+                    self._ai_speaking = False
                     self._ready_for_input.set()
                     if self._discard_until_idle:
                         self._discard_until_idle = False
