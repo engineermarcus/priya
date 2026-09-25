@@ -40,10 +40,11 @@ from textual.widgets.option_list import Option
 from textual.reactive import reactive
 from textual import work
 from rich.text import Text
+from rich.markdown import Markdown
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(DIR, "live_cli.py")
-MODEL_NAME = "gemini-3.8-live"
+MODEL_NAME = "mistral-large-latest"
 
 SENTINEL = object()
 
@@ -441,10 +442,9 @@ class PriyaApp(App):
 
     def __init__(self, talk=False, mic=False):
         super().__init__()
-        # Mic conversations are spoken conversations: keep the model's audio
-        # enabled while its transcription and tool activity remain visible.
-        self.talk = talk or mic
-        self.mic = mic
+        # Audio modes removed (Mistral text-based agent).
+        self.talk = False
+        self.mic = False
         self.proc = None
         self.raw_q = queue.Queue()
         self.ui_q = queue.Queue()
@@ -676,7 +676,11 @@ class PriyaApp(App):
         if self._cur_ai_bubble is None:
             return
         self._cur_ai_text += text
-        self._cur_ai_bubble.update(self._cur_ai_text)
+        # Render Markdown — text-based models (Mistral) output Markdown natively.
+        try:
+            self._cur_ai_bubble.update(Markdown(self._cur_ai_text))
+        except Exception:
+            self._cur_ai_bubble.update(self._cur_ai_text)
         self._mount_links(text)
         convo = self.query_one("#convo", VerticalScroll)
         convo.scroll_end(animate=False)
@@ -1165,9 +1169,7 @@ class PriyaApp(App):
 
 
 def main():
-    talk = "--talk" in sys.argv[1:]
-    mic = "--mic" in sys.argv[1:]
-    app = PriyaApp(talk=talk, mic=mic)
+    app = PriyaApp()
     app.run()
 
 

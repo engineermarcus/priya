@@ -23,7 +23,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 JOBS_DIR = Path(os.environ.get("PRIYA_JOBS_DIR", PROJECT_ROOT / ".priya" / "jobs"))
 PYTHON = sys.executable
-MODEL = "gemini-3.5-flash"
+MODEL = "gemini-3.5-flash-lite"
 MAX_TURNS = 60
 SHELL_TIMEOUT_SECONDS = 120
 MAX_FILE_PREVIEW_LINES = 16

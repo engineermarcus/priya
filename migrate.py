@@ -1,4 +1,71 @@
+#!/usr/bin/env python3
 """
+migrate_to_mistral.py
+─────────────────────
+Run this from the ROOT of the priya codebase:
+
+    cd /home/marcus/priya
+    python migrate_to_mistral.py
+
+What it does
+────────────
+1. Rewrites live_cli.py  — drops Gemini Live (audio/websocket), replaces with
+   a Mistral text-based agent using the mistralai SDK v1 chat.stream() loop.
+   All tools (bash, Read, Edit, Glob, Grep, LSP, agentjob, artifact, …) are
+   preserved exactly; the protocol emitted to priya.py (<<TOOL_START>>, etc.)
+   is unchanged.
+
+2. Patches priya.py     — updates MODEL_NAME constant, renders AI text as
+   Rich Markdown (text-based models output markdown) using a Markdown widget
+   instead of plain Static, keeps the rest of the TUI intact.
+
+3. Patches tools/job_runner.py — upgrades job runner model from
+   gemini-3.5-flash-lite → gemini-3.5-flash (as requested).
+
+4. Rewrites requirements.txt  — swaps google-genai for mistralai, drops
+   audio-only deps (PyAudio, webrtcvad-wheels, pywebrtc-audio).
+
+Backups of every modified file are written to <file>.bak before changes.
+"""
+
+import os
+import sys
+import shutil
+import textwrap
+
+ROOT = os.getcwd()
+
+
+def backup(path):
+    bak = path + ".bak"
+    shutil.copy2(path, bak)
+    print(f"  backed up → {bak}")
+
+
+def write(path, content):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"  wrote     → {path}")
+
+
+def patch_in_place(path, old, new, label=""):
+    with open(path, "r", encoding="utf-8") as f:
+        src = f.read()
+    if old not in src:
+        print(f"  WARNING: patch target not found in {path}" + (f" ({label})" if label else ""))
+        return False
+    patched = src.replace(old, new, 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(patched)
+    print(f"  patched   → {path}" + (f" [{label}]" if label else ""))
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────
+# 1.  NEW live_cli.py — Mistral text-based agent
+# ─────────────────────────────────────────────────────────────────
+
+NEW_LIVE_CLI = r'''"""
 live_cli.py — Mistral text-based agent (migrated from Gemini Live).
 
 Model: mistral-large-latest (streaming chat completions, tool calling).
@@ -34,9 +101,9 @@ from tools.mcp import McpManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-import requests
+from mistralai import Mistral
 
-MODEL = "mistral-medium-latest"
+MODEL = "mistral-large-latest"
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 SESSION_DIR = os.path.realpath(os.getcwd())
@@ -567,9 +634,7 @@ class TextLoop:
         self._interrupt_event = asyncio.Event()
         # conversation history sent to Mistral on every turn
         self._messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
-
-        self._conversation_id = None
-        self._pending_inputs = []
+        self._client = Mistral(api_key=os.environ.get("MISTRAL_API_KEY", ""))
 
     # ── agentjob watcher ──────────────────────────────────────────
 
@@ -1127,75 +1192,50 @@ class TextLoop:
         and emit the priya.py protocol lines.
         """
         self._messages.append({"role": "user", "content": user_text})
-        self._pending_inputs = [{"role": "user", "content": user_text}]
 
         while True:
-            # ── Call one model turn via /v1/conversations ───────────
+            # ── Stream one model turn ──────────────────────────────
             text_buf = []
             tool_calls_buf = {}   # index → {id, name, arguments_str}
 
-            # First call in this process: start a conversation.
-            # Subsequent turns: append to the existing conversation_id.
-            # We still keep self._messages updated (used elsewhere / for
-            # local bookkeeping), but only the LAST user/tool entries are
-            # sent to .append(), since Mistral holds prior turns server-side.
-            import requests as _requests
-            _headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {os.environ.get('MISTRAL_API_KEY', '')}",
-            }
-            if getattr(self, "_conversation_id", None) is None:
-                _body = {
-                    "model": MODEL,
-                    "inputs": [m for m in self._messages if m["role"] != "system"],
-                    "instructions": SYSTEM_INSTRUCTION,
-                    "tools": TOOLS,
-                    "completion_args": {"temperature": 0.7, "max_tokens": 2048},
-                }
-                _resp = await asyncio.to_thread(
-                    lambda h=_headers, b=_body: _requests.post(
-                        "https://api.mistral.ai/v1/conversations",
-                        headers=h,
-                        json=b,
-                    )
+            stream = await asyncio.to_thread(
+                lambda: self._client.chat.stream(
+                    model=MODEL,
+                    messages=self._messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
                 )
-                _resp.raise_for_status()
-                response = _resp.json()
-                self._conversation_id = response["conversation_id"]
-            else:
-                _body = {
-                    "inputs": self._pending_inputs,
-                }
-                _resp = await asyncio.to_thread(
-                    lambda h=_headers, b=_body, cid=self._conversation_id: _requests.post(
-                        f"https://api.mistral.ai/v1/conversations/{cid}",
-                        headers=h,
-                        json=b,
-                    )
-                )
-                _resp.raise_for_status()
-                response = _resp.json()
+            )
 
-            if self._interrupt_event.is_set():
-                pass  # conversations API is non-streaming here; nothing to break mid-flight
+            # Mistral SDK v1 chat.stream() returns a generator of CompletionEvent
+            # Each event has .data which is a ChatCompletionStreamResponse
+            # .data.choices[0].delta has .content and .tool_calls
+            for event in stream:
+                if self._interrupt_event.is_set():
+                    break
+                delta = event.data.choices[0].delta
+                finish_reason = event.data.choices[0].finish_reason
 
-            # Parse response.outputs: entries are either message.output (text)
-            # or function.call (tool call request).
-            idx = 0
-            for entry in response.get("outputs", []):
-                entry_type = entry.get("type")
-                if entry_type == "message.output":
-                    text = entry.get("content", "") or ""
-                    if text:
-                        text_buf.append(text)
-                        out(text)
-                elif entry_type == "function.call":
-                    tool_calls_buf[idx] = {
-                        "id": entry.get("tool_call_id") or entry.get("id") or f"call-{idx}",
-                        "name": entry.get("name", "") or "",
-                        "arguments_str": entry.get("arguments", "") or "",
-                    }
-                    idx += 1
+                # Text chunk
+                if delta.content:
+                    text_buf.append(delta.content)
+                    out(delta.content)
+
+                # Tool call chunks (may arrive across multiple events)
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index if hasattr(tc, "index") and tc.index is not None else 0
+                        if idx not in tool_calls_buf:
+                            tool_calls_buf[idx] = {
+                                "id": getattr(tc, "id", None) or f"call-{idx}",
+                                "name": "",
+                                "arguments_str": "",
+                            }
+                        if tc.function:
+                            if tc.function.name:
+                                tool_calls_buf[idx]["name"] += tc.function.name
+                            if tc.function.arguments:
+                                tool_calls_buf[idx]["arguments_str"] += tc.function.arguments
 
             if self._interrupt_event.is_set():
                 self._interrupt_event.clear()
@@ -1293,15 +1333,13 @@ class TextLoop:
                 print(f"TOOL: {name} → {json.dumps(result)[:200]}", file=sys.stderr)
                 out("<<TOOL_END>>" + json.dumps({"id": tool_event_id, "name": name, "result": result}))
                 tool_results.append({
-                    "type": "function.result",
-                    "object": "entry",
+                    "role": "tool",
                     "tool_call_id": tc["id"],
-                    "result": json.dumps(result),
+                    "content": json.dumps(result),
                 })
 
             # Append tool results and loop for the next model turn
             self._messages.extend(tool_results)
-            self._pending_inputs = tool_results
 
     # ── Scheduler ─────────────────────────────────────────────────
 
@@ -1444,3 +1482,163 @@ class TextLoop:
 if __name__ == "__main__":
     main = TextLoop()
     asyncio.run(main.run())
+'''
+
+
+# ─────────────────────────────────────────────────────────────────
+# 2.  priya.py patches
+# ─────────────────────────────────────────────────────────────────
+
+# 2a. Change MODEL_NAME
+PRIYA_MODEL_OLD = 'MODEL_NAME = "gemini-3.8-live"'
+PRIYA_MODEL_NEW = 'MODEL_NAME = "mistral-large-latest"'
+
+# 2b. Add Markdown import after existing rich import
+PRIYA_IMPORT_OLD = 'from rich.text import Text'
+PRIYA_IMPORT_NEW = 'from rich.text import Text\nfrom rich.markdown import Markdown'
+
+# 2c. Render AI text as Markdown
+# The _do_append_text method updates _cur_ai_bubble with plain text.
+# We change it to wrap with Markdown so the TUI renders formatted output.
+PRIYA_APPEND_OLD = '''\
+    def _do_append_text(self, text):
+        if self._cur_ai_bubble is None:
+            return
+        self._cur_ai_text += text
+        self._cur_ai_bubble.update(self._cur_ai_text)
+        self._mount_links(text)
+        convo = self.query_one("#convo", VerticalScroll)
+        convo.scroll_end(animate=False)'''
+
+PRIYA_APPEND_NEW = '''\
+    def _do_append_text(self, text):
+        if self._cur_ai_bubble is None:
+            return
+        self._cur_ai_text += text
+        # Render Markdown — text-based models (Mistral) output Markdown natively.
+        try:
+            self._cur_ai_bubble.update(Markdown(self._cur_ai_text))
+        except Exception:
+            self._cur_ai_bubble.update(self._cur_ai_text)
+        self._mount_links(text)
+        convo = self.query_one("#convo", VerticalScroll)
+        convo.scroll_end(animate=False)'''
+
+# 2d. Update status-bar text (remove mic placeholder, keep workdir)
+PRIYA_STATUS_OLD = '        placeholder = "Type or speak your message\u2026" if self.mic else "Type your message\u2026"'
+PRIYA_STATUS_NEW = '        placeholder = "Type your message\u2026"'
+
+# 2e. Drop mic/talk flags from compose (keep only text)
+PRIYA_INIT_OLD = '    def __init__(self, talk=False, mic=False):\n        super().__init__()\n        # Mic conversations are spoken conversations: keep the model\'s audio\n        # enabled while its transcription and tool activity remain visible.\n        self.talk = talk or mic\n        self.mic = mic'
+PRIYA_INIT_NEW = '    def __init__(self, talk=False, mic=False):\n        super().__init__()\n        # Audio modes removed (Mistral text-based agent).\n        self.talk = False\n        self.mic = False'
+
+# 2f. Update main() to not pass audio flags
+PRIYA_MAIN_OLD = '''\
+def main():
+    talk = "--talk" in sys.argv[1:]
+    mic = "--mic" in sys.argv[1:]
+    app = PriyaApp(talk=talk, mic=mic)
+    app.run()'''
+PRIYA_MAIN_NEW = '''\
+def main():
+    app = PriyaApp()
+    app.run()'''
+
+
+# ─────────────────────────────────────────────────────────────────
+# 3.  tools/job_runner.py: flash-lite → flash
+# ─────────────────────────────────────────────────────────────────
+
+JR_MODEL_OLD = 'MODEL = "gemini-3.5-flash-lite"'
+JR_MODEL_NEW = 'MODEL = "gemini-3.5-flash"'
+
+
+# ─────────────────────────────────────────────────────────────────
+# 4.  requirements.txt
+# ─────────────────────────────────────────────────────────────────
+
+NEW_REQUIREMENTS = """\
+mistralai>=1.2.4
+textual==8.2.8
+rich==15.0.0
+"""
+
+
+# ═════════════════════════════════════════════════════════════════
+#  RUN
+# ═════════════════════════════════════════════════════════════════
+
+def main():
+    print(f"\n🔧  Priya migration: Gemini Live → Mistral text agent")
+    print(f"    Working directory: {ROOT}\n")
+
+    errors = []
+
+    # ── 1. live_cli.py ────────────────────────────────────────────
+    live_cli_path = os.path.join(ROOT, "live_cli.py")
+    if not os.path.exists(live_cli_path):
+        errors.append(f"live_cli.py not found at {live_cli_path}")
+    else:
+        print("[ live_cli.py ]")
+        backup(live_cli_path)
+        write(live_cli_path, NEW_LIVE_CLI)
+
+    # ── 2. priya.py ───────────────────────────────────────────────
+    priya_path = os.path.join(ROOT, "priya.py")
+    if not os.path.exists(priya_path):
+        errors.append(f"priya.py not found at {priya_path}")
+    else:
+        print("\n[ priya.py ]")
+        backup(priya_path)
+        for old, new, label in [
+            (PRIYA_MODEL_OLD,   PRIYA_MODEL_NEW,   "MODEL_NAME"),
+            (PRIYA_IMPORT_OLD,  PRIYA_IMPORT_NEW,  "Markdown import"),
+            (PRIYA_APPEND_OLD,  PRIYA_APPEND_NEW,  "_do_append_text → Markdown"),
+            (PRIYA_STATUS_OLD,  PRIYA_STATUS_NEW,  "input placeholder"),
+            (PRIYA_INIT_OLD,    PRIYA_INIT_NEW,    "__init__ audio flags"),
+            (PRIYA_MAIN_OLD,    PRIYA_MAIN_NEW,    "main() audio flags"),
+        ]:
+            patch_in_place(priya_path, old, new, label)
+
+    # ── 3. tools/job_runner.py ────────────────────────────────────
+    jr_path = os.path.join(ROOT, "tools", "job_runner.py")
+    if not os.path.exists(jr_path):
+        errors.append(f"tools/job_runner.py not found at {jr_path}")
+    else:
+        print("\n[ tools/job_runner.py ]")
+        backup(jr_path)
+        patch_in_place(jr_path, JR_MODEL_OLD, JR_MODEL_NEW, "MODEL flash-lite → flash")
+
+    # ── 4. requirements.txt ───────────────────────────────────────
+    req_path = os.path.join(ROOT, "requirements.txt")
+    if not os.path.exists(req_path):
+        errors.append(f"requirements.txt not found at {req_path}")
+    else:
+        print("\n[ requirements.txt ]")
+        backup(req_path)
+        write(req_path, NEW_REQUIREMENTS)
+
+    # ── Summary ───────────────────────────────────────────────────
+    print()
+    if errors:
+        print("⚠️  Some files were not found. Run this script from the root of priya/:")
+        for e in errors:
+            print(f"   {e}")
+        sys.exit(1)
+    else:
+        print("✅  Migration complete!\n")
+        print("Next steps:")
+        print("  1. pip install -r requirements.txt   # installs mistralai, drops google-genai")
+        print("  2. export MISTRAL_API_KEY=your_key   # get one from console.mistral.ai")
+        print("  3. python priya.py                   # launch as normal")
+        print()
+        print("Notes:")
+        print("  • Gemini job runner (tools/job_runner.py) still uses GEMINI_API_KEY")
+        print("    (upgraded from flash-lite → flash as requested).")
+        print("  • tools/agent.py uses 'gemini-3.5-flash' (was already flash, not lite).")
+        print("  • All .bak files preserve originals if you need to roll back.")
+        print("  • Microphone / audio flags (--talk, --mic) are now no-ops.")
+
+
+if __name__ == "__main__":
+    main()
