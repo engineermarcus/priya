@@ -75,8 +75,8 @@ def fg(r,g,b): return f"{CSI}38;2;{r};{g};{b}m"
 def bg(r,g,b): return f"{CSI}48;2;{r};{g};{b}m"
 
 # Palette
-C_USER    = fg(139,148,158)   # cool gray
-C_AI      = fg(230,230,230)   # near white
+C_USER    = fg(230,230,230)   # near white
+C_AI      = fg(125,185,232)   # sky blue
 C_DIM     = fg(80,80,90)
 C_TOOL    = fg(74,222,128)    # green
 C_TOOL_B  = fg(96,165,250)    # blue (artifact)
@@ -220,6 +220,127 @@ def colorize_diff(diff):
             out.append(C_DIFF_N + line + RESET)
     return out
 
+def render_markdown_ansi(text, width, indent=2):
+    import mistune
+    import textwrap as _tw
+    import re as _re
+
+    C_H1       = fg(100, 149, 237)
+    C_H2       = fg(96,  165, 250)
+    C_H3       = fg(103, 232, 249)
+    C_CODE     = fg(250, 204,  21)
+    C_FENCE    = fg(120, 130, 150)
+    C_FENCE_BG = bg(28,  28,  36)
+    C_QUOTE    = fg(160, 160, 170)
+    C_LI       = fg(74,  222, 128)
+    C_RULE_C   = fg(60,   60,  70)
+
+    pad     = " " * indent
+    inner_w = max(20, width - indent)
+    out     = []
+
+    def render_inline(children):
+        parts = []
+        for node in (children or []):
+            t = node.get("type")
+            if t == "text":
+                parts.append(C_AI + node.get("raw", ""))
+            elif t == "softbreak":
+                parts.append(" ")
+            elif t == "linebreak":
+                parts.append("\n")
+            elif t == "codespan":
+                parts.append(C_CODE + node.get("raw", "") + RESET)
+            elif t == "strong":
+                parts.append(BOLD + C_AI + render_inline(node.get("children", [])) + RESET)
+            elif t == "emphasis":
+                parts.append(ansi(3) + C_AI + render_inline(node.get("children", [])) + RESET)
+            elif t == "link":
+                parts.append(C_AI + render_inline(node.get("children", [])))
+            else:
+                if "children" in node:
+                    parts.append(render_inline(node["children"]))
+                elif "raw" in node:
+                    parts.append(C_AI + node["raw"])
+        return "".join(parts)
+
+    def plain(children):
+        return _re.sub(r"\033\[[^m]*m", "", render_inline(children))
+
+    def render_block(node, list_depth=0, ordered=False, counter=None):
+        t = node.get("type")
+        if t == "blank_line":
+            out.append("")
+        elif t == "thematic_break":
+            out.append(pad + C_RULE_C + "─" * inner_w + RESET)
+        elif t == "heading":
+            raw_txt = plain(node.get("children", []))
+            out.append(pad + C_AI + BOLD + raw_txt + RESET)
+        elif t == "block_code":
+            lang = (node.get("attrs") or {}).get("info") or ""
+            out.append(pad + C_RULE_C + "─" * inner_w + RESET)
+            if lang:
+                out.append(pad + C_FENCE + BOLD + " " + lang + " " + RESET)
+            for code_line in node.get("raw", "").rstrip("\n").split("\n"):
+                while len(code_line) > inner_w - 2:
+                    out.append(pad + C_FENCE_BG + C_FENCE + code_line[:inner_w-2] + RESET)
+                    code_line = "  " + code_line[inner_w-2:]
+                out.append(pad + C_FENCE_BG + C_FENCE + code_line + RESET)
+            out.append(pad + C_RULE_C + "─" * inner_w + RESET)
+        elif t == "block_quote":
+            for child in node.get("children", []):
+                raw_txt = plain(child.get("children", []))
+                for wl in _tw.wrap(raw_txt, inner_w - 4) or [""]:
+                    out.append(pad + C_RULE_C + "▌ " + RESET + C_QUOTE + wl + RESET)
+        elif t == "list":
+            is_ordered = node.get("attrs", {}).get("ordered", False)
+            depth      = node.get("attrs", {}).get("depth", 0)
+            cnt        = [1]
+            for item in node.get("children", []):
+                render_block(item, list_depth=depth, ordered=is_ordered, counter=cnt)
+        elif t == "list_item":
+            all_children = []
+            for child in node.get("children", []):
+                all_children.extend(child.get("children", []))
+            raw_txt   = plain(all_children)
+            extra_pad = "  " * list_depth
+            avail     = max(10, inner_w - 4 - (list_depth * 2))
+            words     = _tw.wrap(raw_txt, avail) or [""]
+            if ordered and counter is not None:
+                bullet = C_LI + f"{counter[0]}. " + RESET
+                blen   = len(f"{counter[0]}. ")
+                counter[0] += 1
+            else:
+                bullet = C_LI + "• " + RESET
+                blen   = 2
+            for j, wl in enumerate(words):
+                if j == 0:
+                    out.append(pad + extra_pad + bullet + C_AI + wl + RESET)
+                else:
+                    out.append(pad + extra_pad + " " * blen + C_AI + wl + RESET)
+        elif t in ("paragraph", "block_text"):
+            children = node.get("children", [])
+            raw_txt  = plain(children)
+            for wl in _tw.wrap(raw_txt, inner_w) or [""]:
+                out.append(pad + C_AI + wl + RESET)
+            out.append("")
+        else:
+            for child in node.get("children", []):
+                render_block(child)
+
+    md_parse = mistune.create_markdown(renderer=None)
+    try:
+        ast = md_parse(text)
+    except Exception:
+        for line in text.split("\n"):
+            for wl in _tw.wrap(line, inner_w) or [""]:
+                out.append(pad + C_AI + wl + RESET)
+        return out
+
+    for node in (ast or []):
+        render_block(node)
+
+    return out
 # ── Conversation model ────────────────────────────────────────────────────────
 # Each turn is a list of "blocks". A block is a dict with a "type" key.
 # Types: user_msg, ai_text, tool_call, tool_log, tool_done, question, edit_approval, divider
@@ -339,7 +460,7 @@ class Screen:
         if len(display_text) > max_input:
             display_text = display_text[len(display_text) - max_input:]
         buf.append(cup(input_row, 1) + el() + BG_MAIN)
-        buf.append(prompt + C_AI + display_text + RESET)
+        buf.append(prompt + C_USER + display_text + RESET)
 
         buf.append(cup(border_bot_row, 1) + el() + BG_MAIN + border)
 
@@ -366,17 +487,22 @@ class Screen:
         for turn in self.turns:
             # User message
             user_lines = wrap_text(turn.user_text, w - 4, indent=0)
-            lines.append(C_DIM + "  ╭─ you " + ("─" * max(0, w - 9)) + RESET)
             for l in user_lines:
                 lines.append("  " + C_USER + l + RESET)
             lines.append("")
 
             # AI text first — reasoning appears above tool calls
             if turn.ai_lines:
-                lines.append("  " + C_DIM + "╭─ priya " + "─" * max(0, w - 11) + RESET)
-                for al in turn.ai_lines:
-                    for ll in wrap_text(al, w - 4, indent=0):
-                        lines.append("  " + C_AI + ll + RESET)
+                if turn is not self.cur_turn:
+                    # Turn complete — render markdown
+                    full_ai_text = "\n".join(turn.ai_lines)
+                    for ll in render_markdown_ansi(full_ai_text, w - 2, indent=2):
+                        lines.append(ll)
+                else:
+                    # Still streaming — plain wrap to avoid glitches
+                    for al in turn.ai_lines:
+                        for ll in wrap_text(al, w - 4, indent=0):
+                            lines.append("  " + C_AI + ll + RESET)
                 lines.append("")
 
             # Tool nodes below the reasoning
@@ -440,7 +566,14 @@ class Screen:
 
     def tick_spinner(self):
         self.spinner_i += 1
-        self._cache_dirty = True  # spinner in tool nodes needs refresh
+        # Only dirty the cache if something is visibly spinning
+        has_active_tool = any(
+            not node.done
+            for turn in self.turns
+            for node in turn.tool_nodes.values()
+        )
+        if has_active_tool or self.thinking:
+            self._cache_dirty = True
 
     def new_turn(self, user_text):
         t = Turn(user_text)
@@ -621,7 +754,7 @@ class PriyaApp:
         threading.Thread(target=self._spinner_loop, daemon=True).start()
         # Protocol reader thread
         threading.Thread(target=self._protocol_loop, daemon=True).start()
-        self.screen.set_status(f"  ✓  {MODEL_NAME}  ·  {os.getcwd()}", C_READY)
+        self.screen.set_status("", C_STATUS)
         self.screen.redraw()
         self._input_loop()
 
@@ -641,14 +774,6 @@ class PriyaApp:
     def _spinner_loop(self):
         while self._running:
             self.screen.tick_spinner()
-            if self._busy:
-                frame = SPINNER[self.screen.spinner_i % len(SPINNER)]
-                if self._tool_active:
-                    self.screen.set_status(
-                        f"  {frame}  {MODEL_NAME} is working…", C_STATUS)
-                else:
-                    self.screen.set_status(
-                        f"  {frame}  {MODEL_NAME}  ·  …", C_STATUS)
             self.screen.redraw()
             time.sleep(0.1)
 
@@ -751,7 +876,7 @@ class PriyaApp:
                 self._interrupted = False
                 self.screen.set_busy(False)
                 self.screen.end_turn()
-                self.screen.set_status(f"  ✓  {MODEL_NAME}  ·  ready", C_READY)
+                self.screen.set_status("", C_STATUS)
                 thinking_hidden = False
                 continue
 
