@@ -1,1177 +1,865 @@
 """
-Priya TUI — redesigned, bug-fixed.
+Priya TUI — pure terminal, raw ANSI. No Textual. No curses. Just bash vibes.
 
-Critical fixes vs original:
-  1. Worker thread NEVER blocks on UI. All communication is
-     fire-and-forget via ui_q. No call_from_thread. No result_q.
-  2. Thinking bubble hides the instant first text arrives,
-     not on EndTurn.
-  3. Tool nodes tracked by integer ID (not object references).
-     Multiple tool calls per turn work correctly.
-  4. AI text streams into a pre-mounted bubble. No mid-stream
-     widget creation.
-  5. UI updates batched at 30fps via set_interval.
+Feel: vim / lazygit / htop. You're IN the terminal, not wrapped by one.
 
-Protocol (same as original):
-  <<TOOL_START>>{"name": ..., "detail": ...}
-  <<TOOL_END>>{"name": ..., "result": ...}
-  <<ASK_USER_QUESTION>>{"id": ..., "questions": [...]}
-  <<EDIT_APPROVAL>>{"id": ..., "path": ..., "diff": ...}
-  <<SCHEDULED_TASK>>{"job_id": ..., "prompt": ...}
-  <<AGENTJOB_RESULT>>{"job_id": ..., "status": ...}
-  <<END>>
-  (any other line = streamed model text)
+Layout:
+  ┌─────────────────────────────────┐
+  │  conversation history (scrolls) │
+  │                                 │
+  ├─────────────────────────────────┤
+  │  status bar                     │
+  ├─────────────────────────────────┤
+  │  > input                        │
+  └─────────────────────────────────┘
+
+Keys:
+  Enter        send
+  Esc          interrupt
+  Ctrl+C       quit
+  Ctrl+U       clear input
+  Ctrl+L       redraw
+  Up/Down      scroll history
+  PgUp/PgDn    scroll history fast
 """
 
 import os
 import sys
 import json
 import queue
-import re
-import subprocess
+import signal
+import struct
+import fcntl
+import termios
+import tty
 import threading
+import subprocess
+import textwrap
+import time
 from collections import deque
 
-from textual.app import App, ComposeResult
-from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Tree, Input, Static, OptionList, Link
-from textual.events import Paste
-from textual.widgets.option_list import Option
-from textual.reactive import reactive
-from textual import work
-from rich.text import Text
-from rich.markdown import Markdown
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(DIR, "live_cli.py")
-MODEL_NAME = "mistral-large-latest"
-
+MODEL_NAME = "mistral-medium-latest"
 SENTINEL = object()
 
-PENCIL = "\u270e"
-CHECK = "\u2713"
-SPINNER_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c",
-                   "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"]
-THINKING_FRAMES = [f + " thinking\u2026" for f in SPINNER_FRAMES]
+SPINNER = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+THINKING = [f"{f} thinking…" for f in SPINNER]
 
-LOGO_ART = r"""    ▄▄█▀▓████░    ▄▄█▀▓████░ ▓████░ ▓████░ ░████▓    ▄▄░▀▓▄▄
- ▄▄██▓ ▓████░  ▄▄██▓ ▒████▒ ▒████░ ▒████░ ▒████▒  ▄▄██░ ▓██▄▄
-░████▓ ░████▓ ░████▓ ▄▄▄▄▄▄ ░████▒ ▄▄▄▄▄▄ ▒█████ ░████▒ ▒████░
-▒█████▄█████░ ▒████▒ ▓████░ ▒████▓ ▒████▒ ▒████░ ▒████▓ ▒████▒
-▓████░        ▓████░ ░████▒ ▓█████  ▀▓██░ ▓██▓▀  ▓█████ ░████▓
-▓████░        ▓████░ ░████▓ ▓█████    ▀▀█▄█▀▀    ▓█████ ░████▓"""
+# ── ANSI helpers ──────────────────────────────────────────────────────────────
 
-_ADD_KEYS = ("added", "inserted", "lines_added", "additions")
-_DEL_KEYS = ("removed", "deleted", "lines_removed", "deletions")
-_URL_PATTERN = re.compile(r"https?://[^\s<>\]\[\"']+")
-_ERROR_PATTERN = re.compile(r"\b(error|failed|failure|exception|traceback|fatal|denied)\b", re.IGNORECASE)
-_WARNING_PATTERN = re.compile(r"\b(warn(?:ing)?|deprecated|retry)\b", re.IGNORECASE)
-_SUCCESS_PATTERN = re.compile(r"\b(ok|pass(?:ed)?|success(?:ful(?:ly)?)?|done|complete(?:d)?)\b", re.IGNORECASE)
-_JSON_KEY_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"(?=\s*:)')
-_JSON_STRING_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"')
-_JSON_LITERAL_PATTERN = re.compile(r"\b(?:true|false|null)\b")
-_NUMBER_PATTERN = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?")
-_PATH_PATTERN = re.compile(r"(?<!\w)(?:\.?\.?/)[\w./-]+")
+ESC = "\033"
+CSI = ESC + "["
 
+def ansi(*codes): return CSI + ";".join(str(c) for c in codes) + "m"
+def cup(row, col): return f"{CSI}{row};{col}H"   # move cursor
+def el(n=0):       return f"{CSI}{n}K"            # erase line (0=to end)
+def ed(n=0):       return f"{CSI}{n}J"            # erase display
+def sc():          return ESC + "7"               # save cursor
+def rc():          return ESC + "8"               # restore cursor
+def hide_cursor(): return CSI + "?25l"
+def show_cursor(): return CSI + "?25h"
+def alt_screen():  return CSI + "?1049h"
+def main_screen(): return CSI + "?1049l"
+def smcup():       return alt_screen()
+def rmcup():       return main_screen()
 
-def extract_urls(value):
-    """Return distinct HTTP(S) URLs from streamed text or tool results."""
-    if not isinstance(value, str):
-        return []
-    urls = []
-    for match in _URL_PATTERN.finditer(value):
-        url = match.group(0).rstrip(".,;:!?)")
-        if url and url not in urls:
-            urls.append(url)
-    return urls
+RESET    = ansi(0)
+BOLD     = ansi(1)
+DIM      = ansi(2)
+ITALIC   = ansi(3)
 
+def fg(r,g,b): return f"{CSI}38;2;{r};{g};{b}m"
+def bg(r,g,b): return f"{CSI}48;2;{r};{g};{b}m"
 
-def diff_stat(result):
-    if not isinstance(result, dict):
-        return None
-    added = next((result[k] for k in _ADD_KEYS if k in result), None)
-    removed = next((result[k] for k in _DEL_KEYS if k in result), None)
-    if added is None and removed is None:
-        return None
+# Palette
+C_USER    = fg(139,148,158)   # cool gray
+C_AI      = fg(230,230,230)   # near white
+C_DIM     = fg(80,80,90)
+C_TOOL    = fg(74,222,128)    # green
+C_TOOL_B  = fg(96,165,250)    # blue (artifact)
+C_TOOL_P  = fg(196,181,253)   # purple (edit)
+C_TOOL_Y  = fg(250,204,21)    # yellow (ask)
+C_STDOUT  = fg(120,130,150)
+C_STDERR  = fg(161,138,102)
+C_ERR     = fg(251,113,133)   # red
+C_WARN    = fg(250,204,21)    # yellow
+C_OK      = fg(74,222,128)    # green
+C_STATUS  = fg(100,100,110)
+C_READY   = fg(74,222,128)
+C_BORDER  = fg(60,60,70)
+C_PROMPT  = fg(96,165,250)
+C_HEAD    = fg(100,149,237)   # cornflower logo
+C_CYAN    = fg(103,232,249)
+C_DIFF_A  = fg(74,222,128)
+C_DIFF_D  = fg(251,113,133)
+C_DIFF_N  = fg(209,213,219)
+BG_MAIN   = bg(18,18,18)
+BG_INPUT  = bg(30,30,36)
+BG_STATUS = bg(15,15,18)
+
+TOOL_COLORS = {
+    "bash":            C_TOOL,
+    "artifact":        C_TOOL_B,
+    "edit":            C_TOOL_P,
+    "read":            C_CYAN,
+    "askuserquestion": C_TOOL_Y,
+}
+
+LOGO = [
+    "    ▄▄█▀▓████░    ▄▄█▀▓████░ ▓████░ ▓████░ ░████▓    ▄▄░▀▓▄▄",
+    " ▄▄██▓ ▓████░  ▄▄██▓ ▒████▒ ▒████░ ▒████░ ▒████▒  ▄▄██░ ▓██▄▄",
+    "░████▓ ░████▓ ░████▓ ▄▄▄▄▄▄ ░████▒ ▄▄▄▄▄▄ ▒█████ ░████▒ ▒████░",
+    "▒█████▄█████░ ▒████▒ ▓████░ ▒████▓ ▒████▒ ▒████░ ▒████▓ ▒████▒",
+    "▓████░        ▓████░ ░████▒ ▓█████  ▀▓██░ ▓██▓▀  ▓█████ ░████▓",
+    "▓████░        ▓████░ ░████▓ ▓█████    ▀▀█▄█▀▀    ▓█████ ░████▓",
+]
+
+# ── Terminal size ─────────────────────────────────────────────────────────────
+
+def terminal_size():
     try:
-        return int(added or 0), int(removed or 0)
-    except (TypeError, ValueError):
-        return None
+        h, w = struct.unpack("hh", fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0"*4))
+        return max(w, 40), max(h, 10)
+    except Exception:
+        return 80, 24
 
+# ── Line rendering helpers ────────────────────────────────────────────────────
 
-def colorize_tool_text(value, stream="stdout", *, result=False):
-    """Return a compact terminal-style Rich label without altering log text."""
-    base = {
-        "stdout": "#7c8798",
-        "stderr": "#a18a66",
-        "agentjob": "#8b93a7",
-    }.get(stream, "#7c8798")
-    text = Text(value, style=base)
+def truncate(s, width):
+    """Truncate a plain string to fit terminal width."""
+    if len(s) <= width:
+        return s
+    return s[:width-1] + "…"
 
-    if result:
-        for match in _JSON_STRING_PATTERN.finditer(value):
-            text.stylize("#a7f3d0", match.start(), match.end())
-        for match in _JSON_KEY_PATTERN.finditer(value):
-            text.stylize("bold #7dd3fc", match.start(), match.end())
-        for match in _JSON_LITERAL_PATTERN.finditer(value):
-            text.stylize("bold #c4b5fd", match.start(), match.end())
-        for match in _NUMBER_PATTERN.finditer(value):
-            text.stylize("#fdba74", match.start(), match.end())
-    else:
-        for match in _PATH_PATTERN.finditer(value):
-            text.stylize("#67e8f9", match.start(), match.end())
+def wrap_text(text, width, indent=0):
+    """Wrap plain text to lines of given width."""
+    prefix = " " * indent
+    lines = []
+    for para in text.split("\n"):
+        if not para.strip():
+            lines.append("")
+            continue
+        for line in textwrap.wrap(para, width - indent) or [""]:
+            lines.append(prefix + line)
+    return lines
 
-    for match in _WARNING_PATTERN.finditer(value):
-        text.stylize("bold #facc15", match.start(), match.end())
-    for match in _SUCCESS_PATTERN.finditer(value):
-        text.stylize("bold #4ade80", match.start(), match.end())
-    for match in _ERROR_PATTERN.finditer(value):
-        text.stylize("bold #fb7185", match.start(), match.end())
-    return text
+def colorize_log(text, stream="stdout"):
+    """Apply ANSI colors to a tool log line."""
+    base = C_STDOUT if stream == "stdout" else C_STDERR
+    # Simple keyword coloring
+    import re
+    result = base + text + RESET
+    return result
 
-
-def tool_log_label(stream, value):
-    """Show the log message itself without a redundant stream-name prefix."""
-    return colorize_tool_text(value, stream)
-
-
-def colorize_diff(value):
-    """Color additions green and deletions red, including +++/--- headers."""
-    rendered = Text()
-    for line in value.splitlines(keepends=True):
-        if line.startswith(("+++", "+")):
-            style = "#4ade80"
-        elif line.startswith(("---", "-")):
-            style = "#fb7185"
+def colorize_diff(diff):
+    """Return list of colored diff lines."""
+    out = []
+    for line in diff.split("\n"):
+        if line.startswith("+++") or (line.startswith("+") and not line.startswith("+++")):
+            out.append(C_DIFF_A + line + RESET)
+        elif line.startswith("---") or (line.startswith("-") and not line.startswith("---")):
+            out.append(C_DIFF_D + line + RESET)
         else:
-            style = "#d1d5db"
-        rendered.append(line, style=style)
-    return rendered
+            out.append(C_DIFF_N + line + RESET)
+    return out
 
+# ── Conversation model ────────────────────────────────────────────────────────
+# Each turn is a list of "blocks". A block is a dict with a "type" key.
+# Types: user_msg, ai_text, tool_call, tool_log, tool_done, question, edit_approval, divider
 
-class PriyaInput(Input):
-    """Single-line prompt that accepts complete multiline terminal pastes."""
+class Turn:
+    def __init__(self, user_text):
+        self.user_text = user_text
+        self.blocks = []          # rendered line-groups
+        self.ai_lines = []        # raw AI text lines accumulated
+        self.tool_nodes = {}      # tool_id → ToolNode
+        self.tool_order = []      # ordered tool_ids
 
-    def _on_paste(self, event: Paste) -> None:
-        # Textual Input's default handler keeps only the first pasted line.
-        # Flatten line breaks so a pasted prompt remains one complete message.
-        # This class handler runs in addition to Input's default handler unless
-        # it is explicitly suppressed, which otherwise inserts the first line
-        # a second time.
-        event.prevent_default()
-        pasted = " ".join(event.text.splitlines())
-        if pasted:
-            selection = self.selection
-            if selection.is_empty:
-                self.insert_text_at_cursor(pasted)
-            else:
-                self.replace(pasted, *selection)
-        event.stop()
+class ToolNode:
+    def __init__(self, tool_id, name, detail):
+        self.tool_id = tool_id
+        self.name = name
+        self.detail = detail
+        self.logs = []            # (stream, text)
+        self.done = False
+        self.result_text = None
+        self.expanded = False     # user can toggle
 
+# ── Screen renderer ───────────────────────────────────────────────────────────
+
+class Screen:
+    """
+    Owns the terminal. Renders everything from scratch on each redraw.
+    All public methods are called from the main thread only.
+    """
+
+    def __init__(self):
+        self.turns = []           # list of Turn
+        self.cur_turn = None      # Turn being built
+        self.status_text = ""
+        self.status_color = C_STATUS
+        self.input_text = ""
+        self.input_cursor = 0
+        self.scroll_offset = 0    # lines scrolled up from bottom
+        self.spinner_i = 0
+        self.busy = False
+        self.thinking = False
+        self._lines_cache = []    # flat list of rendered lines for the convo
+        self._cache_dirty = True
+        self._w = 80
+        self._h = 24
+        self._convo_h = 20        # lines available for conversation
+        self._question_state = None
+        self._edit_state = None
+
+        # Enter alt screen, hide cursor
+        self._write(smcup() + hide_cursor() + BG_MAIN + ed(2))
+        self._update_size()
+        self._draw_logo()
+
+    def _write(self, s):
+        sys.stdout.write(s)
+        sys.stdout.flush()
+
+    def _update_size(self):
+        w, h = terminal_size()
+        self._w = w
+        self._h = h
+        # Layout: logo(8) + border(1) + convo(rest) + status(1) + input(1)
+        self._convo_h = max(4, h - 8 - 1 - 1 - 1)
+        self._cache_dirty = True
+
+    # ── Logo ──────────────────────────────────────────────────────
+
+    def _draw_logo(self):
+        buf = []
+        buf.append(cup(1, 1))
+        for i, line in enumerate(LOGO):
+            buf.append(cup(i + 1, 1) + el() + BG_MAIN + C_HEAD + line + RESET)
+        # divider
+        row = len(LOGO) + 1
+        buf.append(cup(row, 1) + el() + BG_MAIN + C_BORDER + ("─" * self._w) + RESET)
+        self._write("".join(buf))
+        self._logo_rows = len(LOGO) + 1  # rows consumed by logo + divider
+
+    # ── Full redraw ───────────────────────────────────────────────
+
+    def redraw(self):
+        self._update_size()
+        buf = []
+        buf.append(BG_MAIN)
+
+        # Logo
+        for i, line in enumerate(LOGO):
+            buf.append(cup(i + 1, 1) + el() + C_HEAD + line + RESET + BG_MAIN)
+        logo_end = len(LOGO) + 1
+        buf.append(cup(logo_end, 1) + el() + C_BORDER + ("─" * self._w) + RESET + BG_MAIN)
+
+        # Convo area
+        convo_start = logo_end + 1
+        lines = self._get_lines()
+        visible_start = max(0, len(lines) - self._convo_h - self.scroll_offset)
+        visible = lines[visible_start: visible_start + self._convo_h]
+
+        for i in range(self._convo_h):
+            row = convo_start + i
+            buf.append(cup(row, 1) + el())
+            if i < len(visible):
+                buf.append(visible[i])
+        
+        # Thinking spinner (last convo row if busy)
+        if self.busy and self.thinking:
+            row = convo_start + min(len(visible), self._convo_h - 1)
+            frame = THINKING[self.spinner_i % len(THINKING)]
+            buf.append(cup(row, 1) + el() + C_DIM + "  " + frame + RESET)
+
+        # Status bar
+        status_row = convo_start + self._convo_h
+        buf.append(cup(status_row, 1) + el() + BG_STATUS + self.status_color)
+        buf.append(truncate(self.status_text, self._w))
+        buf.append(RESET)
+
+        # Input bar
+        input_row = status_row + 1
+        prompt = C_PROMPT + BOLD + " > " + RESET + BG_INPUT
+        display_text = self.input_text
+        max_input = self._w - 4
+        if len(display_text) > max_input:
+            display_text = display_text[len(display_text) - max_input:]
+        buf.append(cup(input_row, 1) + el() + BG_INPUT)
+        buf.append(prompt + C_AI + display_text + RESET)
+
+        # Key hint bar
+        hint_row = input_row + 1
+        hints = "  esc:stop  ctrl+u:clear  ctrl+l:redraw  ↑↓:scroll  ctrl+c:quit"
+        buf.append(cup(hint_row, 1) + el() + BG_STATUS + C_DIM + truncate(hints, self._w) + RESET)
+
+        # Cursor in input
+        cursor_col = 4 + min(self.input_cursor, max_input)  # " > " = 3 + 1 space
+        buf.append(cup(input_row, cursor_col))
+        buf.append(show_cursor())
+
+        self._write("".join(buf))
+
+    # ── Line cache ────────────────────────────────────────────────
+
+    def _get_lines(self):
+        if not self._cache_dirty:
+            return self._lines_cache
+        lines = []
+        w = self._w - 2  # side margin
+
+        for turn in self.turns:
+            # User message
+            user_lines = wrap_text(turn.user_text, w - 4, indent=0)
+            lines.append(C_DIM + "  ╭─ you " + ("─" * max(0, w - 9)) + RESET)
+            for l in user_lines:
+                lines.append("  " + C_USER + l + RESET)
+            lines.append("")
+
+            # Tool nodes
+            for tid in turn.tool_order:
+                node = turn.tool_nodes[tid]
+                tc = TOOL_COLORS.get(node.name.lower(), C_AI)
+                spinner_f = SPINNER[self.spinner_i % len(SPINNER)]
+                icon = "✓" if node.done else spinner_f
+                icon_c = C_OK if node.done else C_DIM
+                detail_s = node.detail[:w-20] if node.detail else ""
+                lines.append(
+                    f"  {icon_c}{icon}{RESET} {BOLD}{tc}{node.name}{RESET}"
+                    f"  {C_DIM}{detail_s}{RESET}"
+                )
+                if node.expanded or not node.done:
+                    for stream, text in node.logs[-40:]:   # cap at 40 log lines
+                        lc = C_STDOUT if stream == "stdout" else C_STDERR
+                        for ll in wrap_text(text, w - 6, indent=0):
+                            lines.append(f"    {lc}{ll}{RESET}")
+            if turn.tool_order:
+                lines.append("")
+
+            # AI text
+            if turn.ai_lines:
+                lines.append("  " + C_DIM + "╭─ priya " + "─" * max(0, w - 11) + RESET)
+                for al in turn.ai_lines:
+                    for ll in wrap_text(al, w - 4, indent=0):
+                        lines.append("  " + C_AI + ll + RESET)
+                lines.append("")
+
+            # Question
+            if turn is self.cur_turn and self._question_state:
+                qs = self._question_state
+                q = qs["questions"][qs["index"]]
+                lines.append("  " + C_TOOL_Y + BOLD + "? " + q.get("header","") + RESET)
+                lines.append("  " + C_AI + q["question"] + RESET)
+                for opt in q["options"]:
+                    lines.append(f"    {C_DIM}[{opt['label']}]{RESET} {C_AI}{opt['description']}{RESET}")
+                lines.append("  " + C_DIM + "Type your answer below ↓" + RESET)
+                lines.append("")
+
+            # Edit approval
+            if turn is self.cur_turn and self._edit_state:
+                es = self._edit_state
+                lines.append("  " + C_TOOL_P + BOLD + "✎ Edit approval: " + RESET + C_AI + es["path"] + RESET)
+                diff_lines = colorize_diff(es["diff"])
+                for dl in diff_lines[:30]:  # cap diff preview
+                    lines.append("    " + dl)
+                lines.append("  " + C_DIM + "Type 'y' to approve or 'n' to cancel ↓" + RESET)
+                lines.append("")
+
+        self._lines_cache = lines
+        self._cache_dirty = False
+        return lines
+
+    def _dirty(self):
+        self._cache_dirty = True
+
+    # ── Public state mutators (main thread only) ──────────────────
+
+    def set_status(self, text, color=None):
+        self.status_text = text
+        self.status_color = color or C_STATUS
+
+    def set_busy(self, busy):
+        self.busy = busy
+        self.thinking = busy
+        self._dirty()
+
+    def tick_spinner(self):
+        self.spinner_i += 1
+        self._cache_dirty = True  # spinner in tool nodes needs refresh
+
+    def new_turn(self, user_text):
+        t = Turn(user_text)
+        self.turns.append(t)
+        self.cur_turn = t
+        self.scroll_offset = 0
+        self._dirty()
+        return t
+
+    def add_tool_node(self, tool_id, name, detail):
+        if self.cur_turn is None:
+            return
+        node = ToolNode(tool_id, name, detail)
+        self.cur_turn.tool_nodes[tool_id] = node
+        self.cur_turn.tool_order.append(tool_id)
+        self._dirty()
+
+    def append_tool_log(self, tool_id, stream, text):
+        if self.cur_turn is None:
+            return
+        node = self.cur_turn.tool_nodes.get(tool_id)
+        if node:
+            node.logs.append((stream, text))
+            self._dirty()
+
+    def finish_tool_node(self, tool_id, result_text):
+        if self.cur_turn is None:
+            return
+        node = self.cur_turn.tool_nodes.get(tool_id)
+        if node:
+            node.done = True
+            node.result_text = result_text
+            self._dirty()
+
+    def toggle_last_tool(self):
+        if self.cur_turn and self.cur_turn.tool_order:
+            tid = self.cur_turn.tool_order[-1]
+            node = self.cur_turn.tool_nodes[tid]
+            node.expanded = not node.expanded
+            self._dirty()
+
+    def append_ai_text(self, text):
+        if self.cur_turn is None:
+            return
+        self.thinking = False
+        self.cur_turn.ai_lines.append(text)
+        self._dirty()
+
+    def end_turn(self):
+        self.cur_turn = None
+        self._question_state = None
+        self._edit_state = None
+        self._dirty()
+
+    def set_question(self, state):
+        self._question_state = state
+        self._dirty()
+
+    def set_edit(self, state):
+        self._edit_state = state
+        self._dirty()
+
+    def scroll_up(self, n=3):
+        lines = self._get_lines()
+        max_scroll = max(0, len(lines) - self._convo_h)
+        self.scroll_offset = min(self.scroll_offset + n, max_scroll)
+
+    def scroll_down(self, n=3):
+        self.scroll_offset = max(0, self.scroll_offset - n)
+
+    def input_insert(self, ch):
+        self.input_text = (self.input_text[:self.input_cursor]
+                           + ch
+                           + self.input_text[self.input_cursor:])
+        self.input_cursor += 1
+
+    def input_backspace(self):
+        if self.input_cursor > 0:
+            self.input_text = (self.input_text[:self.input_cursor-1]
+                               + self.input_text[self.input_cursor:])
+            self.input_cursor -= 1
+
+    def input_clear(self):
+        self.input_text = ""
+        self.input_cursor = 0
+
+    def input_left(self):
+        self.input_cursor = max(0, self.input_cursor - 1)
+
+    def input_right(self):
+        self.input_cursor = min(len(self.input_text), self.input_cursor + 1)
+
+    def input_home(self):
+        self.input_cursor = 0
+
+    def input_end(self):
+        self.input_cursor = len(self.input_text)
+
+    def take_input(self):
+        text = self.input_text
+        self.input_clear()
+        return text
+
+    def cleanup(self):
+        self._write(show_cursor() + rmcup() + RESET)
+
+# ── Input reading ─────────────────────────────────────────────────────────────
+
+def read_key(fd):
+    """Read one keypress from raw terminal fd. Returns a string token."""
+    ch = os.read(fd, 1)
+    if ch == b"\x1b":
+        # Try to read escape sequence
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, os.O_NONBLOCK)
+            rest = b""
+            try:
+                rest = os.read(fd, 8)
+            except BlockingIOError:
+                pass
+            finally:
+                fcntl.fcntl(fd, fcntl.F_SETFL, 0)
+        except Exception:
+            rest = b""
+        seq = ch + rest
+        mapping = {
+            b"\x1b[A": "UP",
+            b"\x1b[B": "DOWN",
+            b"\x1b[C": "RIGHT",
+            b"\x1b[D": "LEFT",
+            b"\x1b[5~": "PGUP",
+            b"\x1b[6~": "PGDN",
+            b"\x1b[H": "HOME",
+            b"\x1b[F": "END",
+            b"\x1b": "ESC",
+        }
+        return mapping.get(seq, mapping.get(ch, f"ESC_SEQ:{seq.hex()}"))
+    # Control chars
+    ctrl = {
+        b"\r": "ENTER",
+        b"\n": "ENTER",
+        b"\x7f": "BACKSPACE",
+        b"\x08": "BACKSPACE",
+        b"\x03": "CTRL_C",
+        b"\x15": "CTRL_U",
+        b"\x0c": "CTRL_L",
+        b"\x01": "HOME",
+        b"\x05": "END",
+    }
+    return ctrl.get(ch, ch.decode("utf-8", errors="replace"))
+
+# ── Worker I/O ────────────────────────────────────────────────────────────────
 
 def reader_thread(proc, q):
     for line in iter(proc.stdout.readline, ""):
         q.put(line)
     q.put(SENTINEL)
 
+# ── Main app ──────────────────────────────────────────────────────────────────
 
-class ToolNodeData:
-    def __init__(self, name, detail):
-        self.name = name
-        self.detail = detail
-        self.result = None
-        self.stat = None
-        self.done = False
-
-
-def tool_label(data, spinner_frame=None):
-    label = Text()
-    if data.done:
-        label.append(f"{PENCIL} ", style="bold white")
-    else:
-        frame = spinner_frame or SPINNER_FRAMES[0]
-        label.append(f"{frame} ", style="dim")
-    name = (data.name[:1].upper() + data.name[1:]) if data.name else "Tool"
-    tool_color = {
-        "bash": "#4ade80", "artifact": "#60a5fa", "edit": "#c4b5fd",
-        "read": "#67e8f9", "askUserQuestion": "#facc15",
-    }.get(data.name, "white")
-    label.append(name, style=f"bold {tool_color}")
-    label.append(f"  {data.detail}", style="dim #94a3b8")
-    if data.stat:
-        added, removed = data.stat
-        label.append("  ")
-        if added:
-            label.append(f"+{added} ", style="bold #4ade80")
-        if removed:
-            label.append(f"-{removed}", style="bold #fb7185")
-    return label
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Fire-and-forget messages: worker thread → UI thread
-# No result_q. No blocking. Ever.
-# ─────────────────────────────────────────────────────────────────────────────
-
-class Msg:
-    pass
-
-class MountTurn(Msg):
-    def __init__(self, user_text):
-        self.user_text = user_text
-
-class AddToolNode(Msg):
-    def __init__(self, tool_id, name, detail):
-        self.tool_id = tool_id
-        self.name = name
-        self.detail = detail
-
-class FinishToolNode(Msg):
-    def __init__(self, tool_id, result_text, stat):
-        self.tool_id = tool_id
-        self.result_text = result_text
-        self.stat = stat
-
-class AppendToolLog(Msg):
-    def __init__(self, tool_id, stream, text):
-        self.tool_id = tool_id
-        self.stream = stream
-        self.text = text
-
-class AppendText(Msg):
-    def __init__(self, text):
-        self.text = text
-
-class HideThinking(Msg):
-    pass
-
-class AskUserQuestion(Msg):
-    def __init__(self, question_id, questions):
-        self.question_id = question_id
-        self.questions = questions
-
-class EditApproval(Msg):
-    def __init__(self, edit_id, path, diff):
-        self.edit_id = edit_id
-        self.path = path
-        self.diff = diff
-
-class EndTurn(Msg):
-    pass
-
-class WorkerClosed(Msg):
-    pass
-
-class AgentJobResult(Msg):
-    def __init__(self, result):
-        self.result = result
-
-
-class PriyaApp(App):
-    CSS = """
-    Screen {
-        background: #121212;
-    }
-
-    #convo {
-        height: 1fr;
-        padding: 1 2 0 2;
-        scrollbar-size: 1 1;
-        scrollbar-color: #333;
-        scrollbar-background: transparent;
-        background: #121212;
-    }
-
-    #logo {
-        width: 100%;
-        height: auto;
-        padding: 0 2;
-        color: #60a5fa;
-        background: #121212;
-    }
-
-    #logo-divider {
-        width: 100%;
-        height: 3;
-        margin: 0;
-        padding: 0;
-        background: #121212;
-        border-top: heavy #4b4b4b;
-        border-bottom: heavy #4b4b4b;
-    }
-
-    .turn {
-        width: 100%;
-        height: auto;
-        margin: 0 0 1 0;
-        padding: 0;
-    }
-
-    .bubble {
-        width: auto;
-        max-width: 72%;
-        height: auto;
-        padding: 0 1;
-        margin: 0 0 1 0;
-    }
-    .user-bubble {
-        background: #1b1b1b;
-        margin-left: 0;
-    }
-    .ai-bubble {
-        background: #111111;
-        margin-left: 2;
-    }
-    .thinking {
-        color: #555555;
-        background: transparent;
-    }
-    .interrupted {
-        color: #666666;
-        background: transparent;
-    }
-
-    .ask-question {
-        width: 72%;
-        height: auto;
-        margin: 0 0 1 2;
-        padding: 1;
-        background: #151515;
-        border: round #4b5563;
-    }
-    .ask-header {
-        color: #a5b4fc;
-        text-style: bold;
-    }
-    .ask-prompt {
-        color: #f5f5f5;
-        margin: 1 0 0 0;
-    }
-    .ask-help, .ask-answer {
-        color: #9ca3af;
-        margin: 1 0 0 0;
-    }
-    .ask-options {
-        height: auto;
-        max-height: 10;
-        margin: 1 0 0 0;
-        background: #111111;
-    }
-    .edit-diff {
-        height: auto;
-        max-height: 14;
-        margin: 1 0 0 0;
-        color: #d1d5db;
-        background: #0b0b0b;
-    }
-    .reply-link {
-        width: auto;
-        height: auto;
-        margin: 0 0 1 2;
-    }
-
-    .turn-tools {
-        width: 100%;
-        height: auto;
-        min-height: 1;
-        max-height: 12;
-        margin: 0 0 1 2;
-        padding: 0;
-        border: none;
-        background: #121212;
-    }
-    .turn-tools {
-        background: #121212;
-    }
-    .turn-tools .tree--label {
-        color: white;
-    }
-    .turn-tools Tree {
-        background: #121212;
-    }
-    .turn-tools .tree--guides {
-        color: #333;
-    }
-    .turn-tools .tree--guides-hover {
-        color: #555;
-    }
-
-    #statusbar {
-        dock: bottom;
-        height: 1;
-        background: #111;
-        color: #666;
-        padding: 0 2;
-    }
-    #keybar {
-        dock: bottom;
-        height: 1;
-        background: #111;
-        color: #555;
-        padding: 0 2;
-    }
-    #inputbar {
-        dock: bottom;
-        height: 3;
-        border: none;
-        padding: 0 2;
-        background: #242424;
-    }
-    #inputbar Input {
-        border: none;
-        background: #242424;
-    }
-    #inputbar Input:focus {
-        border: none;
-    }
-    #inputbar.-disabled {
-        color: #525252;
-        background: #242424;
-    }
-    """
-
-    BINDINGS = [
-        ("ctrl+o", "toggle_last_tool", "Expand/collapse last tool"),
-        ("ctrl+e", "expand_all", "Expand all"),
-        ("ctrl+r", "collapse_all", "Collapse all"),
-        ("escape", "interrupt", "Stop response"),
-        ("ctrl+c", "quit", "Quit"),
-    ]
-
-    busy = reactive(False)
-
-    def __init__(self, talk=False, mic=False):
-        super().__init__()
-        # Audio modes removed (Mistral text-based agent).
-        self.talk = False
-        self.mic = False
-        self.proc = None
+class PriyaApp:
+    def __init__(self):
+        self.screen = Screen()
         self.raw_q = queue.Queue()
-        self.ui_q = queue.Queue()
-        self.render_q = queue.Queue()
+        self.proc = None
         self._stdin_lock = threading.Lock()
-        self._spinner_i = 0
-        self._flush_timer = None
-        self._spinner_timer = None
-        # Current turn state (UI thread only)
-        self._cur_tree = None
-        self._cur_turn = None
-        self._cur_ai_bubble = None
-        self._cur_ai_text = ""
-        self._cur_thinking = None
-        self._cur_tool_node = None
-        self._cur_links = set()
-        self._all_tool_nodes = []
-        self._node_registry = {}
+        self._busy = False
         self._question_state = None
-        self._edit_approval_state = None
+        self._edit_state = None
         self._interrupted = False
-        self._worker_restart_count = 0
-        self._background_job_status = None
+        self._running = True
 
-    def compose(self) -> ComposeResult:
-        yield Static(LOGO_ART, id="logo")
-        yield Static("", id="logo-divider")
-        yield VerticalScroll(id="convo")
-        yield Static(f"  {MODEL_NAME}  \u00b7  {os.getcwd()}", id="statusbar")
-        placeholder = "Type or speak your message\u2026" if self.mic else "Type your message\u2026"
-        yield PriyaInput(placeholder=placeholder, id="inputbar")
-        yield Static("esc stop  ^o expand  ^e all  ^r collapse  ^c quit", id="keybar")
-
-    def on_mount(self):
+    def start(self):
         self._start_worker()
-        self.query_one("#inputbar", Input).focus()
-        self._flush_timer = self.set_interval(1 / 30, self._drain_ui_q)
-        # Textual batches widget updates per refresh. Presenting one protocol
-        # event at a time gives a streamed model reply a refresh before the
-        # following tool result changes the same turn's layout.
-        self.set_interval(0.06, self._present_next)
-        self._spinner_timer = self.set_interval(0.1, self._tick_spinner)
-        self.read_worker()
+        # Spinner thread
+        threading.Thread(target=self._spinner_loop, daemon=True).start()
+        # Protocol reader thread
+        threading.Thread(target=self._protocol_loop, daemon=True).start()
+        self.screen.set_status(f"  ✓  {MODEL_NAME}  ·  {os.getcwd()}", C_READY)
+        self.screen.redraw()
+        self._input_loop()
 
     def _start_worker(self):
-        cmd = [sys.executable, WORKER]
-        if self.talk:
-            cmd.append("--talk")
-        if self.mic:
-            cmd.append("--mic")
         self.proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            [sys.executable, WORKER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
             stderr=open("/tmp/priya_worker.log", "w"),
             text=True, bufsize=1,
         )
-        threading.Thread(target=reader_thread, args=(self.proc, self.raw_q),
-                         daemon=True).start()
+        threading.Thread(target=reader_thread,
+                         args=(self.proc, self.raw_q), daemon=True).start()
 
-    def _restart_worker(self):
-        if self.proc is not None and self.proc.poll() is None:
-            return
-        self._start_worker()
-        self._worker_restart_count = 0
-        self.query_one("#inputbar", Input).disabled = False
-        self.query_one("#inputbar", Input).focus()
-        self._set_status(f"  {CHECK}  {MODEL_NAME} reconnected · ready", "#4ade80")
+    # ── Spinner ───────────────────────────────────────────────────
 
-    def on_unmount(self):
-        if self.proc is not None:
-            self.proc.terminate()
+    def _spinner_loop(self):
+        while self._running:
+            self.screen.tick_spinner()
+            if self._busy:
+                frame = SPINNER[self.screen.spinner_i % len(SPINNER)]
+                self.screen.set_status(
+                    f"  {frame}  {MODEL_NAME} is working…", C_STATUS)
+            self.screen.redraw()
+            time.sleep(0.1)
 
-    def _set_status(self, text, color="#666"):
-        bar = self.query_one("#statusbar", Static)
-        bar.styles.color = color
-        bar.update(text)
+    # ── Protocol parser ───────────────────────────────────────────
 
-    def _tick_spinner(self):
-        self._spinner_i += 1
-        frame = SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]
-        if not self.busy:
-            if self._background_job_status:
-                self._set_status(f"  {frame}  {self._background_job_status}", "#a5b4fc")
-            return
-        status = f"  {frame}  {MODEL_NAME} is working\u2026"
-        if self._background_job_status:
-            status += f"  ·  {self._background_job_status[:90]}"
-        self._set_status(status)
-        if self._cur_thinking is not None:
-            tf = THINKING_FRAMES[self._spinner_i % len(THINKING_FRAMES)]
-            self._cur_thinking.update(tf)
-        if self._cur_tool_node is not None and not self._cur_tool_node.data.done:
-            self._cur_tool_node.set_label(
-                tool_label(self._cur_tool_node.data, frame)
-            )
+    def _protocol_loop(self):
+        deferred_finishes = []
+        thinking_hidden = False
 
-    # ── UI queue drain ───────────────────────────────────────────────────────
-
-    def _drain_ui_q(self):
-        try:
-            while True:
-                self.render_q.put(self.ui_q.get_nowait())
-        except queue.Empty:
-            pass
-
-    def _present_next(self):
-        try:
-            self._handle_msg(self.render_q.get_nowait())
-        except queue.Empty:
-            pass
-
-    def _handle_msg(self, msg):
-        # Esc has already shown a terminal interruption state. Drop delayed
-        # worker output rather than letting queued logs/text revive the turn.
-        if self._interrupted and isinstance(
-            msg, (AddToolNode, FinishToolNode, AppendToolLog, AppendText, AskUserQuestion, EditApproval)
-        ):
-            return
-        if isinstance(msg, MountTurn):
-            self._do_mount_turn(msg.user_text)
-        elif isinstance(msg, AddToolNode):
-            self._do_add_tool_node(msg.tool_id, msg.name, msg.detail)
-        elif isinstance(msg, FinishToolNode):
-            self._do_finish_tool_node(msg.tool_id, msg.result_text, msg.stat)
-        elif isinstance(msg, AppendToolLog):
-            self._do_append_tool_log(msg.tool_id, msg.stream, msg.text)
-        elif isinstance(msg, AppendText):
-            self._do_append_text(msg.text)
-        elif isinstance(msg, HideThinking):
-            self._do_hide_thinking()
-        elif isinstance(msg, AskUserQuestion):
-            self._do_ask_user_question(msg.question_id, msg.questions)
-        elif isinstance(msg, EditApproval):
-            self._do_edit_approval(msg.edit_id, msg.path, msg.diff)
-        elif isinstance(msg, EndTurn):
-            self._do_end_turn()
-        elif isinstance(msg, WorkerClosed):
-            self._do_worker_closed()
-        elif isinstance(msg, AgentJobResult):
-            self._do_agentjob_result(msg.result)
-
-    # ── UI operations (UI thread only, called from _drain_ui_q) ─────────────
-
-    def _do_mount_turn(self, user_text):
-        self._interrupted = False
-        self.busy = True
-        self.query_one("#inputbar", Input).disabled = True
-        convo = self.query_one("#convo", VerticalScroll)
-        turn = Vertical(classes="turn")
-        convo.mount(turn)
-
-        user_bubble = Static(user_text, classes="bubble user-bubble")
-        turn.mount(user_bubble)
-
-        tree = Tree("", classes="turn-tools")
-        tree.root.expand()
-        tree.show_root = False
-        tree.guide_depth = 2
-        tree.styles.display = "none"
-        turn.mount(tree)
-
-        ai_bubble = Static("", classes="bubble ai-bubble")
-        turn.mount(ai_bubble)
-
-        thinking_bubble = Static(THINKING_FRAMES[0],
-                                  classes="bubble ai-bubble thinking")
-        turn.mount(thinking_bubble)
-
-        convo.scroll_end(animate=False)
-
-        self._cur_tree = tree
-        self._cur_turn = turn
-        self._cur_ai_bubble = ai_bubble
-        self._cur_ai_text = ""
-        self._cur_thinking = thinking_bubble
-        self._cur_tool_node = None
-        self._cur_links = set()
-
-    def _do_add_tool_node(self, tool_id, name, detail):
-        if self._cur_tree is None:
-            return
-        self._cur_tree.styles.display = "block"
-        data = ToolNodeData(name, detail)
-        node = self._cur_tree.root.add(tool_label(data), data=data)
-        self._node_registry[tool_id] = node
-        self._all_tool_nodes.append((node, self._cur_tree))
-        self._cur_tool_node = node
-        self._cur_tree.refresh()
-
-    def _do_finish_tool_node(self, tool_id, result_text, stat):
-        # Keep the registry entry after completion.  Most tools stop emitting
-        # at their final response, but agentjob is deliberately non-blocking:
-        # its live journal continues to append to this completed spawn node.
-        node = self._node_registry.get(tool_id)
-        if node is None:
-            return
-        data = node.data
-        data.done = True
-        data.result = result_text
-        data.stat = stat
-        node.set_label(tool_label(data))
-        # Tool results remain available to Priya internally, while the
-        # expandable transcript stays focused on useful streamed log entries.
-        if self._cur_tool_node is node:
-            self._cur_tool_node = None
-        for n, t in self._all_tool_nodes:
-            if n is node:
-                t.refresh()
-                break
-
-    def _do_append_tool_log(self, tool_id, stream, text):
-        node = self._node_registry.get(tool_id)
-        if node is None:
-            return
-        node.add_leaf(tool_log_label(stream, text))
-        if stream == "agentjob":
-            self._background_job_status = f"Agent job running · {text[:100]}"
-            self._set_status(f"  {SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]}  {self._background_job_status}", "#a5b4fc")
-            if text.startswith("Job done:"):
-                self._background_job_status = f"Agent job complete · {text}"
-            elif text.startswith(("Job failed:", "Job stopped:")):
-                self._background_job_status = f"Agent job ended · {text}"
-        for n, tree in self._all_tool_nodes:
-            if n is node:
-                tree.refresh()
-                break
-
-    def _do_append_text(self, text):
-        if self._cur_ai_bubble is None:
-            return
-        self._cur_ai_text += text
-        # Render Markdown — text-based models (Mistral) output Markdown natively.
-        try:
-            self._cur_ai_bubble.update(Markdown(self._cur_ai_text))
-        except Exception:
-            self._cur_ai_bubble.update(self._cur_ai_text)
-        self._mount_links(text)
-        convo = self.query_one("#convo", VerticalScroll)
-        convo.scroll_end(animate=False)
-
-    def _mount_links(self, text):
-        """Expose URLs only when they are part of Priya's visible reply."""
-        if self._cur_turn is None:
-            return
-        for url in extract_urls(text):
-            if url in self._cur_links:
+        while self._running:
+            item = self.raw_q.get()
+            if item is SENTINEL:
+                self.screen.set_status("  worker closed — restarting…", C_WARN)
+                time.sleep(0.5)
+                self._start_worker()
                 continue
-            self._cur_links.add(url)
-            self._cur_turn.mount(Link(url, url=url, tooltip="Open in browser", classes="reply-link"))
 
-    def _do_hide_thinking(self):
-        if self._cur_thinking is not None:
-            self._cur_thinking.remove()
-            self._cur_thinking = None
+            line = item.strip()
+            if not line:
+                continue
 
-    def _do_ask_user_question(self, question_id, questions):
-        """Show one question at a time; all answers return in one tool response."""
-        if self._cur_turn is None or self._question_state is not None:
-            return
-        self._question_state = {
-            "id": question_id, "questions": questions, "answers": [], "index": 0,
-            "card": None, "options": None,
-        }
-        # A question permits a custom typed answer even though ordinary turns
-        # remain locked until the active model turn has ended.
-        self.query_one("#inputbar", Input).disabled = False
-        self._set_status("  ?  Waiting for your answer", "#a5b4fc")
-        self._show_next_question()
+            if line.startswith("<<TOOL_START>>"):
+                try:
+                    p = json.loads(line[len("<<TOOL_START>>"):])
+                    tid = p.get("id", f"t{id(p)}")
+                    self.screen.add_tool_node(tid, p["name"], p.get("detail",""))
+                except Exception:
+                    pass
+                continue
 
-    def _show_next_question(self):
-        state = self._question_state
-        if state is None:
-            return
-        question = state["questions"][state["index"]]
-        options = OptionList(*[
-            Option(f"{option['label']} — {option['description']}", id=option["label"])
-            for option in question["options"]
-        ], classes="ask-options", id="ask-options")
-        card = Vertical(
-            Static(question["header"], classes="ask-header"),
-            Static(question["question"], classes="ask-prompt"),
-            options,
-            Static("↑/↓ then Enter to choose · Tab to type a custom answer", classes="ask-help"),
-            classes="ask-question",
-        )
-        self._cur_turn.mount(card)
-        state["card"] = card
-        state["options"] = options
-        self.call_after_refresh(options.focus)
-        self.call_after_refresh(self.query_one("#convo", VerticalScroll).scroll_end, animate=False)
+            if line.startswith("<<TOOL_LOG>>"):
+                try:
+                    p = json.loads(line[len("<<TOOL_LOG>>"):])
+                    self.screen.append_tool_log(p["id"], p.get("stream","stdout"), p["text"])
+                except Exception:
+                    pass
+                continue
 
-    def _answer_question(self, answer):
-        state = self._question_state
-        if state is None or not isinstance(answer, str) or not answer.strip():
-            return False
-        answer = answer.strip()
-        card, options = state["card"], state["options"]
-        if options is not None:
-            options.remove()
-        if card is not None:
-            card.remove()
-        state["answers"].append(answer)
-        state["index"] += 1
-        if state["index"] < len(state["questions"]):
-            self._show_next_question()
-            return True
+            if line.startswith("<<TOOL_END>>"):
+                try:
+                    p = json.loads(line[len("<<TOOL_END>>"):])
+                    tid = p.get("id")
+                    result_text = json.dumps(p.get("result",""), indent=2)
+                    deferred_finishes.append((tid, result_text))
+                except Exception:
+                    pass
+                continue
 
-        payload = {"id": state["id"], "answers": state["answers"]}
-        self._question_state = None
-        self.query_one("#inputbar", Input).disabled = True
-        self._set_status(f"  {SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]}  {MODEL_NAME} is working…")
-        self.send_question_answers(payload)
-        return True
+            if line.startswith("<<ASK_USER_QUESTION>>"):
+                try:
+                    p = json.loads(line[len("<<ASK_USER_QUESTION>>"):])
+                    self._question_state = {
+                        "id": p["id"],
+                        "questions": p["questions"],
+                        "answers": [],
+                        "index": 0,
+                    }
+                    self.screen.set_question(self._question_state)
+                    self.screen.set_status("  ?  Waiting for your answer", C_TOOL_Y)
+                except Exception:
+                    pass
+                continue
 
-    def _do_edit_approval(self, edit_id, path, diff):
-        if (self._cur_turn is None or self._question_state is not None
-                or self._edit_approval_state is not None):
-            return
-        options = OptionList(
-            Option("Approve — apply this exact diff", id="approve"),
-            Option("Cancel — leave the file unchanged", id="cancel"),
-            classes="ask-options", id="edit-approval-options",
-        )
-        card = Vertical(
-            Static("Review edit", classes="ask-header"),
-            Static(path, classes="ask-prompt"),
-            Static(colorize_diff(diff) if diff else Text("(no textual diff)"), classes="edit-diff"),
-            options,
-            Static("↑/↓ then Enter to approve or cancel", classes="ask-help"),
-            classes="ask-question",
-        )
-        self._edit_approval_state = {"id": edit_id, "card": card, "options": options}
-        self.query_one("#inputbar", Input).disabled = False
-        self._set_status("  ?  Waiting for edit approval", "#a5b4fc")
-        self._cur_turn.mount(card)
-        self.call_after_refresh(options.focus)
-        self.call_after_refresh(self.query_one("#convo", VerticalScroll).scroll_end, animate=False)
+            if line.startswith("<<EDIT_APPROVAL>>"):
+                try:
+                    p = json.loads(line[len("<<EDIT_APPROVAL>>"):])
+                    self._edit_state = {
+                        "id": p["id"],
+                        "path": p["path"],
+                        "diff": p["diff"],
+                    }
+                    self.screen.set_edit(self._edit_state)
+                    self.screen.set_status("  ✎  Review edit — type y/n", C_TOOL_P)
+                except Exception:
+                    pass
+                continue
 
-    def _answer_edit_approval(self, approved):
-        state = self._edit_approval_state
-        if state is None:
-            return False
-        options = state["options"]
-        if options is not None:
-            options.remove()
-        # The approval UI has served its purpose; remove the whole review card
-        # immediately instead of leaving a completed panel in the transcript.
-        if state["card"] is not None:
-            state["card"].remove()
-        payload = {"id": state["id"], "approved": approved}
-        self._edit_approval_state = None
-        self.query_one("#inputbar", Input).disabled = True
-        self._set_status(f"  {SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]}  {MODEL_NAME} is working…")
-        self.send_edit_approval(payload)
-        return True
+            if line.startswith("<<SCHEDULED_TASK>>"):
+                try:
+                    p = json.loads(line[len("<<SCHEDULED_TASK>>"):])
+                    text = p.get("prompt","").strip()
+                    if text:
+                        self.screen.new_turn(f"⏰ Scheduled: {text}")
+                        thinking_hidden = False
+                        deferred_finishes.clear()
+                except Exception:
+                    pass
+                continue
 
-    def _do_end_turn(self):
-        # Each turn starts with an empty tree placeholder so tools can stream
-        # into it. Remove that placeholder for ordinary replies with no tools;
-        # otherwise its default surface can look like a stray black block.
-        if self._cur_tree is not None and not self._cur_tree.root.children:
-            self._cur_tree.remove()
-        self.busy = False
-        if self._interrupted:
-            self._set_status("  ⊘  Interrupted", "#666666")
-        else:
-            self._set_status(f"  {CHECK}  {MODEL_NAME}  \u00b7  ready", "#4ade80")
-        self._do_hide_thinking()
-        self._cur_tree = None
-        self._cur_turn = None
-        self._cur_ai_bubble = None
-        self._cur_tool_node = None
-        self._question_state = None
-        self._edit_approval_state = None
-        input_bar = self.query_one("#inputbar", Input)
-        input_bar.disabled = False
-        input_bar.focus()
+            if line.startswith("<<AGENTJOB_RESULT>>"):
+                continue  # handled implicitly via tool logs
 
-    def _do_interrupted(self):
-        """Immediately reflect Esc, before the worker finishes cancelling."""
-        if self._interrupted:
-            return
-        self._interrupted = True
-        self.busy = False
-        self._set_status("  ⊘  Interrupted", "#666666")
-        self._do_hide_thinking()
-        if self._cur_tool_node is not None and not self._cur_tool_node.data.done:
-            data = self._cur_tool_node.data
-            data.done = True
-            data.result = "interrupted"
-            self._cur_tool_node.set_label(tool_label(data))
-            self._cur_tool_node.add_leaf(Text("interrupted", style="bold #fbbf24"))
-            self._cur_tool_node = None
-        if self._cur_ai_bubble is not None:
-            if not self._cur_ai_text.strip():
-                self._cur_ai_bubble.remove()
-            if self._cur_turn is not None:
-                self._cur_turn.mount(Static("Interrupted", classes="bubble ai-bubble interrupted"))
+            if line == "<<END>>":
+                for tid, rt in deferred_finishes:
+                    self.screen.finish_tool_node(tid, rt)
+                deferred_finishes.clear()
+                self._busy = False
+                self._interrupted = False
+                self.screen.set_busy(False)
+                self.screen.end_turn()
+                self.screen.set_status(f"  ✓  {MODEL_NAME}  ·  ready", C_READY)
+                thinking_hidden = False
+                continue
 
-    def _do_worker_closed(self):
-        self.busy = False
-        self.query_one("#inputbar", Input).disabled = True
-        self._worker_restart_count += 1
-        if self._worker_restart_count <= 3:
-            self._set_status("  reconnecting Priya…", "#fbbf24")
-            self.set_timer(0.5, self._restart_worker)
-        else:
-            self._set_status("  worker closed the connection", "#f87171")
-        self._do_hide_thinking()
-        if self._cur_ai_bubble is not None:
-            self._cur_ai_bubble.update("(worker closed the connection)")
+            # Plain text → AI response
+            if not thinking_hidden:
+                thinking_hidden = True
+                self.screen.thinking = False
+            for tid, rt in deferred_finishes:
+                self.screen.finish_tool_node(tid, rt)
+            deferred_finishes.clear()
+            self.screen.append_ai_text(line)
 
-    def _do_agentjob_result(self, result):
-        job_id = result.get("job_id", "unknown")
-        status = result.get("status", "unknown")
-        reason = result.get("reason")
-        if status == "done":
-            message, color = f"Agent job {job_id} finished. Priya is reviewing its changes.", "#4ade80"
-        else:
-            detail = reason or status
-            message, color = f"Agent job {job_id} ended ({detail}). Priya is taking over and checking the work.", "#fbbf24"
-        if result.get("handoff_error"):
-            message += f" Completion handoff error: {result['handoff_error']}"
-        # The original user turn has closed. Mount a dedicated review turn so
-        # Priya's automatic follow-up transcription and any review tools have
-        # active UI targets instead of being silently dropped.
-        self.busy = True
-        self.query_one("#inputbar", Input).disabled = True
-        convo = self.query_one("#convo", VerticalScroll)
-        tree = Tree("", classes="turn-tools")
-        tree.root.expand()
-        tree.show_root = False
-        tree.guide_depth = 2
-        tree.styles.display = "none"
-        ai_bubble = Static("", classes="bubble ai-bubble")
-        # Child widgets must be supplied while the container is constructed;
-        # mounting them into an unattached Vertical raises Textual MountError.
-        review_turn = Vertical(
-            Static(message, classes="bubble ai-bubble"), tree, ai_bubble,
-            classes="turn",
-        )
-        convo.mount(review_turn)
-        convo.scroll_end(animate=False)
-        self._cur_tree = tree
-        self._cur_turn = review_turn
-        self._cur_ai_bubble = ai_bubble
-        self._cur_ai_text = ""
-        self._cur_thinking = None
-        self._cur_tool_node = None
-        self._cur_links = set()
-        self._background_job_status = message
-        self._set_status(f"  {message}", color)
+    # ── Input loop ────────────────────────────────────────────────
 
-    # ── Key bindings ─────────────────────────────────────────────────────────
-
-    def action_toggle_last_tool(self):
-        if self._all_tool_nodes:
-            node, _ = self._all_tool_nodes[-1]
-            node.toggle()
-
-    def action_expand_all(self):
-        for node, tree in self._all_tool_nodes:
-            node.expand()
-
-    def action_collapse_all(self):
-        for node, tree in self._all_tool_nodes:
-            node.collapse()
-
-    def action_interrupt(self):
-        """Ask the persistent Live worker to interrupt its current response."""
-        if not self.busy or self.proc is None or self.proc.stdin is None:
-            return
+    def _input_loop(self):
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
         try:
-            if self._question_state is not None:
-                options = self._question_state.get("options")
-                card = self._question_state.get("card")
-                if options is not None:
-                    options.remove()
-                if card is not None:
-                    card.mount(Static("Question cancelled", classes="ask-answer"))
-                self._question_state = None
-            if self._edit_approval_state is not None:
-                options = self._edit_approval_state.get("options")
-                card = self._edit_approval_state.get("card")
-                if options is not None:
-                    options.remove()
-                if card is not None:
-                    card.mount(Static("Edit cancelled", classes="ask-answer"))
-                self._edit_approval_state = None
-            self._do_interrupted()
-            with self._stdin_lock:
-                self.proc.stdin.write("<<PRIYA_INTERRUPT>>\n")
-                self.proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            self.ui_q.put(WorkerClosed())
+            tty.setraw(fd)
+            while self._running:
+                key = read_key(fd)
+                self._handle_key(key)
+        except Exception:
+            pass
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            self.screen.cleanup()
+            if self.proc:
+                self.proc.terminate()
 
-    # ── Input ────────────────────────────────────────────────────────────────
+    def _handle_key(self, key):
+        s = self.screen
 
-    def on_input_submitted(self, event: Input.Submitted):
-        # This also closes the tiny scheduling window before MountTurn reaches
-        # the UI queue, so two rapid Enters cannot be written to Live while it
-        # is processing a tool/response hand-off.
-        if self.busy and self._question_state is None and self._edit_approval_state is None:
+        if key == "CTRL_C":
+            self._running = False
             return
-        text = event.value.strip()
-        event.input.value = ""
+
+        if key == "CTRL_L":
+            s.redraw()
+            return
+
+        if key == "UP":
+            s.scroll_up(3)
+            return
+
+        if key == "DOWN":
+            s.scroll_down(3)
+            return
+
+        if key == "PGUP":
+            s.scroll_up(s._convo_h - 2)
+            return
+
+        if key == "PGDN":
+            s.scroll_down(s._convo_h - 2)
+            return
+
+        if key == "ESC":
+            self._do_interrupt()
+            return
+
+        if key == "CTRL_U":
+            s.input_clear()
+            return
+
+        if key == "LEFT":
+            s.input_left()
+            return
+
+        if key == "RIGHT":
+            s.input_right()
+            return
+
+        if key == "HOME":
+            s.input_home()
+            return
+
+        if key == "END":
+            s.input_end()
+            return
+
+        if key == "BACKSPACE":
+            s.input_backspace()
+            return
+
+        if key == "ENTER":
+            self._do_submit()
+            return
+
+        # Printable character
+        if len(key) == 1 and key.isprintable():
+            s.input_insert(key)
+            return
+
+    def _do_submit(self):
+        text = self.screen.take_input().strip()
         if not text:
             return
+
+        # Question answer
         if self._question_state is not None:
-            self._answer_question(text)
+            qs = self._question_state
+            qs["answers"].append(text)
+            qs["index"] += 1
+            if qs["index"] < len(qs["questions"]):
+                self.screen.set_question(qs)
+            else:
+                payload = {"id": qs["id"], "answers": qs["answers"]}
+                self._question_state = None
+                self.screen.set_question(None)
+                self._send_line("<<ASK_USER_ANSWER>>" + json.dumps(payload))
             return
-        if self._edit_approval_state is not None:
-            normalized = text.casefold()
-            if normalized in ("approve", "approved", "yes", "y"):
-                self._answer_edit_approval(True)
-            elif normalized in ("cancel", "no", "n"):
-                self._answer_edit_approval(False)
+
+        # Edit approval
+        if self._edit_state is not None:
+            approved = text.casefold() in ("y", "yes", "approve", "approved")
+            cancelled = text.casefold() in ("n", "no", "cancel")
+            if approved or cancelled:
+                payload = {"id": self._edit_state["id"], "approved": approved}
+                self._edit_state = None
+                self.screen.set_edit(None)
+                self._send_line("<<EDIT_APPROVAL>>" + json.dumps(payload))
             return
+
         if text.lower() == "q":
-            self.exit()
+            self._running = False
             return
-        self.busy = True
-        event.input.disabled = True
-        self._set_status(f"  {SPINNER_FRAMES[self._spinner_i % len(SPINNER_FRAMES)]}  {MODEL_NAME} is working…")
-        self.send_turn(text)
 
-    # ── Backend I/O workers (background threads, NEVER touch widgets) ───────
+        # Normal turn
+        self._busy = True
+        self._interrupted = False
+        self.screen.new_turn(text)
+        self.screen.set_busy(True)
+        self.screen.set_status(
+            f"  {SPINNER[0]}  {MODEL_NAME} is working…", C_STATUS)
+        threading.Thread(target=self._send_line, args=(text,), daemon=True).start()
 
-    @work(thread=True)
-    def send_turn(self, text):
-        self.ui_q.put(MountTurn(text))
+    def _do_interrupt(self):
+        if not self._busy:
+            return
+        self._interrupted = True
+        self._busy = False
+        self.screen.set_busy(False)
+        self.screen.set_status("  ⊘  Interrupted", C_DIM)
+        self._send_line("<<PRIYA_INTERRUPT>>")
 
+    def _send_line(self, text):
         try:
             with self._stdin_lock:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
         except (BrokenPipeError, OSError):
-            self.ui_q.put(WorkerClosed())
+            self.screen.set_status("  ✗  worker pipe broken", C_ERR)
 
-    @work(thread=True)
-    def send_edit_approval(self, payload):
-        try:
-            with self._stdin_lock:
-                self.proc.stdin.write("<<EDIT_APPROVAL>>" + json.dumps(payload) + "\n")
-                self.proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            self.ui_q.put(WorkerClosed())
-
-    @work(thread=True)
-    def send_question_answers(self, payload):
-        """Return a completed interactive question to the waiting worker call."""
-        try:
-            with self._stdin_lock:
-                self.proc.stdin.write("<<ASK_USER_ANSWER>>" + json.dumps(payload) + "\n")
-                self.proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            self.ui_q.put(WorkerClosed())
-
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected):
-        state = self._question_state
-        if state is not None and event.option_list is state["options"] and event.option.id is not None:
-            self._answer_question(str(event.option.id))
-            return
-        state = self._edit_approval_state
-        if state is not None and event.option_list is state["options"] and event.option.id is not None:
-            self._answer_edit_approval(event.option.id == "approve")
-
-    @work(exclusive=True, thread=True)
-    def read_worker(self):
-        """Translate the worker protocol into ordered UI presentation events.
-
-        This reader runs for the lifetime of the process, so microphone turns
-        receive the same model/text/tool rendering as typed turns.
-        """
-
-        tool_id_counter = 0
-        pending_tool_ids = deque()
-        thinking_hidden = False
-        deferred_tool_finishes = []
-
-        while True:
-            item = self.raw_q.get()
-            if item is SENTINEL:
-                self.ui_q.put(WorkerClosed())
-                return
-
-            line = item.strip()
-
-            if line.startswith("<<SCHEDULED_TASK>>"):
-                try:
-                    payload = json.loads(line[len("<<SCHEDULED_TASK>>"):])
-                    text = payload["prompt"].strip()
-                except (json.JSONDecodeError, KeyError, AttributeError):
-                    continue
-                if text:
-                    self.ui_q.put(MountTurn(f"⏰ Scheduled: {text}"))
-                    pending_tool_ids.clear()
-                    thinking_hidden = False
-                    deferred_tool_finishes.clear()
-                continue
-
-            if line.startswith("<<AGENTJOB_RESULT>>"):
-                try:
-                    result = json.loads(line[len("<<AGENTJOB_RESULT>>"):])
-                    if not isinstance(result, dict):
-                        raise ValueError("result is not an object")
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                self.ui_q.put(AgentJobResult(result))
-                continue
-
-            if line.startswith("<<USER_SPEECH>>"):
-                text = line[len("<<USER_SPEECH>>"):].strip()
-                if text:
-                    # This arrives before the server begins its response for
-                    # the spoken turn, preserving a normal conversation turn.
-                    self.ui_q.put(MountTurn(text))
-                    pending_tool_ids.clear()
-                    thinking_hidden = False
-                    deferred_tool_finishes.clear()
-                continue
-
-            if line.startswith("<<TOOL_START>>"):
-                try:
-                    payload = json.loads(line[len("<<TOOL_START>>"):])
-                    name, detail = payload["name"], payload["detail"]
-                except (json.JSONDecodeError, KeyError):
-                    payload = {}
-                    name, detail = "tool", "(unparsed)"
-                tool_id = payload.get("id")
-                if tool_id is None:
-                    tool_id_counter += 1
-                    tool_id = f"local-{tool_id_counter}"
-                pending_tool_ids.append(tool_id)
-                self.ui_q.put(AddToolNode(tool_id, name, detail))
-                continue
-
-            if line.startswith("<<TOOL_LOG>>"):
-                try:
-                    payload = json.loads(line[len("<<TOOL_LOG>>"):])
-                    tool_id = payload["id"]
-                    stream = payload.get("stream", "stdout")
-                    text = payload["text"]
-                except (json.JSONDecodeError, KeyError):
-                    continue
-                self.ui_q.put(AppendToolLog(tool_id, stream, text))
-                continue
-
-            if line.startswith("<<ASK_USER_QUESTION>>"):
-                try:
-                    payload = json.loads(line[len("<<ASK_USER_QUESTION>>"):])
-                    question_id = payload["id"]
-                    questions = payload["questions"]
-                    if not isinstance(questions, list):
-                        raise ValueError("questions is not a list")
-                except (json.JSONDecodeError, KeyError, ValueError):
-                    continue
-                self.ui_q.put(AskUserQuestion(question_id, questions))
-                continue
-
-            if line.startswith("<<EDIT_APPROVAL>>"):
-                try:
-                    payload = json.loads(line[len("<<EDIT_APPROVAL>>"):])
-                    edit_id = payload["id"]
-                    path = payload["path"]
-                    diff = payload["diff"]
-                    if not isinstance(path, str) or not isinstance(diff, str):
-                        raise ValueError("invalid edit approval")
-                except (json.JSONDecodeError, KeyError, ValueError):
-                    continue
-                self.ui_q.put(EditApproval(edit_id, path, diff))
-                continue
-
-            if line.startswith("<<TOOL_END>>"):
-                try:
-                    payload = json.loads(line[len("<<TOOL_END>>"):])
-                    result = payload["result"]
-                    result_text = json.dumps(result, indent=2)
-                except (json.JSONDecodeError, KeyError):
-                    payload = {}
-                    result = None
-                    result_text = "(unparsed result)"
-                tool_id = payload.get("id")
-                if tool_id in pending_tool_ids:
-                    pending_tool_ids.remove(tool_id)
-                elif pending_tool_ids:
-                    tool_id = pending_tool_ids.popleft()
-                else:
-                    tool_id = None
-                if tool_id is not None:
-                    stat = diff_stat(result)
-                    # Hold the result until the model's next text is shown.
-                    # Otherwise a tree refresh can consume the same Textual
-                    # render frame as the first assistant transcription.
-                    deferred_tool_finishes.append(
-                        FinishToolNode(tool_id, result_text, stat)
-                    )
-                continue
-
-            if line == "<<END>>":
-                for tool_finish in deferred_tool_finishes:
-                    self.ui_q.put(tool_finish)
-                deferred_tool_finishes.clear()
-                self.ui_q.put(EndTurn())
-                pending_tool_ids.clear()
-                thinking_hidden = False
-                # The backend is long-lived; keep reading for the next typed
-                # or microphone turn.
-                continue
-
-            if line:
-                # Hide thinking on FIRST text line
-                if not thinking_hidden:
-                    thinking_hidden = True
-                    self.ui_q.put(HideThinking())
-                self.ui_q.put(AppendText(line + " "))
-                # Let the text render first; _present_next supplies the small
-                # inter-event delay before result tree updates.
-                for tool_finish in deferred_tool_finishes:
-                    self.ui_q.put(tool_finish)
-                deferred_tool_finishes.clear()
-
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    # Make stdout unbuffered
+    sys.stdout = open(sys.stdout.fileno(), "w", buffering=1, closefd=False)
     app = PriyaApp()
-    app.run()
-
+    try:
+        app.start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.screen.cleanup()
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
