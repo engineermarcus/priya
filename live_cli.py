@@ -2157,26 +2157,53 @@ class TextLoop:
                     out("<<END>>")
 
     async def run(self):
+        # --- Live session auto-reconnect ---
+        # A dropped Live connection (keepalive timeout, network blip,
+        # server-side restart) is not a fatal error -- reconnect and keep
+        # going. self.session = None while disconnected makes every send/
+        # receive path (all already guarded on `is not None`) pause
+        # naturally instead of throwing into a dead socket.
+        user_requested_exit = False
+        reconnect_delay = 1
         try:
-            async with (
-                client.aio.live.connect(model=MODEL, config=CONFIG) as session,
-                asyncio.TaskGroup() as tg,
-            ):
-                self.session = session
-                await asyncio.sleep(0.1)
-                send_text_task = tg.create_task(self.send_text())
-                tg.create_task(self.receive_text())
-                tg.create_task(self.scheduler_loop())
-                if MIC:
-                    tg.create_task(self.listen_audio())
-                    tg.create_task(self.send_audio())
-                await send_text_task
-                print("send_text: user requested exit", file=sys.stderr)
-                raise asyncio.CancelledError("User requested exit")
+            while not user_requested_exit:
+                try:
+                    async with (
+                        client.aio.live.connect(model=MODEL, config=CONFIG) as session,
+                        asyncio.TaskGroup() as tg,
+                    ):
+                        self.session = session
+                        reconnect_delay = 1  # reset backoff once we're back up
+                        await asyncio.sleep(0.1)
+                        send_text_task = tg.create_task(self.send_text())
+                        tg.create_task(self.receive_text())
+                        tg.create_task(self.scheduler_loop())
+                        if MIC:
+                            tg.create_task(self.listen_audio())
+                            tg.create_task(self.send_audio())
+                        await send_text_task
+                        print("send_text: user requested exit", file=sys.stderr)
+                        user_requested_exit = True
+                        raise asyncio.CancelledError("User requested exit")
+                except* asyncio.CancelledError:
+                    if user_requested_exit:
+                        raise asyncio.CancelledError("User requested exit")
+                    # A child task's own CancelledError (e.g. propagated from
+                    # TaskGroup teardown after a sibling failure) -- fall
+                    # through to reconnect, same as any other connection loss.
+                except* Exception as EG:
+                    traceback.print_exception(EG)
+                if user_requested_exit:
+                    break
+                self.session = None
+                print(
+                    f"Live connection lost, reconnecting in {reconnect_delay}s...",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 30)
         except asyncio.CancelledError:
             pass
-        except ExceptionGroup as EG:
-            traceback.print_exception(EG)
         finally:
             self._lsp.reset()
             self._mcp.reset()
