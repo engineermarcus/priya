@@ -1010,8 +1010,7 @@ class PriyaApp:
         self._interrupted = False
         self.screen.new_turn(text)
         self.screen.set_busy(True)
-        self.screen.set_status(
-            f"  {SPINNER[0]}  {MODEL_NAME}  ·  …", C_STATUS)
+        self.screen.set_status("", C_STATUS)
         threading.Thread(target=self._send_line, args=(text,), daemon=True).start()
 
     def _do_interrupt(self):
