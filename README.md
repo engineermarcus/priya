@@ -111,3 +111,26 @@ When a coding decision needs your input, the model can call `askUserQuestion`.
 Priya pauses the tool round and renders its multiple-choice options in the
 terminal. Choose with arrow keys and Enter, or press Tab and submit a custom
 free-text answer; the model resumes with your answers.
+
+## UI & Slash Commands
+
+Priya features a pure terminal, zero-flicker raw ANSI TUI:
+
+- **Clean Terminal Aesthetic**: No heavy boxes or artificial window borders. Clean message flow with top and bottom borders only for the input bar.
+- **Tool Execution Status & Timing**: Shows inline status badges with elapsed timers (`[running ⠋ 1.2s]`, `[done ✓ 0.4s]`, `[failed ✗ 0.3s]`).
+- **Collapsible Tool Logs**: Press `Tab` or `Ctrl+O` (or `/compact`) to fold long tool outputs into clean summaries.
+- **Rich Markdown**: Pygments syntax-highlighted code blocks, Unicode tables, GitHub callouts (`> [!NOTE]`, `> [!TIP]`, `> [!WARNING]`), and checklists.
+- **Interactive Multi-Choice Prompts**: Navigate options with `↑`/`↓` arrow keys, pick via `1`-`9`, or press Enter to confirm.
+- **Diff Reviews**: Colorized diff lines (`+` green, `-` red) with instant `[y/Enter]` approval or `[n/Esc]` rejection.
+- **Slash Commands**: Type `/` to see available commands in the bottom bar with `Tab` autocomplete:
+  - `/help`: Commands and keyboard shortcuts guide
+  - `/status`: Workspace, git branch, commit status, and session uptime
+  - `/diff`: Inspect unstaged git changes directly in conversation
+  - `/clear`: Clear conversation view and reset screen
+  - `/tools`: Reference table of all 14 available tools
+  - `/model`: Active model details and parameters
+  - `/history`: Browse previous prompts entered in this session
+  - `/compact`: Toggle tool output folding mode
+  - `/exit`: Cleanly exit Priya
+- **Command History**: Press `↑`/`↓` in an empty prompt to cycle through previous commands.
+

@@ -1171,8 +1171,9 @@ class TextLoop:
                 "stream": True,
                 "completion_args": {
                     "temperature": 0.7,
-                    "max_tokens": 2048,
+                    "max_tokens": 4096,
                     "top_p": 1,
+                    "reasoning_effort": "high",
                 },
             }
 
@@ -1235,14 +1236,32 @@ class TextLoop:
 
                 event_type = chunk.get("type", "")
 
-                # Text delta — conversations API
+                # Text / Reasoning delta — conversations API
                 if event_type == "message.output.delta":
-                    text_piece = chunk.get("content") or ""
-                    if isinstance(text_piece, list):
-                        text_piece = "".join(
-                            c.get("text", "") if isinstance(c, dict) else str(c)
-                            for c in text_piece
-                        )
+                    content_raw = chunk.get("content") or ""
+                    reasoning_piece = ""
+                    text_piece = ""
+
+                    if isinstance(content_raw, list):
+                        for c in content_raw:
+                            if isinstance(c, dict):
+                                c_type = c.get("type", "")
+                                if c_type in ("thinking", "reasoning", "thought"):
+                                    reasoning_piece += c.get("thinking") or c.get("reasoning") or c.get("text", "")
+                                else:
+                                    text_piece += c.get("text", "")
+                            else:
+                                text_piece += str(c)
+                    elif isinstance(content_raw, str):
+                        text_piece = content_raw
+
+                    direct_reasoning = chunk.get("reasoning_content") or chunk.get("thinking")
+                    if direct_reasoning:
+                        reasoning_piece += direct_reasoning
+
+                    if reasoning_piece:
+                        out("<<THINKING>>" + json.dumps({"text": reasoning_piece}))
+
                     if text_piece:
                         text_chunks.append(text_piece)
                         line_buf += text_piece
