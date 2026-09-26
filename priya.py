@@ -1164,24 +1164,41 @@ class Screen:
                 box_w = min(max_line_w - 4, 76)
                 content_w = max(10, box_w - 4)
                 drop_lines = []
-                title_text = "┌─ Commands "
-                drop_lines.append(C_BORDER + title_text + "─" * max(0, box_w - vis_len(title_text) - 1) + "┐" + RESET)
 
                 sel = getattr(self, "suggestion_index", 0) % len(matched)
-                for i, (cmd_name, cmd_desc) in enumerate(matched[:8]):
+                max_items = min(len(matched), max(4, min(9, status_row - 4)))
+                if len(matched) <= max_items:
+                    start_idx = 0
+                    end_idx = len(matched)
+                else:
+                    if sel < max_items:
+                        start_idx = 0
+                    elif sel >= len(matched) - (max_items // 2):
+                        start_idx = len(matched) - max_items
+                    else:
+                        start_idx = sel - (max_items // 2)
+                    start_idx = max(0, min(start_idx, len(matched) - max_items))
+                    end_idx = start_idx + max_items
+
+                scroll_info = f" ({sel + 1}/{len(matched)})" if len(matched) > 1 else ""
+                title_text = f"┌─ Commands{scroll_info} "
+                drop_lines.append(C_BORDER + title_text + "─" * max(0, box_w - vis_len(title_text) - 1) + "┐" + RESET)
+
+                for i in range(start_idx, end_idx):
+                    cmd_name, cmd_desc = matched[i]
                     is_sel = (i == sel)
                     if is_sel:
-                        cmd_str = f"❯ {cmd_name:<9} {cmd_desc}"
+                        cmd_str = f"❯ {cmd_name:<12} {cmd_desc}"
                         c_disp = fit_line(cmd_str, content_w)
                         c_pad = " " * max(0, content_w - vis_len(c_disp))
                         drop_lines.append(C_BORDER + "│ " + RESET + BOLD + C_CYAN + c_disp + RESET + c_pad + C_BORDER + " │" + RESET)
                     else:
-                        cmd_str = f"  {cmd_name:<9} {cmd_desc}"
+                        cmd_str = f"  {cmd_name:<12} {cmd_desc}"
                         c_disp = fit_line(cmd_str, content_w)
                         c_pad = " " * max(0, content_w - vis_len(c_disp))
                         drop_lines.append(C_BORDER + "│ " + RESET + C_DIM + c_disp + RESET + c_pad + C_BORDER + " │" + RESET)
 
-                foot_text = "└─ [↑/↓] iterate • [Enter] complete "
+                foot_text = f"└─ [↑/↓] iterate • [Enter] complete{scroll_info} "
                 drop_lines.append(C_BORDER + foot_text + "─" * max(0, box_w - vis_len(foot_text) - 1) + "┘" + RESET)
 
                 box_h = len(drop_lines)
@@ -2055,11 +2072,45 @@ class PriyaApp:
             return
 
         if key == "WHEEL_UP":
+            if self._question_state:
+                qs = self._question_state
+                with s._lock:
+                    qs["selected_option"] = max(0, qs.get("selected_option", 0) - 1)
+                    s._cache_dirty = True
+                s.redraw()
+                return
+            if s.input_text.startswith("/"):
+                matched = [c for c in COMMANDS if c[0].startswith(s.input_text.lower())]
+                if matched:
+                    self.suggestion_index = (self.suggestion_index - 1) % len(matched)
+                    with s._lock:
+                        s.suggestion_index = self.suggestion_index
+                        s._cache_dirty = True
+                    s.redraw()
+                    return
             s.scroll_up(3)
             s.redraw()
             return
 
         if key == "WHEEL_DOWN":
+            if self._question_state:
+                qs = self._question_state
+                q = qs["questions"][qs["index"]]
+                opts = q.get("options", [])
+                with s._lock:
+                    qs["selected_option"] = min(len(opts) - 1, qs.get("selected_option", 0) + 1)
+                    s._cache_dirty = True
+                s.redraw()
+                return
+            if s.input_text.startswith("/"):
+                matched = [c for c in COMMANDS if c[0].startswith(s.input_text.lower())]
+                if matched:
+                    self.suggestion_index = (self.suggestion_index + 1) % len(matched)
+                    with s._lock:
+                        s.suggestion_index = self.suggestion_index
+                        s._cache_dirty = True
+                    s.redraw()
+                    return
             s.scroll_down(3)
             s.redraw()
             return
@@ -2256,6 +2307,16 @@ class PriyaApp:
             return
 
         if key == "RIGHT":
+            if s.input_text.startswith("/") and s.input_cursor >= len(s.input_text):
+                matched = [c[0] for c in COMMANDS if c[0].startswith(s.input_text.lower())]
+                if matched:
+                    chosen = matched[self.suggestion_index % len(matched)]
+                    with s._lock:
+                        s.input_text = chosen
+                        s.input_cursor = len(s.input_text)
+                        s._cache_dirty = True
+                    s.redraw()
+                    return
             s.input_right()
             s.redraw()
             return

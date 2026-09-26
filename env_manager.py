@@ -119,7 +119,8 @@ def get_api_keys_status(project_dir: Optional[str] = None) -> Dict[str, Any]:
 
 def get_onboarding_instructions(status: Optional[Dict[str, Any]] = None) -> str:
     """
-    Returns user-facing Markdown instructions explaining how to obtain and configure API keys.
+    Returns user-facing Markdown instructions explaining how to obtain,
+    export, and configure API keys permanently in ~/.bashrc or ~/.zshrc.
     """
     if status is None:
         status = get_api_keys_status()
@@ -140,19 +141,45 @@ Priya requires an API key for **Mistral AI** or **Google Gemini** (both offer fr
 
 ---
 
-#### 1. How to get a Mistral API Key:
-1. Visit [console.mistral.ai](https://console.mistral.ai/)
-2. Sign up or log into your Mistral account
-3. Navigate to **API Keys** and click **Create new key**
-4. Copy the key and configure it below or export `MISTRAL_API_KEY="your-key"`
+#### 1. Mistral AI Key
+- **Direct Portal URL**: https://console.mistral.ai/
+- **Steps**:
+  1. Open https://console.mistral.ai/ in your browser and sign up or log in.
+  2. Navigate to **API Keys** and click **Create new key**.
+  3. Copy your generated key.
 
-#### 2. How to get a Google Gemini API Key:
-1. Visit [aistudio.google.com](https://aistudio.google.com/)
-2. Sign in with your Google account
-3. Click **Get API key** → **Create API key**
-4. Copy the key and configure it below or export `GEMINI_API_KEY="your-key"`
-*(Free tier includes Gemini 3.7 Flash, 3.5 Flash, 3.1 Flash Lite, 3.8 Flash)*
+#### 2. Google Gemini Key (Free Tier Available)
+- **Direct Portal URL**: https://aistudio.google.com/
+- **Steps**:
+  1. Open https://aistudio.google.com/ in your browser and sign in with Google.
+  2. Click **Get API key** → **Create API key in new project**.
+  3. Copy your key *(Free tier includes 3.7 Flash, 3.5 Flash, 3.1 Flash Lite, 3.8 Flash)*.
 
 ---
-Select an option below to enter/update your key or continue.
+
+#### Exporting & Making Keys Permanent in Your Terminal
+To run Priya across any project directory, export your key in your terminal:
+
+**1. Current Session Export:**
+```bash
+export MISTRAL_API_KEY="your-mistral-api-key"
+export GEMINI_API_KEY="your-gemini-api-key"
+```
+
+**2. Make Permanent in `~/.bashrc` (Default Linux Bash):**
+```bash
+echo 'export MISTRAL_API_KEY="your-mistral-api-key"' >> ~/.bashrc
+echo 'export GEMINI_API_KEY="your-gemini-api-key"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+**3. Make Permanent in `~/.zshrc` (macOS / Zsh):**
+```bash
+echo 'export MISTRAL_API_KEY="your-mistral-api-key"' >> ~/.zshrc
+echo 'export GEMINI_API_KEY="your-gemini-api-key"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+---
+*Tip: You can also choose an option below to enter/paste your key and save it directly to this project's `.env` file.*
 """

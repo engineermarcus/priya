@@ -234,3 +234,63 @@ def test_priya_app_onboarding_flow(tmp_path):
         # Verify <<SET_KEYS>> was sent to worker
         app._send_line.assert_called_with('<<SET_KEYS>>{"GEMINI_API_KEY": "AIzaSy_fake_test_gemini_key_123"}')
         assert app._pending_key_entry is None
+
+
+def test_command_list_scrolling_when_only_slash_entered():
+    app = priya.PriyaApp()
+    app.screen.input_text = "/"
+    app.screen.input_cursor = 1
+
+    total_cmds = len(priya.COMMANDS)
+    assert total_cmds >= 10
+
+    # User presses DOWN arrow repeatedly across the entire list
+    for step in range(total_cmds + 2):
+        app._handle_key("DOWN")
+        assert app.suggestion_index == (step + 1) % total_cmds
+
+    # User presses UP arrow repeatedly
+    for _ in range(3):
+        cur = app.suggestion_index
+        app._handle_key("UP")
+        assert app.suggestion_index == (cur - 1) % total_cmds
+
+    # User uses WHEEL_DOWN and WHEEL_UP
+    cur = app.suggestion_index
+    app._handle_key("WHEEL_DOWN")
+    assert app.suggestion_index == (cur + 1) % total_cmds
+    app._handle_key("WHEEL_UP")
+    assert app.suggestion_index == cur
+
+    # User presses RIGHT arrow to autocomplete
+    app.suggestion_index = 0
+    expected_first = priya.COMMANDS[0][0]
+    app._handle_key("RIGHT")
+    assert app.screen.input_text == expected_first
+
+
+def test_onboarding_instructions_has_urls_and_shell_exports():
+    status = {
+        "has_env_file": False,
+        "env_path": "/fake/path/.env",
+        "mistral": False,
+        "mistral_masked": "Not set",
+        "gemini": False,
+        "gemini_masked": "Not set",
+        "has_any_key": False,
+    }
+    instr = get_onboarding_instructions(status)
+    # Check explicit URLs
+    assert "https://console.mistral.ai/" in instr
+    assert "https://aistudio.google.com/" in instr
+
+    # Check export instructions
+    assert 'export MISTRAL_API_KEY="your-mistral-api-key"' in instr
+    assert 'export GEMINI_API_KEY="your-gemini-api-key"' in instr
+
+    # Check permanence in .bashrc and .zshrc
+    assert "~/.bashrc" in instr
+    assert "~/.zshrc" in instr
+    assert "source ~/.bashrc" in instr
+    assert "source ~/.zshrc" in instr
+
