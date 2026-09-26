@@ -73,8 +73,8 @@ def hide_cursor(): return CSI + "?25l"
 def show_cursor(): return CSI + "?25h"
 def alt_screen():  return CSI + "?1049h"
 def main_screen(): return CSI + "?1049l"
-def enable_mouse():  return CSI + "?1000h" + CSI + "?1006h"
-def disable_mouse(): return CSI + "?1006l" + CSI + "?1000l"
+def enable_mouse():  return CSI + "?1000l" + CSI + "?1006l" + CSI + "?1007h" + CSI + "?2004h"
+def disable_mouse(): return CSI + "?1007l" + CSI + "?2004l"
 def smcup():       return alt_screen()
 def rmcup():       return main_screen()
 
@@ -672,6 +672,19 @@ class Screen:
         with self._lock:
             if self.cur_turn is not None:
                 self.cur_turn.thinking_chunks.append(text)
+                if (self.cur_turn.blocks 
+                        and self.cur_turn.blocks[-1].get("type") == "thinking" 
+                        and not self.cur_turn.blocks[-1].get("done")):
+                    self.cur_turn.blocks[-1]["chunks"].append(text)
+                else:
+                    self.cur_turn.blocks.append({
+                        "type": "thinking",
+                        "chunks": [text],
+                        "start_time": time.time(),
+                        "end_time": None,
+                        "done": False,
+                    })
+                    self.thinking_start = time.time()
             self.active_thinking = text.strip().replace("\n", " ")[:60]
             self.thinking = True
             self._cache_dirty = True
@@ -828,6 +841,85 @@ class Screen:
 
     # ── Line Cache ────────────────────────────────────────────────
 
+    def _render_tool_node_lines(self, node, w):
+        out = []
+        tc = TOOL_COLORS.get(node.name.lower(), C_TOOL)
+        spinner_f = SPINNER[self.spinner_i % len(SPINNER)]
+        clean_detail = node.detail
+        if clean_detail and clean_detail.startswith("{") and clean_detail.endswith("}"):
+            try:
+                d = json.loads(clean_detail)
+                vals = [str(v) for v in d.values() if isinstance(v, (str, int, float))]
+                if vals:
+                    clean_detail = " ".join(vals)
+            except Exception:
+                pass
+        detail_s = f"({clean_detail})" if clean_detail else ""
+        elapsed = node.elapsed_str()
+
+        flat_logs = []
+        for stream, log_text in node.logs:
+            for line in log_text.split("\n"):
+                if line:
+                    flat_logs.append((stream, line))
+
+        if not flat_logs and node.result_text and node.done:
+            try:
+                r = json.loads(node.result_text)
+                if isinstance(r, dict):
+                    text_out = r.get("stdout") or r.get("output") or r.get("error")
+                    if text_out and isinstance(text_out, str):
+                        for l in text_out.split("\n"):
+                            if l:
+                                flat_logs.append(("stdout", l))
+            except Exception:
+                pass
+
+        if not node.done:
+            icon = f"{C_CYAN}{spinner_f}{RESET}"
+            status_s = f" {C_CYAN}[running {elapsed}]{RESET}"
+        elif node.error:
+            icon = f"{C_ERR}●{RESET}"
+            status_s = f" {C_ERR}[failed ✗ {elapsed}]{RESET}"
+        else:
+            icon = f"{tc}●{RESET}"
+            status_s = f" {C_OK}[done ✓ {elapsed}]{RESET}" if not flat_logs else ""
+
+        header_line = f"  {icon} {BOLD}{tc}{node.name}{RESET}{C_DIM}{detail_s}{RESET}{status_s}"
+        out.append(fit_line(header_line, w))
+
+        is_collapsed = self.compact_mode and not node.expanded
+        max_preview = 6
+        is_diff_cmd = bool(node and ("diff" in node.name.lower() or "diff" in node.detail.lower()))
+
+        if flat_logs:
+            if is_collapsed and len(flat_logs) > max_preview:
+                omitted = len(flat_logs) - max_preview
+                preview_logs = flat_logs[-max_preview:]
+                branch_hdr = f"  {C_DIM}⎿  <output +{omitted} lines>{RESET}"
+                out.append(fit_line(branch_hdr, w))
+
+                for l_idx, (stream, log_text) in enumerate(preview_logs):
+                    is_last = (l_idx == len(preview_logs) - 1)
+                    hint = f" {C_DIM}(ctrl+o to collapse){RESET}" if is_last else ""
+                    c_line = format_log_line(stream, log_text, is_diff=is_diff_cmd)
+                    out.append(fit_line(f"     {c_line}{hint}", w))
+            else:
+                show_collapse_hint = len(flat_logs) > max_preview
+                for l_idx, (stream, log_text) in enumerate(flat_logs):
+                    is_first = (l_idx == 0)
+                    is_last = (l_idx == len(flat_logs) - 1)
+                    prefix = f"  {C_DIM}⎿  {RESET}" if is_first else "     "
+                    hint = f" {C_DIM}(ctrl+o to collapse){RESET}" if (is_last and show_collapse_hint) else ""
+                    c_line = format_log_line(stream, log_text, is_diff=is_diff_cmd)
+                    out.append(fit_line(f"{prefix}{c_line}{hint}", w))
+
+        if not node.done and not flat_logs:
+            out.append(f"  {C_DIM}⎿  {spinner_f} running…{RESET}")
+
+        out.append("")
+        return out
+
     def _get_lines(self):
         if not self._cache_dirty:
             return self._lines_cache
@@ -851,118 +943,72 @@ class Screen:
                     lines.append("  " + C_USER + l + RESET)
                 lines.append("")
 
-            # Thinking trace (if any)
-            if turn.thinking_chunks:
-                full_thought = "".join(turn.thinking_chunks).strip()
-                if full_thought:
-                    is_active = (turn is self.cur_turn and self.thinking)
-                    dur = (time.time() - self.thinking_start) if (is_active and self.thinking_start) else 0.0
-                    spinner_f = SPINNER[self.spinner_i % len(SPINNER)]
-                    if is_active:
-                        header = f"  {C_CYAN}{spinner_f} Thinking ({dur:.1f}s){RESET}"
+            # Chronological Blocks (thinking -> tool -> thinking -> tool -> ai)
+            if turn.blocks:
+                for block in turn.blocks:
+                    b_type = block.get("type")
+                    if b_type == "thinking":
+                        chunks = block.get("chunks", [])
+                        thought_text = "".join(chunks).strip()
+                        if thought_text:
+                            is_active = (turn is self.cur_turn and not block.get("done") and self.thinking)
+                            dur = (time.time() - block["start_time"]) if is_active else (
+                                (block["end_time"] - block["start_time"]) if block.get("end_time") else 0.0
+                            )
+                            spinner_f = SPINNER[self.spinner_i % len(SPINNER)]
+                            if is_active:
+                                header = f"  {C_CYAN}{spinner_f} Thinking ({dur:.1f}s){RESET}"
+                            else:
+                                dur_s = f" ({dur:.1f}s)" if dur >= 0.5 else ""
+                                header = f"  {C_DIM}💭 Thought process{dur_s}{RESET}"
+                            lines.append(header)
+                            for tl in wrap_text(thought_text, w - 6, indent=0):
+                                lines.append(f"     {C_DIM}{ITALIC}{tl}{RESET}")
+                            lines.append("")
+
+                    elif b_type == "tool":
+                        tid = block.get("id")
+                        node = turn.tool_nodes.get(tid)
+                        if node:
+                            lines.extend(self._render_tool_node_lines(node, w))
+
+                    elif b_type == "ai":
+                        ai_lines = block.get("lines", [])
+                        if ai_lines:
+                            if turn is not self.cur_turn:
+                                full_ai_text = "\n".join(ai_lines)
+                                for ll in render_markdown_ansi(full_ai_text, w - 2, indent=2):
+                                    lines.append(ll)
+                            else:
+                                for al in ai_lines:
+                                    for ll in wrap_text(al, w - 4, indent=0):
+                                        lines.append("  " + C_AI + ll + RESET)
+                            lines.append("")
+            else:
+                # Fallback if no blocks recorded
+                if turn.thinking_chunks:
+                    full_thought = "".join(turn.thinking_chunks).strip()
+                    if full_thought:
+                        lines.append(f"  {C_DIM}💭 Thought process{RESET}")
+                        for tl in wrap_text(full_thought, w - 6, indent=0):
+                            lines.append(f"     {C_DIM}{ITALIC}{tl}{RESET}")
+                        lines.append("")
+
+                for idx, tid in enumerate(turn.tool_order):
+                    node = turn.tool_nodes.get(tid)
+                    if node:
+                        lines.extend(self._render_tool_node_lines(node, w))
+
+                if turn.ai_lines:
+                    if turn is not self.cur_turn:
+                        full_ai_text = "\n".join(turn.ai_lines)
+                        for ll in render_markdown_ansi(full_ai_text, w - 2, indent=2):
+                            lines.append(ll)
                     else:
-                        header = f"  {C_DIM}💭 Thought process{RESET}"
-                    lines.append(header)
-                    for tl in wrap_text(full_thought, w - 6, indent=0):
-                        lines.append(f"     {C_DIM}{ITALIC}{tl}{RESET}")
+                        for al in turn.ai_lines:
+                            for ll in wrap_text(al, w - 4, indent=0):
+                                lines.append("  " + C_AI + ll + RESET)
                     lines.append("")
-
-            # Tool nodes
-            for idx, tid in enumerate(turn.tool_order):
-                node = turn.tool_nodes[tid]
-                tc = TOOL_COLORS.get(node.name.lower(), C_TOOL)
-                spinner_f = SPINNER[self.spinner_i % len(SPINNER)]
-                clean_detail = node.detail
-                if clean_detail and clean_detail.startswith("{") and clean_detail.endswith("}"):
-                    try:
-                        d = json.loads(clean_detail)
-                        vals = [str(v) for v in d.values() if isinstance(v, (str, int, float))]
-                        if vals:
-                            clean_detail = " ".join(vals)
-                    except Exception:
-                        pass
-                detail_s = f"({clean_detail})" if clean_detail else ""
-                elapsed = node.elapsed_str()
-
-                # Collect output lines from logs and/or result
-                flat_logs = []
-                for stream, log_text in node.logs:
-                    for line in log_text.split("\n"):
-                        if line:
-                            flat_logs.append((stream, line))
-
-                if not flat_logs and node.result_text and node.done:
-                    try:
-                        r = json.loads(node.result_text)
-                        if isinstance(r, dict):
-                            text_out = r.get("stdout") or r.get("output") or r.get("error")
-                            if text_out and isinstance(text_out, str):
-                                for l in text_out.split("\n"):
-                                    if l:
-                                        flat_logs.append(("stdout", l))
-                    except Exception:
-                        pass
-
-                if not node.done:
-                    icon = f"{C_CYAN}{spinner_f}{RESET}"
-                    status_s = f" {C_CYAN}[running {elapsed}]{RESET}"
-                elif node.error:
-                    icon = f"{C_ERR}●{RESET}"
-                    status_s = f" {C_ERR}[failed ✗ {elapsed}]{RESET}"
-                else:
-                    icon = f"{tc}●{RESET}"
-                    status_s = f" {C_OK}[done ✓ {elapsed}]{RESET}" if not flat_logs else ""
-
-                # Header: ● ToolName(detail) status
-                header_line = f"  {icon} {BOLD}{tc}{node.name}{RESET}{C_DIM}{detail_s}{RESET}{status_s}"
-                lines.append(fit_line(header_line, w))
-
-                is_collapsed = self.compact_mode and not node.expanded
-                max_preview = 6
-
-                is_diff_cmd = bool(node and ("diff" in node.name.lower() or "diff" in node.detail.lower()))
-
-                if flat_logs:
-                    if is_collapsed and len(flat_logs) > max_preview:
-                        omitted = len(flat_logs) - max_preview
-                        preview_logs = flat_logs[-max_preview:]
-                        branch_hdr = f"  {C_DIM}⎿  <output +{omitted} lines>{RESET}"
-                        lines.append(fit_line(branch_hdr, w))
-
-                        for l_idx, (stream, log_text) in enumerate(preview_logs):
-                            is_last = (l_idx == len(preview_logs) - 1)
-                            hint = f" {C_DIM}(ctrl+o to collapse){RESET}" if is_last else ""
-                            c_line = format_log_line(stream, log_text, is_diff=is_diff_cmd)
-                            lines.append(fit_line(f"     {c_line}{hint}", w))
-                    else:
-                        # Full / normal output
-                        show_collapse_hint = len(flat_logs) > max_preview
-                        for l_idx, (stream, log_text) in enumerate(flat_logs):
-                            is_first = (l_idx == 0)
-                            is_last = (l_idx == len(flat_logs) - 1)
-                            prefix = f"  {C_DIM}⎿  {RESET}" if is_first else "     "
-                            hint = f" {C_DIM}(ctrl+o to collapse){RESET}" if (is_last and show_collapse_hint) else ""
-                            c_line = format_log_line(stream, log_text, is_diff=is_diff_cmd)
-                            lines.append(fit_line(f"{prefix}{c_line}{hint}", w))
-
-                if not node.done and not flat_logs:
-                    lines.append(f"  {C_DIM}⎿  {spinner_f} running…{RESET}")
-
-                is_last_tool = (idx == len(turn.tool_order) - 1)
-                if flat_logs or is_last_tool:
-                    lines.append("")
-
-            # AI text
-            if turn.ai_lines:
-                if turn is not self.cur_turn:
-                    full_ai_text = "\n".join(turn.ai_lines)
-                    for ll in render_markdown_ansi(full_ai_text, w - 2, indent=2):
-                        lines.append(ll)
-                else:
-                    for al in turn.ai_lines:
-                        for ll in wrap_text(al, w - 4, indent=0):
-                            lines.append("  " + C_AI + ll + RESET)
-                lines.append("")
 
             # Interactive Question State
             if turn is self.cur_turn and self._question_state:
@@ -1054,10 +1100,18 @@ class Screen:
         with self._lock:
             if self.cur_turn is None:
                 return
+            if (self.cur_turn.blocks 
+                    and self.cur_turn.blocks[-1].get("type") == "thinking" 
+                    and not self.cur_turn.blocks[-1].get("done")):
+                self.cur_turn.blocks[-1]["done"] = True
+                self.cur_turn.blocks[-1]["end_time"] = time.time()
+            self.cur_turn.blocks.append({"type": "tool", "id": tool_id})
             node = ToolNode(tool_id, name, detail)
             node.expanded = not self.compact_mode
             self.cur_turn.tool_nodes[tool_id] = node
             self.cur_turn.tool_order.append(tool_id)
+            self.thinking = False
+            self.active_thinking = ""
             self._cache_dirty = True
 
     def append_tool_log(self, tool_id, stream, text):
@@ -1091,11 +1145,26 @@ class Screen:
             if self.cur_turn is None:
                 return
             self.thinking = False
+            if (self.cur_turn.blocks 
+                    and self.cur_turn.blocks[-1].get("type") == "thinking" 
+                    and not self.cur_turn.blocks[-1].get("done")):
+                self.cur_turn.blocks[-1]["done"] = True
+                self.cur_turn.blocks[-1]["end_time"] = time.time()
+            if self.cur_turn.blocks and self.cur_turn.blocks[-1].get("type") == "ai":
+                self.cur_turn.blocks[-1]["lines"].append(text)
+            else:
+                self.cur_turn.blocks.append({"type": "ai", "lines": [text]})
             self.cur_turn.ai_lines.append(text)
             self._cache_dirty = True
 
     def end_turn(self):
         with self._lock:
+            if self.cur_turn and self.cur_turn.blocks:
+                for b in self.cur_turn.blocks:
+                    if b.get("type") == "thinking" and not b.get("done"):
+                        b["done"] = True
+                        if not b.get("end_time"):
+                            b["end_time"] = time.time()
             self.cur_turn = None
             self._question_state = None
             self._edit_state = None
@@ -1196,6 +1265,25 @@ def read_key(fd):
                 break
             if len(seq) >= 3 and seq[-1:] in b"aAbBcCdDhHfF~RzZ":
                 break
+
+        # Bracketed paste: \x1b[200~ ... \x1b[201~
+        if seq.startswith(b"\x1b[200~"):
+            paste_bytes = seq[6:]
+            while b"\x1b[201~" not in paste_bytes:
+                r, _, _ = select.select([fd], [], [], 0.05)
+                if not r:
+                    break
+                try:
+                    c = os.read(fd, 4096)
+                    if not c:
+                        break
+                    paste_bytes += c
+                except Exception:
+                    break
+            if b"\x1b[201~" in paste_bytes:
+                paste_bytes = paste_bytes[:paste_bytes.index(b"\x1b[201~")]
+            pasted_text = paste_bytes.decode("utf-8", errors="replace")
+            return ("PASTE", pasted_text)
 
         # SGR mouse event: \x1b[<cb;cx;cy(M|m)
         if seq.startswith(b"\x1b[<"):
@@ -1329,8 +1417,6 @@ class PriyaApp:
             time.sleep(0.08)
 
     def _protocol_loop(self):
-        thinking_hidden = False
-
         while self._running:
             item = self.raw_q.get()
             if item is SENTINEL:
@@ -1430,7 +1516,6 @@ class PriyaApp:
                     text = p.get("prompt","").strip()
                     if text:
                         self.screen.new_turn(f"⏰ Scheduled: {text}")
-                        thinking_hidden = False
                         self.screen.redraw()
                 except Exception:
                     pass
@@ -1447,14 +1532,10 @@ class PriyaApp:
                 self.screen.set_busy(False)
                 self.screen.end_turn()
                 self.screen.set_status("ready", C_READY)
-                thinking_hidden = False
                 self.screen.redraw()
                 continue
 
             # Streamed text
-            if not thinking_hidden:
-                thinking_hidden = True
-                self.screen.thinking = False
             self.screen.append_ai_text(line)
             self.screen.redraw()
 
@@ -1541,6 +1622,18 @@ class PriyaApp:
             s.redraw()
             return
 
+        if isinstance(key, tuple) and key[0] == "PASTE":
+            pasted = key[1].replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+            if pasted:
+                with s._lock:
+                    s.input_text = (s.input_text[:s.input_cursor]
+                                    + pasted
+                                    + s.input_text[s.input_cursor:])
+                    s.input_cursor += len(pasted)
+                    s._cache_dirty = True
+                s.redraw()
+            return
+
         if key in ("UP", "CTRL_P"):
             if self._question_state:
                 qs = self._question_state
@@ -1552,13 +1645,7 @@ class PriyaApp:
                 s.redraw()
                 return
 
-            # If user has scrolled up, UP arrow scrolls conversation further
-            if s.scroll_offset > 0:
-                s.scroll_up(3)
-                s.redraw()
-                return
-
-            if not s.busy:
+            if key == "CTRL_P" or self.history_index != -1:
                 if self.history:
                     if self.history_index == -1:
                         self.saved_input = s.input_text
@@ -1571,12 +1658,25 @@ class PriyaApp:
                             s.input_text = self.history[self.history_index]
                             s.input_cursor = len(s.input_text)
                             s.history_badge = f"history {self.history_index + 1}/{len(self.history)}"
+                            s._cache_dirty = True
                         s.redraw()
                         return
 
-            s.scroll_up(3)
-            s.redraw()
-            return
+            lines = s._get_lines()
+            if len(lines) > s._convo_h or s.scroll_offset > 0:
+                s.scroll_up(3)
+                s.redraw()
+                return
+            elif self.history and not s.busy:
+                self.saved_input = s.input_text
+                self.history_index = len(self.history) - 1
+                with s._lock:
+                    s.input_text = self.history[self.history_index]
+                    s.input_cursor = len(s.input_text)
+                    s.history_badge = f"history {self.history_index + 1}/{len(self.history)}"
+                    s._cache_dirty = True
+                s.redraw()
+                return
 
         if key in ("DOWN", "CTRL_N"):
             if self._question_state:
@@ -1589,12 +1689,6 @@ class PriyaApp:
                 s.redraw()
                 return
 
-            # If user is scrolled up into conversation, DOWN arrow scrolls down
-            if s.scroll_offset > 0:
-                s.scroll_down(3)
-                s.redraw()
-                return
-
             if self.history_index != -1:
                 self.history_index += 1
                 if self.history_index >= len(self.history):
@@ -1603,13 +1697,16 @@ class PriyaApp:
                         s.input_text = self.saved_input
                         s.input_cursor = len(s.input_text)
                         s.history_badge = ""
+                        s._cache_dirty = True
                 else:
                     with s._lock:
                         s.input_text = self.history[self.history_index]
                         s.input_cursor = len(s.input_text)
                         s.history_badge = f"history {self.history_index + 1}/{len(self.history)}"
+                        s._cache_dirty = True
                 s.redraw()
                 return
+
             s.scroll_down(3)
             s.redraw()
             return

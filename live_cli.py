@@ -1283,7 +1283,14 @@ class TextLoop:
                     elif isinstance(content_raw, str):
                         text_piece = content_raw
 
-                    direct_reasoning = chunk.get("reasoning_content") or chunk.get("thinking")
+                    direct_reasoning = chunk.get("reasoning_content") or chunk.get("thinking") or chunk.get("reasoning")
+                    if isinstance(direct_reasoning, dict):
+                        direct_reasoning = direct_reasoning.get("text", "")
+                    elif isinstance(direct_reasoning, list):
+                        direct_reasoning = "".join(x.get("text", str(x)) if isinstance(x, dict) else str(x) for x in direct_reasoning)
+                    elif direct_reasoning and not isinstance(direct_reasoning, str):
+                        direct_reasoning = str(direct_reasoning)
+
                     if direct_reasoning:
                         reasoning_piece += direct_reasoning
 
