@@ -1242,12 +1242,40 @@ class TextLoop:
                     reasoning_piece = ""
                     text_piece = ""
 
-                    if isinstance(content_raw, list):
+                    if isinstance(content_raw, dict):
+                        c_type = content_raw.get("type", "")
+                        if c_type in ("thinking", "reasoning", "thought"):
+                            thinking_arr = content_raw.get("thinking")
+                            if isinstance(thinking_arr, list):
+                                for item in thinking_arr:
+                                    if isinstance(item, dict):
+                                        reasoning_piece += item.get("text", "")
+                                    else:
+                                        reasoning_piece += str(item)
+                            elif isinstance(thinking_arr, str):
+                                reasoning_piece += thinking_arr
+                            else:
+                                reasoning_piece += content_raw.get("text", "")
+                        elif c_type == "text":
+                            text_piece += content_raw.get("text", "")
+                        else:
+                            text_piece += content_raw.get("text", "") or ""
+                    elif isinstance(content_raw, list):
                         for c in content_raw:
                             if isinstance(c, dict):
                                 c_type = c.get("type", "")
                                 if c_type in ("thinking", "reasoning", "thought"):
-                                    reasoning_piece += c.get("thinking") or c.get("reasoning") or c.get("text", "")
+                                    thinking_arr = c.get("thinking")
+                                    if isinstance(thinking_arr, list):
+                                        for item in thinking_arr:
+                                            if isinstance(item, dict):
+                                                reasoning_piece += item.get("text", "")
+                                            else:
+                                                reasoning_piece += str(item)
+                                    elif isinstance(thinking_arr, str):
+                                        reasoning_piece += thinking_arr
+                                    else:
+                                        reasoning_piece += c.get("text", "")
                                 else:
                                     text_piece += c.get("text", "")
                             else:
@@ -1325,8 +1353,17 @@ class TextLoop:
                 except json.JSONDecodeError:
                     args_dict = {}
 
-                detail = (args_dict.get("command") or args_dict.get("task")
-                          or args_dict.get("action") or json.dumps(args_dict)[:80])
+                detail = (args_dict.get("path")
+                          or args_dict.get("file_path")
+                          or args_dict.get("pattern")
+                          or args_dict.get("query")
+                          or args_dict.get("command")
+                          or args_dict.get("task")
+                          or args_dict.get("action"))
+                if not detail and args_dict:
+                    vals = [str(v) for v in args_dict.values() if isinstance(v, (str, int, float, bool))]
+                    detail = " ".join(vals)[:80] if vals else ""
+                detail = detail or ""
                 self._tool_event_id += 1
                 tool_event_id = self._tool_event_id
 

@@ -221,6 +221,22 @@ def colorize_diff(diff):
             out.append(C_DIFF_N + line + RESET)
     return out
 
+def format_log_line(stream, line, is_diff=False):
+    """Format and colorize a single tool output line."""
+    if is_diff:
+        if line.startswith("+++") or (line.startswith("+") and not line.startswith("+++")):
+            return C_DIFF_A + line + RESET
+        elif line.startswith("---") or (line.startswith("-") and not line.startswith("---")):
+            return C_DIFF_D + line + RESET
+        elif line.startswith("@@"):
+            return C_CYAN + line + RESET
+    if stream == "stderr":
+        return C_STDERR + line + RESET
+    elif stream == "info":
+        return C_DIM + line + RESET
+    else:
+        return C_STDOUT + line + RESET
+
 # ── Code Syntax Highlighting ──────────────────────────────────────────────────
 
 _FORMATTER = TerminalTrueColorFormatter(style="monokai")
@@ -532,6 +548,9 @@ def render_markdown_ansi(text, width, indent=2):
     for node in (ast or []):
         render_block(node)
 
+    while out and not out[-1].strip():
+        out.pop()
+
     return out
 
 # ── Conversation Model ────────────────────────────────────────────────────────
@@ -555,10 +574,19 @@ class ToolNode:
         self.end_time = time.time()
         self.duration = self.end_time - self.start_time
         self.result_text = result_text
-        if result_text and isinstance(result_text, str):
-            low = result_text.lower()
-            if '"error":' in low or "error:" in low or '"failed":' in low:
-                self.error = True
+        self.error = False
+        if result_text:
+            try:
+                res = json.loads(result_text) if isinstance(result_text, str) else result_text
+                if isinstance(res, dict):
+                    if res.get("error"):
+                        self.error = True
+                    elif res.get("exit_code") is not None and res.get("exit_code") != 0:
+                        self.error = True
+                    elif res.get("failed") is True:
+                        self.error = True
+            except Exception:
+                pass
 
     def elapsed_str(self):
         t = self.duration if self.duration is not None else (time.time() - self.start_time)
@@ -827,58 +855,102 @@ class Screen:
             if turn.thinking_chunks:
                 full_thought = "".join(turn.thinking_chunks).strip()
                 if full_thought:
+                    is_active = (turn is self.cur_turn and self.thinking)
+                    dur = (time.time() - self.thinking_start) if (is_active and self.thinking_start) else 0.0
+                    spinner_f = SPINNER[self.spinner_i % len(SPINNER)]
+                    if is_active:
+                        header = f"  {C_CYAN}{spinner_f} Thinking ({dur:.1f}s){RESET}"
+                    else:
+                        header = f"  {C_DIM}💭 Thought process{RESET}"
+                    lines.append(header)
                     for tl in wrap_text(full_thought, w - 6, indent=0):
-                        lines.append(f"    {C_DIM}{ITALIC}💭 {tl}{RESET}")
+                        lines.append(f"     {C_DIM}{ITALIC}{tl}{RESET}")
                     lines.append("")
 
             # Tool nodes
-            for tid in turn.tool_order:
+            for idx, tid in enumerate(turn.tool_order):
                 node = turn.tool_nodes[tid]
                 tc = TOOL_COLORS.get(node.name.lower(), C_TOOL)
                 spinner_f = SPINNER[self.spinner_i % len(SPINNER)]
-                detail_s = f"({node.detail})" if node.detail else ""
+                clean_detail = node.detail
+                if clean_detail and clean_detail.startswith("{") and clean_detail.endswith("}"):
+                    try:
+                        d = json.loads(clean_detail)
+                        vals = [str(v) for v in d.values() if isinstance(v, (str, int, float))]
+                        if vals:
+                            clean_detail = " ".join(vals)
+                    except Exception:
+                        pass
+                detail_s = f"({clean_detail})" if clean_detail else ""
                 elapsed = node.elapsed_str()
 
-                if not node.done:
-                    status_s = f" {C_CYAN}[running {spinner_f} {elapsed}]{RESET}"
-                elif node.error:
-                    status_s = f" {C_ERR}[failed ✗ {elapsed}]{RESET}"
-                else:
-                    status_s = f" {C_OK}[done ✓ {elapsed}]{RESET}"
-
-                # Header: ToolName(detail): [status] (fitted to terminal width)
-                header_line = (
-                    f"  {BOLD}{tc}{node.name}{RESET}"
-                    f"{C_DIM}{detail_s}:{RESET}"
-                    f"{status_s}"
-                )
-                lines.append(fit_line(header_line, w))
-
-
-                # Logs indented beneath, with folding if long
+                # Collect output lines from logs and/or result
                 flat_logs = []
                 for stream, log_text in node.logs:
                     for line in log_text.split("\n"):
                         if line:
                             flat_logs.append((stream, line))
 
-                display_logs = flat_logs
-                if node.done and self.compact_mode and not node.expanded and len(flat_logs) > 8:
-                    display_logs = flat_logs[:2] + [("info", f"… [{len(flat_logs) - 4} lines hidden — press Tab or Ctrl+O to expand]")] + flat_logs[-2:]
-
-                for stream, log_text in display_logs:
-                    if stream == "info":
-                        lc = C_DIM
-                    elif stream == "stderr":
-                        lc = C_STDERR
-                    else:
-                        lc = C_STDOUT
-                    for ll in wrap_text(log_text, w - 12, indent=0):
-                        lines.append(f"          {lc}{ll}{RESET}")
+                if not flat_logs and node.result_text and node.done:
+                    try:
+                        r = json.loads(node.result_text)
+                        if isinstance(r, dict):
+                            text_out = r.get("stdout") or r.get("output") or r.get("error")
+                            if text_out and isinstance(text_out, str):
+                                for l in text_out.split("\n"):
+                                    if l:
+                                        flat_logs.append(("stdout", l))
+                    except Exception:
+                        pass
 
                 if not node.done:
-                    lines.append(f"          {C_DIM}{spinner_f}{RESET}")
-                lines.append("")
+                    icon = f"{C_CYAN}{spinner_f}{RESET}"
+                    status_s = f" {C_CYAN}[running {elapsed}]{RESET}"
+                elif node.error:
+                    icon = f"{C_ERR}●{RESET}"
+                    status_s = f" {C_ERR}[failed ✗ {elapsed}]{RESET}"
+                else:
+                    icon = f"{tc}●{RESET}"
+                    status_s = f" {C_OK}[done ✓ {elapsed}]{RESET}" if not flat_logs else ""
+
+                # Header: ● ToolName(detail) status
+                header_line = f"  {icon} {BOLD}{tc}{node.name}{RESET}{C_DIM}{detail_s}{RESET}{status_s}"
+                lines.append(fit_line(header_line, w))
+
+                is_collapsed = self.compact_mode and not node.expanded
+                max_preview = 6
+
+                is_diff_cmd = bool(node and ("diff" in node.name.lower() or "diff" in node.detail.lower()))
+
+                if flat_logs:
+                    if is_collapsed and len(flat_logs) > max_preview:
+                        omitted = len(flat_logs) - max_preview
+                        preview_logs = flat_logs[-max_preview:]
+                        branch_hdr = f"  {C_DIM}⎿  <output +{omitted} lines>{RESET}"
+                        lines.append(fit_line(branch_hdr, w))
+
+                        for l_idx, (stream, log_text) in enumerate(preview_logs):
+                            is_last = (l_idx == len(preview_logs) - 1)
+                            hint = f" {C_DIM}(ctrl+o to collapse){RESET}" if is_last else ""
+                            c_line = format_log_line(stream, log_text, is_diff=is_diff_cmd)
+                            lines.append(fit_line(f"     {c_line}{hint}", w))
+                    else:
+                        # Full / normal output
+                        show_collapse_hint = len(flat_logs) > max_preview
+                        for l_idx, (stream, log_text) in enumerate(flat_logs):
+                            is_first = (l_idx == 0)
+                            is_last = (l_idx == len(flat_logs) - 1)
+                            prefix = f"  {C_DIM}⎿  {RESET}" if is_first else "     "
+                            hint = f" {C_DIM}(ctrl+o to collapse){RESET}" if (is_last and show_collapse_hint) else ""
+                            c_line = format_log_line(stream, log_text, is_diff=is_diff_cmd)
+                            lines.append(fit_line(f"{prefix}{c_line}{hint}", w))
+
+                if not node.done and not flat_logs:
+                    lines.append(f"  {C_DIM}⎿  {spinner_f} running…{RESET}")
+
+                is_last_tool = (idx == len(turn.tool_order) - 1)
+                if flat_logs or is_last_tool:
+                    lines.append("")
 
             # AI text
             if turn.ai_lines:
@@ -924,9 +996,21 @@ class Screen:
                 lines.append("  " + C_DIM + "Type 'y' to approve, 'n' to cancel (or press y/n) ↓" + RESET)
                 lines.append("")
 
-        self._lines_cache = lines
+        # Compact / normalize blank lines: never allow consecutive empty lines, and strip trailing empty lines
+        compact_lines = []
+        for line in lines:
+            if not line.strip():
+                if compact_lines and not compact_lines[-1].strip():
+                    continue
+                compact_lines.append("")
+            else:
+                compact_lines.append(line)
+        while compact_lines and not compact_lines[-1].strip():
+            compact_lines.pop()
+
+        self._lines_cache = compact_lines
         self._cache_dirty = False
-        return lines
+        return compact_lines
 
     # ── State Mutators ────────────────────────────────────────────
 
@@ -1245,7 +1329,6 @@ class PriyaApp:
             time.sleep(0.08)
 
     def _protocol_loop(self):
-        deferred_finishes = []
         thinking_hidden = False
 
         while self._running:
@@ -1302,7 +1385,7 @@ class PriyaApp:
                         self.screen.plan_mode = False
 
                     result_text = json.dumps(res, indent=2)
-                    deferred_finishes.append((tid, result_text))
+                    self.screen.finish_tool_node(tid, result_text)
                     self.screen.finish_active_tool()
                     self.screen.redraw()
                 except Exception:
@@ -1348,7 +1431,6 @@ class PriyaApp:
                     if text:
                         self.screen.new_turn(f"⏰ Scheduled: {text}")
                         thinking_hidden = False
-                        deferred_finishes.clear()
                         self.screen.redraw()
                 except Exception:
                     pass
@@ -1358,9 +1440,6 @@ class PriyaApp:
                 continue
 
             if line == "<<END>>":
-                for tid, rt in deferred_finishes:
-                    self.screen.finish_tool_node(tid, rt)
-                deferred_finishes.clear()
                 self._busy = False
                 self._tool_active = False
                 self._interrupted = False
@@ -1376,9 +1455,6 @@ class PriyaApp:
             if not thinking_hidden:
                 thinking_hidden = True
                 self.screen.thinking = False
-            for tid, rt in deferred_finishes:
-                self.screen.finish_tool_node(tid, rt)
-            deferred_finishes.clear()
             self.screen.append_ai_text(line)
             self.screen.redraw()
 
