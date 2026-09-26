@@ -2828,52 +2828,45 @@ class TextLoop:
 
         self._gemini_history.append({"role": "user", "parts": [{"text": user_text}]})
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse&key={key}"
-
+        model_name = self._active_model if self._active_model.startswith("gemini") else "gemini-3.8-flash"
         system_content = SYSTEM_INSTRUCTION
         if self._tool_store_content:
             system_content += f"\n\n---\n# AUTHORITATIVE TOOL STORE (LOADED TO MEMORY AT STARTUP)\n{self._tool_store_content}"
 
         while True:
+            gen_config = {"temperature": 0.7}
+            if self._gemini_thinking_budget > 0:
+                gen_config["thinkingConfig"] = {"thinkingBudget": self._gemini_thinking_budget}
+
             body = {
                 "contents": self._gemini_history,
                 "systemInstruction": {"parts": [{"text": system_content}]},
                 "tools": [{"functionDeclarations": self._gemini_tools}],
-                "generationConfig": {
-                    "temperature": 0.7,
-                    "thinkingConfig": {
-                        "thinkingBudget": self._gemini_thinking_budget
-                    }
-                }
+                "generationConfig": gen_config
             }
 
             event_q: asyncio.Queue = asyncio.Queue()
             loop = asyncio.get_running_loop()
 
-            def _do_stream(u=url, b=body):
+            def _do_stream(target_model=model_name, b=body):
                 import requests as _req
                 delay = 2.0
-                for _attempt in range(5):
+                for _attempt in range(3):
+                    target_url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:streamGenerateContent?alt=sse&key={key}"
                     try:
-                        resp = _req.post(u, json=b, stream=True, timeout=120)
+                        resp = _req.post(target_url, json=b, stream=True, timeout=60)
                         if resp.status_code == 429:
                             err_data = {}
                             try:
                                 err_data = resp.json()
                             except Exception:
                                 pass
-                            retry_delay = delay
-                            for d in err_data.get("error", {}).get("details", []):
-                                if "retryDelay" in d:
-                                    s = d["retryDelay"].rstrip("s")
-                                    try:
-                                        retry_delay = float(s)
-                                    except ValueError:
-                                        pass
-                            print(f"[Gemini 429] Quota exceeded. Retrying in {retry_delay:.1f}s...", file=sys.stderr)
-                            time.sleep(retry_delay)
-                            delay = min(delay * 2, 30.0)
-                            continue
+                            err_msg = err_data.get("error", {}).get("message", resp.text)
+                            loop.call_soon_threadsafe(
+                                event_q.put_nowait,
+                                ("quota_error", (target_model, err_msg))
+                            )
+                            return
 
                         if resp.status_code != 200:
                             err_msg = resp.text
@@ -2892,7 +2885,7 @@ class TextLoop:
                     except Exception as exc:
                         loop.call_soon_threadsafe(event_q.put_nowait, ("error", str(exc)))
                         return
-                loop.call_soon_threadsafe(event_q.put_nowait, ("error", "Gemini API rate limit: quota exceeded. Please wait a moment and try again."))
+                loop.call_soon_threadsafe(event_q.put_nowait, ("error", "Gemini API rate limit: quota exceeded. Please try again later or switch models."))
 
             threading.Thread(target=_do_stream, daemon=True).start()
 
@@ -2917,8 +2910,20 @@ class TextLoop:
                     out("<<END>>")
                     return
 
+                if kind == "quota_error":
+                    if line_buf.strip():
+                        out(line_buf)
+                    t_model, err = data
+                    out(f"> [!WARNING]\n> **Free Tier Limit Reached**: Your free tier quota for model **`{t_model}`** has been exhausted.\n>\n> Please type `/models` to switch to another available model (e.g. `Gemini 3.7 Flash`, `Gemini 3.5 Flash`, `Gemini 3.6 Flash`, or `mistral-medium-latest`).")
+                    out("<<END>>")
+                    return
+
                 if kind == "error":
-                    raise RuntimeError(data)
+                    if line_buf.strip():
+                        out(line_buf)
+                    out(f"> [!WARNING]\n> **Gemini API Error**: {data}\n>\n> Please type `/models` to pick another model.")
+                    out("<<END>>")
+                    return
                 if kind == "done":
                     break
 

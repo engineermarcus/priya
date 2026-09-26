@@ -84,9 +84,12 @@ class TestScrollAndHistory(unittest.TestCase):
 
     def test_mouse_escape_sequences(self):
         enable = priya.enable_mouse()
-        self.assertIn("?1000h", enable)
-        self.assertIn("?1006h", enable)
+        # Must disable button tracking so terminal natively allows highlight-to-copy and right-click paste
+        self.assertIn("?1000l", enable)
+        self.assertIn("?1006l", enable)
+        self.assertIn("?1007h", enable)
+        self.assertIn("?2004h", enable)
 
         disable = priya.disable_mouse()
-        self.assertIn("?1000l", disable)
-        self.assertIn("?1006l", disable)
+        self.assertIn("?1007l", disable)
+        self.assertIn("?2004l", disable)

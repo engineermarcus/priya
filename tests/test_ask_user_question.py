@@ -149,7 +149,7 @@ class TestAskUserQuestion(unittest.TestCase):
         self.assertIsNotNone(self.app._question_state)
         self.assertEqual(self.app._question_state["step"], 1)
 
-        # Arrow down to Gemini 3.8 Flash (high) (index 3)
+        # Arrow down to Gemini 3.7 Flash (high) (index 3)
         self.app._handle_key("DOWN")
         self.assertEqual(self.app._question_state["selected_option"], 1)
         self.app._handle_key("DOWN")
@@ -160,14 +160,14 @@ class TestAskUserQuestion(unittest.TestCase):
         # Enter to confirm in single unified step
         self.app._handle_key("ENTER")
         self.assertIsNone(self.app._question_state)
-        self.assertEqual(self.app.active_model, "gemini-3.8-flash")
+        self.assertEqual(self.app.active_model, "gemini-3.7-flash")
         self.assertEqual(self.app.model_effort, "high")
-        self.assertEqual(self.app.model_badge, "gemini-3.8-flash (high)")
+        self.assertEqual(self.app.model_badge, "gemini-3.7-flash (high)")
 
         written = self.app.proc.stdin.write.call_args[0][0]
         self.assertTrue(written.startswith("<<SET_MODEL>>"))
         payload = json.loads(written[len("<<SET_MODEL>>"):])
-        self.assertEqual(payload["model"], "gemini-3.8-flash")
+        self.assertEqual(payload["model"], "gemini-3.7-flash")
         self.assertEqual(payload["effort"], "high")
         self.assertEqual(payload["budget"], 16384)
 

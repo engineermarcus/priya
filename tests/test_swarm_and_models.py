@@ -136,20 +136,18 @@ def test_priya_models_interactive_flow():
     assert app._question_state["is_model_picker"] is True
     assert app._question_state["step"] == 1
     options = app._question_state["questions"][0]["options"]
-    assert len(options) == 5
+    assert len(options) == 10
     assert "mistral-medium-latest" in options[0]["label"]
-    assert "Gemini 3.8 Flash (medium" in options[1]["label"]
-    assert "Gemini 3.8 Flash (low" in options[2]["label"]
-    assert "Gemini 3.8 Flash (high" in options[3]["label"]
-    assert "Skip" in options[4]["label"]
+    assert "Gemini 3.7 Flash (medium" in options[1]["label"]
+    assert "Skip" in options[9]["label"]
 
-    # User picks Gemini 3.8 Flash (medium - Recommended)
-    app._submit_question_answer("Gemini 3.8 Flash (medium - Recommended)")
+    # User picks Gemini 3.7 Flash (medium - Recommended)
+    app._submit_question_answer("Gemini 3.7 Flash (medium - Recommended)")
     assert app._question_state is None
-    assert app.active_model == "gemini-3.8-flash"
+    assert app.active_model == "gemini-3.7-flash"
     assert app.model_effort == "medium"
-    assert app.model_badge == "gemini-3.8-flash (medium)"
-    assert app.screen.model_badge == "gemini-3.8-flash (medium)"
+    assert app.model_badge == "gemini-3.7-flash (medium)"
+    assert app.screen.model_badge == "gemini-3.7-flash (medium)"
 
     # User invokes /models again and picks mistral -> switches immediately
     app._handle_cmd_models()

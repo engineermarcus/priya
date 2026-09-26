@@ -73,8 +73,8 @@ def hide_cursor(): return CSI + "?25l"
 def show_cursor(): return CSI + "?25h"
 def alt_screen():  return CSI + "?1049h"
 def main_screen(): return CSI + "?1049l"
-def enable_mouse():  return CSI + "?1000h" + CSI + "?1006h" + CSI + "?2004h"
-def disable_mouse(): return CSI + "?1006l" + CSI + "?1000l" + CSI + "?1007l" + CSI + "?2004l"
+def enable_mouse():  return CSI + "?1000l" + CSI + "?1006l" + CSI + "?1007h" + CSI + "?2004h"
+def disable_mouse(): return CSI + "?1007l" + CSI + "?2004l"
 def smcup():       return alt_screen()
 def rmcup():       return main_screen()
 
@@ -2557,7 +2557,7 @@ Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
         cur_sel = 0
         if self.active_model == "mistral-medium-latest":
             cur_sel = 0
-        elif self.active_model.startswith("gemini"):
+        elif self.active_model == "gemini-3.7-flash":
             effort = getattr(self, "model_effort", "medium")
             if effort == "low":
                 cur_sel = 2
@@ -2565,6 +2565,16 @@ Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
                 cur_sel = 3
             else:
                 cur_sel = 1
+        elif self.active_model == "gemini-3.5-flash":
+            cur_sel = 4
+        elif self.active_model == "gemini-3.5-flash-lite":
+            cur_sel = 5
+        elif self.active_model == "gemini-3.6-flash":
+            cur_sel = 6
+        elif self.active_model == "gemini-3.1-flash-lite":
+            cur_sel = 7
+        elif self.active_model == "gemini-3.8-flash":
+            cur_sel = 8
 
         qs = {
             "id": "model_select_1",
@@ -2574,9 +2584,14 @@ Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
                 "question": "Choose AI model and reasoning effort:",
                 "options": [
                     {"label": "mistral-medium-latest", "description": "Mistral Large reasoning & tool execution (fast, no extra config)"},
-                    {"label": "Gemini 3.8 Flash (medium - Recommended)", "description": "Google GenAI 4,096 tokens thinking budget — Balanced reasoning"},
-                    {"label": "Gemini 3.8 Flash (low)", "description": "Google GenAI 1,024 tokens thinking budget — Fast, low latency"},
-                    {"label": "Gemini 3.8 Flash (high)", "description": "Google GenAI 16,384 tokens thinking budget — Deep extended reasoning"},
+                    {"label": "Gemini 3.7 Flash (medium - Recommended)", "description": "Google GenAI 3.7 Flash — 4,096 tokens thinking budget (free tier active)"},
+                    {"label": "Gemini 3.7 Flash (low)", "description": "Google GenAI 3.7 Flash — 1,024 tokens thinking budget (free tier active)"},
+                    {"label": "Gemini 3.7 Flash (high)", "description": "Google GenAI 3.7 Flash — 16,384 tokens thinking budget (free tier active)"},
+                    {"label": "Gemini 3.5 Flash", "description": "Google GenAI 3.5 Flash — Fast tool-calling model (free tier active)"},
+                    {"label": "Gemini 3.5 Flash Lite", "description": "Google GenAI 3.5 Flash Lite — Lightweight, minimal latency (free tier active)"},
+                    {"label": "Gemini 3.6 Flash", "description": "Google GenAI 3.6 Flash — Balanced capability (free tier active)"},
+                    {"label": "Gemini 3.1 Flash Lite", "description": "Google GenAI 3.1 Flash Lite — Ultra-fast responses (free tier active)"},
+                    {"label": "Gemini 3.8 Flash (medium)", "description": "Google GenAI 3.8 Flash — 4,096 tokens thinking budget (20 req/day limit)"},
                     {"label": "Skip", "description": "Keep current model unchanged", "skip": True},
                 ]
             }],
@@ -2658,54 +2673,60 @@ Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
                 self.screen.end_turn()
                 self.screen.redraw()
                 return
-            elif "gemini" in ans_clean:
+
+            if "3.8" in ans_clean:
+                model = "gemini-3.8-flash"
                 if "low" in ans_clean:
-                    effort = "low"
-                    budget = 1024
+                    effort, budget = "low", 1024
                 elif "high" in ans_clean:
-                    effort = "high"
-                    budget = 16384
+                    effort, budget = "high", 16384
                 else:
-                    effort = "medium"
-                    budget = 4096
-                self.active_model = "gemini-3.8-flash"
-                self.model_effort = effort
-                self.model_badge = f"gemini-3.8-flash ({effort})"
-                self.screen.set_model_badge(self.model_badge)
-                self._question_state = None
-                self.screen.set_question(None)
-                self.screen.set_status(f"✓ Active model: Gemini 3.8 Flash ({effort})", C_CYAN)
-                self._send_line("<<SET_MODEL>>" + json.dumps({
-                    "model": "gemini-3.8-flash",
-                    "effort": effort,
-                    "budget": budget
-                }))
-                turn = self.screen.new_turn("/models", is_system=True)
-                turn.ai_lines.append(f"✓ Switched active model to **Gemini 3.8 Flash** (effort: `{effort}`)")
-                self.screen.end_turn()
-                self.screen.redraw()
-                return
+                    effort, budget = "medium", 4096
+                badge = f"gemini-3.8-flash ({effort})"
+            elif "3.7" in ans_clean:
+                model = "gemini-3.7-flash"
+                if "low" in ans_clean:
+                    effort, budget = "low", 1024
+                elif "high" in ans_clean:
+                    effort, budget = "high", 16384
+                else:
+                    effort, budget = "medium", 4096
+                badge = f"gemini-3.7-flash ({effort})"
+            elif "3.5" in ans_clean:
+                if "lite" in ans_clean:
+                    model, effort, budget, badge = "gemini-3.5-flash-lite", "none", 0, "gemini-3.5-lite"
+                else:
+                    model, effort, budget, badge = "gemini-3.5-flash", "none", 0, "gemini-3.5-flash"
+            elif "3.6" in ans_clean:
+                model, effort, budget, badge = "gemini-3.6-flash", "none", 0, "gemini-3.6-flash"
+            elif "3.1" in ans_clean:
+                model, effort, budget, badge = "gemini-3.1-flash-lite", "none", 0, "gemini-3.1-lite"
             elif ans_clean in ("low", "medium", "high"):
+                model = "gemini-3.7-flash"
                 effort = ans_clean
                 budget_map = {"low": 1024, "medium": 4096, "high": 16384}
                 budget = budget_map[effort]
-                self.active_model = "gemini-3.8-flash"
-                self.model_effort = effort
-                self.model_badge = f"gemini-3.8-flash ({effort})"
-                self.screen.set_model_badge(self.model_badge)
-                self._question_state = None
-                self.screen.set_question(None)
-                self.screen.set_status(f"✓ Active model: Gemini 3.8 Flash ({effort})", C_CYAN)
-                self._send_line("<<SET_MODEL>>" + json.dumps({
-                    "model": "gemini-3.8-flash",
-                    "effort": effort,
-                    "budget": budget
-                }))
-                turn = self.screen.new_turn("/models", is_system=True)
-                turn.ai_lines.append(f"✓ Switched active model to **Gemini 3.8 Flash** (effort: `{effort}`)")
-                self.screen.end_turn()
-                self.screen.redraw()
-                return
+                badge = f"gemini-3.7-flash ({effort})"
+            else:
+                model, effort, budget, badge = "gemini-3.7-flash", "medium", 4096, "gemini-3.7-flash (medium)"
+
+            self.active_model = model
+            self.model_effort = effort
+            self.model_badge = badge
+            self.screen.set_model_badge(self.model_badge)
+            self._question_state = None
+            self.screen.set_question(None)
+            self.screen.set_status(f"✓ Active model: {badge}", C_CYAN)
+            self._send_line("<<SET_MODEL>>" + json.dumps({
+                "model": model,
+                "effort": effort,
+                "budget": budget
+            }))
+            turn = self.screen.new_turn("/models", is_system=True)
+            turn.ai_lines.append(f"✓ Switched active model to **{model}**" + (f" (effort: `{effort}`)" if effort != "none" else ""))
+            self.screen.end_turn()
+            self.screen.redraw()
+            return
 
         # Normal askUserQuestion handling
         if ans.strip().lower() == "skip":
