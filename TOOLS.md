@@ -1,4 +1,4 @@
-**TOOL SET A**
+**TOOL SET A (Implemented in Priya)**
 
 # IMPLEMENTED: AGENTJOB
 
@@ -238,80 +238,153 @@ Tasks help maintain clarity and progress across steps.
 - `ReadMcpResourceTool {uri, server?}` → `{server, uri, contents: [...]}`.
 - Available in Plan Mode.
 
-# COMING SOON
+# IMPLEMENTED: MONITOR
 
-- Monitor
-- PushNotification
-- RemoteTrigger
-- ReportFindings
-- ScheduleWakeup
-- SendMessage
-- SendUserFile
-- ShareOnboardingGuide
-- Skill
-- TaskOutput
-- TodoWrite (disabled by default, superseded by Task*)
-- ToolSearch
-- WaitForMcpServers
-- Workflow
+`Monitor` inspects active or background processes started by `bash {background: true}` or checks arbitrary OS PIDs.
+It reports running status, exit codes, and recent stdout/stderr log output.
+
+- `Monitor {process_id?, pid?, action?, lines?}` → `{process_id, pid, running, stdout_tail, stderr_tail, command}`.
+- `action`: `"status"`, `"logs"`, or `"kill"`.
+- `lines` defaults to 20.
+- Available in Plan Mode for inspection; kill action blocked in Plan Mode.
+
+# IMPLEMENTED: PUSHNOTIFICATION
+
+`PushNotification` sends a desktop notification or terminal alert to the user.
+
+- `PushNotification {title, message, urgency?}` → `{delivered, method, title, message}`.
+- Supports `notify-send` on Linux desktops and falls back to terminal OSC 9 / bell alerts.
+- Available in Plan Mode.
+
+# IMPLEMENTED: REMOTETRIGGER
+
+`RemoteTrigger` fires an HTTP request or webhook to external services, APIs, or local dev reload endpoints.
+
+- `RemoteTrigger {url, method?, headers?, data?, timeout_s?}` → `{url, method, status_code, body, elapsed_s}`.
+- `method` defaults to `"POST"`.
+
+# IMPLEMENTED: REPORTFINDINGS
+
+`ReportFindings` generates structured audit, testing, or research reports and writes them into `.priya/reports/`.
+
+- `ReportFindings {title, summary, findings: [{title, severity, description, file?, line?}], recommendations?}` → `{report_id, path, findings_count, title}`.
+- Formats markdown summary tables and severity breakdowns.
+- Available in Plan Mode.
+
+# IMPLEMENTED: SCHEDULEWAKEUP
+
+`ScheduleWakeup` schedules a one-shot delayed wakeup prompt or reminder that fires after a specified delay in seconds.
+
+- `ScheduleWakeup {delay_seconds, prompt}` → `{wakeup_id, delay_seconds, fire_time, prompt}`.
+- Asynchronously sleeps and submits the prompt to Priya's prompt queue upon timer expiry.
+
+# IMPLEMENTED: SENDMESSAGE
+
+`SendMessage` sends a message or steering instruction to a background subagent (`agentjob`) or presents an announcement to the user.
+
+- `SendMessage {target: 'agentjob'|'user', message, target_id?}` → `{delivered, target, message}`.
+- Available in Plan Mode for user messages.
+
+# IMPLEMENTED: SENDUSERFILE
+
+`SendUserFile` stages and exports a file from the workspace into `.priya/exports/` for the user to open, download, or review.
+
+- `SendUserFile {path, description?}` → `{path, export_path, filename, size_bytes, description}`.
+- Available in Plan Mode.
+
+# IMPLEMENTED: SHAREONBOARDINGGUIDE
+
+`ShareOnboardingGuide` analyzes the repository structure, config files, and build scripts to generate a beginner-friendly `ONBOARDING.md` guide.
+
+- `ShareOnboardingGuide {target_path?, save_to_file?}` → `{path, saved, detected_stack, guide}`.
+- Automatically discovers Node.js, Python, Rust, Go, Make, Docker, and other stacks.
+
+# IMPLEMENTED: SKILL
+
+`Skill` discovers, inspects, and executes custom project automation routines from `.priya/skills/`.
+
+- `Skill {action: 'list'|'get'|'run', skill_name?, args?}` → `{skills: [...]}` or execution output.
+- Execution blocked in Plan Mode.
+
+# IMPLEMENTED: TASKOUTPUT
+
+`TaskOutput` records and attaches deliverables, completion notes, and generated artifact file paths to a session task.
+
+- `TaskOutput {task_id, output, artifacts?}` → `{task_id, task}`.
+- Automatically transitions tasks from `pending`/`in_progress` to `completed`.
+- Available in Plan Mode.
+
+# IMPLEMENTED: TODOWRITE
+
+`TodoWrite` manages and persists a markdown task checklist (`TODO.md`) in the workspace.
+
+- `TodoWrite {todos: [{task, done}], path?, merge?}` → `{path, total, completed, pending}`.
+- Supports merging with existing checklist items.
+
+# IMPLEMENTED: TOOLSEARCH
+
+`ToolSearch` enables semantic and keyword discovery across all registered tools, descriptions, and parameters.
+
+- `ToolSearch {query}` → `{query, count, matches: [{name, description, parameters, score}]}`.
+- Available in Plan Mode.
+
+# IMPLEMENTED: WAITFORMCPSERVERS
+
+`WaitForMcpServers` waits for background Model Context Protocol (MCP) servers to complete initialization.
+
+- `WaitForMcpServers {timeout_s?}` → `{ready, servers, elapsed_s}`.
+- Available in Plan Mode.
+
+# IMPLEMENTED: WORKFLOW
+
+`Workflow` executes a sequence of automated tool steps in order, halting on error and returning structured step results.
+
+- `Workflow {action: 'run'|'status'|'list', steps?, workflow_id?}` → `{workflow_id, status, total_steps, completed_steps, step_results}`.
 
 
 
-**TOOL SET B**
+**TOOL SET B (Browser Automation - Candidate)**
 
-- browser_subagent (dispatcher)
-- browser_navigate / open_browser_url
-- read_browser_page
-- browser_click_element
-- browser_select_option
-- browser_press_key
-- browser_scroll
-- browser_scroll_up
-- browser_scroll_down
-- browser_resize_window
-- capture_browser_screenshot
-- execute_browser_javascript
-- list_browser_pages
-- browser_input
-- browser_get_dom
-- browser_move_mouse
-- click_browser_pixel
-- browser_drag_pixel_to_pixel
-- capture_browser_console_logs
+- `browser_subagent`: Autonomous browser task controller & dispatcher
+- `browser_navigate`: Navigate active page to URL
+- `read_browser_page`: Extract rendered markdown/text from live browser DOM
+- `browser_click_element`: Click DOM element by CSS selector or XPath
+- `browser_select_option`: Select option in dropdown element
+- `browser_input`: Type text into targeted input/textarea
+- `browser_press_key`: Send keyboard key events (Enter, Escape, Tab, Backspace)
+- `browser_scroll`: Scroll viewport or element by direction (`up`, `down`, `top`, `bottom`) and amount
+- `browser_resize_window`: Set browser viewport dimensions
+- `capture_browser_screenshot`: Capture viewport or full-page PNG screenshot
+- `execute_browser_javascript`: Execute JavaScript snippet within page context
+- `list_browser_pages`: List active browser tabs/contexts
+- `browser_get_dom`: Retrieve accessibility tree or structured DOM hierarchy
+- `browser_move_mouse`: Move mouse cursor to coordinate
+- `click_browser_pixel`: Click at exact (x, y) screen/viewport coordinates
+- `browser_drag_pixel_to_pixel`: Drag from start coordinate to end coordinate
+- `capture_browser_console_logs`: Stream and fetch browser console logs/errors
 
-**TOOL SET C**
+---
 
-**Files & code (5)**
-- `read_file`
-- `list_dir`
-- `glob_file_search`
-- `rg` (ripgrep search)
-- `git`
+**TOOL SET C (Advanced System, Multimodal & Swarms - Candidate)**
 
-**Editing (1)**
-- `apply_patch`
+*(Tools from Set A like `bash`, `Read`, `Glob`, `Grep`, `WebSearch`, `ToolSearch`, and task/plan updates are excluded to eliminate redundancy.)*
 
-**Execution (1)**
-- `shell_command`
+**Git & Patching (2)**
+- `git`: Structured Git repository operations (status, diff, commit, branch, checkout, log)
+- `apply_patch`: Apply unified diff / multi-file patch directly to workspace
 
-**Search/info (2)**
-- `web_search`
-- `tool_search`
+**Multimodal & Images (2)**
+- `view_image`: Inspect image metadata, dimensions, and encode for multimodal vision models
+- `image_gen`: Text-to-image synthesis and generation via external image model API
 
-**Images (2)**
-- `view_image`
-- `image_gen`
+**Multi-Agent Swarm & Orchestration (6 - IMPLEMENTED in Priya)**
+- `spawn_agent`: Launch independent background worker agent with role, prompt, and isolated context
+- `send_input`: Send steering message or payload to active background agent
+- `wait_agent`: Wait for agent completion or milestone event
+- `close_agent`: Stop and clean up an active agent instance
+- `resume_agent`: Resume paused or interrupted agent
+- `spawn_agents_on_csv`: Batch spawn parallel worker agents across CSV dataset rows
 
-**Planning (1)**
-- `update_plan`
+**Parallel Execution (1)**
+- `multi_tool_use.parallel`: Execute multiple independent tool calls simultaneously in parallel
 
-**Multi-agent orchestration (6)**
-- `spawn_agent`
-- `send_input`
-- `wait_agent`
-- `close_agent`
-- `resume_agent`
-- `spawn_agents_on_csv`
-
-**Parallel dispatch (1)**
-- `multi_tool_use.parallel`

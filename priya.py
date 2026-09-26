@@ -51,7 +51,7 @@ from pygments.formatters import TerminalTrueColorFormatter
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(DIR, "live_cli.py")
-MODEL_NAME = "mistral-medium-latest"
+MODEL_NAME = "magistral-medium-latest"
 VERSION = "v0.156.1"
 SENTINEL = object()
 
@@ -73,8 +73,8 @@ def hide_cursor(): return CSI + "?25l"
 def show_cursor(): return CSI + "?25h"
 def alt_screen():  return CSI + "?1049h"
 def main_screen(): return CSI + "?1049l"
-def enable_mouse():  return CSI + "?1000l" + CSI + "?1006l" + CSI + "?1007h" + CSI + "?2004h"
-def disable_mouse(): return CSI + "?1007l" + CSI + "?2004l"
+def enable_mouse():  return CSI + "?1000h" + CSI + "?1006h" + CSI + "?2004h"
+def disable_mouse(): return CSI + "?1006l" + CSI + "?1000l" + CSI + "?1007l" + CSI + "?2004l"
 def smcup():       return alt_screen()
 def rmcup():       return main_screen()
 
@@ -137,6 +137,20 @@ TOOL_COLORS = {
     "enterplanmode":        C_WARN,
     "exitplanmode":         C_WARN,
     "askuserquestion":      C_TOOL_Y,
+    "monitor":              C_WARN,
+    "pushnotification":     C_TOOL_Y,
+    "remotetrigger":        C_TOOL_B,
+    "reportfindings":       C_CYAN,
+    "schedulewakeup":       C_WARN,
+    "sendmessage":          C_TOOL_Y,
+    "senduserfile":         C_CYAN,
+    "shareonboardingguide": C_TOOL_P,
+    "skill":                C_HEAD,
+    "taskoutput":           C_TOOL_Y,
+    "todowrite":            C_TOOL_P,
+    "toolsearch":           C_CYAN,
+    "waitformcpservers":    C_TOOL,
+    "workflow":             C_HEAD,
 }
 
 COMMANDS = [
@@ -145,6 +159,7 @@ COMMANDS = [
     ("/diff", "Show git diff of unstaged changes"),
     ("/clear", "Clear conversation screen"),
     ("/tools", "List all available Priya tools"),
+    ("/models", "Switch active model (Mistral / Gemini 3.8 Flash)"),
     ("/model", "View active model information"),
     ("/history", "Browse command history"),
     ("/compact", "Toggle compact / expanded tool logs"),
@@ -373,6 +388,68 @@ def get_tool_summary(name, detail, result_text):
         if exit_code is not None and exit_code != 0:
             return f"Command exited with code {exit_code}."
         return None
+
+    elif act == "monitor":
+        pid = r.get("pid") or r.get("process_id")
+        alive = r.get("running")
+        st = "running" if alive else "stopped"
+        return f"Process {pid} ({st})." if pid else f"Checked {r.get('count', 0)} processes."
+
+    elif act == "pushnotification":
+        return f"Notification delivered: {r.get('title')}."
+
+    elif act == "remotetrigger":
+        code = r.get("status_code", 200)
+        s = r.get("elapsed_s", 0)
+        return f"Triggered HTTP {code} in {s}s."
+
+    elif act == "reportfindings":
+        count = r.get("findings_count", 0)
+        return f"Generated report ({count} {'finding' if count == 1 else 'findings'})."
+
+    elif act == "schedulewakeup":
+        s = r.get("delay_seconds", 0)
+        return f"Wakeup scheduled in {s}s."
+
+    elif act == "sendmessage":
+        return f"Message sent to {r.get('target', 'recipient')}."
+
+    elif act == "senduserfile":
+        fn = r.get("filename") or os.path.basename(r.get("path", "file"))
+        kb = round(r.get("size_bytes", 0) / 1024, 1)
+        return f"Exported {fn} ({kb} KB)."
+
+    elif act == "shareonboardingguide":
+        p = format_path(r.get("path", "ONBOARDING.md"))
+        return f"Created onboarding guide ({p})."
+
+    elif act == "skill":
+        if "skills" in r:
+            return f"Found {r.get('count', len(r['skills']))} skills."
+        return f"Executed {r.get('skill', 'skill')} (exit {r.get('exit_code', 0)})."
+
+    elif act == "taskoutput":
+        return f"Recorded output for {r.get('task_id', 'task')}."
+
+    elif act == "todowrite":
+        total = r.get("total", 0)
+        comp = r.get("completed", 0)
+        return f"Saved {total} todos ({comp} completed)."
+
+    elif act == "toolsearch":
+        count = r.get("count", len(r.get("matches", [])))
+        return f"Found {count} matching {'tool' if count == 1 else 'tools'}."
+
+    elif act == "waitformcpservers":
+        ready = "ready" if r.get("ready") else "timed out"
+        return f"MCP servers {ready}."
+
+    elif act == "workflow":
+        wid = r.get("workflow_id", "workflow")
+        st = r.get("status", "done")
+        steps = r.get("completed_steps", 0)
+        total = r.get("total_steps", steps)
+        return f"Workflow {wid} ({st}, {steps}/{total} steps)."
 
     return None
 
@@ -761,6 +838,7 @@ class Screen:
         self.thinking_start = 0.0
         self.compact_mode = True
         self.history_badge = ""
+        self.model_badge = "mistral-medium"
         self.plan_mode = False
 
         self.active_tool_name = ""
@@ -776,12 +854,18 @@ class Screen:
 
         self._question_state = None
         self._edit_state = None
+        self.suggestion_index = 0
         self._git_branch = None
         self._git_check = 0.0
 
         self._lock = threading.RLock()
         self._write(smcup() + enable_mouse() + hide_cursor() + BG_MAIN + ed(2))
         self._update_size()
+
+    def set_model_badge(self, badge):
+        with self._lock:
+            self.model_badge = badge
+            self._cache_dirty = True
 
     def _write(self, s):
         sys.stdout.write(s)
@@ -901,6 +985,26 @@ class Screen:
                 "listmcpresourcestool": "listing mcp",
                 "readmcpresourcetool": "reading mcp",
                 "askuserquestion": "asking question",
+                "monitor": "monitoring process",
+                "pushnotification": "pushing notification",
+                "remotetrigger": "triggering webhook",
+                "reportfindings": "generating report",
+                "schedulewakeup": "scheduling wakeup",
+                "sendmessage": "sending message",
+                "senduserfile": "exporting file",
+                "shareonboardingguide": "generating guide",
+                "skill": "running skill",
+                "taskoutput": "saving task output",
+                "todowrite": "updating todos",
+                "toolsearch": "searching tools",
+                "waitformcpservers": "waiting for mcp",
+                "workflow": "running workflow",
+                "spawn_agent": "spawning agent",
+                "send_input": "sending input",
+                "wait_agent": "waiting for agent",
+                "close_agent": "closing agent",
+                "resume_agent": "resuming agent",
+                "spawn_agents_on_csv": "batch spawning agents",
             }
             action_label = desc_map.get(act, f"{self.active_tool_name} running")
             detail_trunc = truncate(self.active_tool_detail, 32) if self.active_tool_detail else ""
@@ -912,11 +1016,16 @@ class Screen:
 
         elif self.busy:
             dur = time.time() - self.thinking_start if self.thinking_start else 0.0
+            scroll_hint = f" [+{self.scroll_offset}]" if self.scroll_offset > 0 else ""
             if self.active_thinking:
                 snippet = truncate(self.active_thinking, 32)
-                left_st = f"  {spinner_f} thinking: {snippet} ({dur:.1f}s)"
+                left_st = f"  {spinner_f} thinking: {snippet} ({dur:.1f}s){scroll_hint}"
             else:
-                left_st = f"  {spinner_f} Generating… ({dur:.1f}s)"
+                left_st = f"  {spinner_f} Generating… ({dur:.1f}s){scroll_hint}"
+            st_color = C_CYAN
+
+        elif self.scroll_offset > 0:
+            left_st = f"  ↑ scrolled +{self.scroll_offset} lines  │  press ↓ to return"
             st_color = C_CYAN
 
         elif self.status_text and self.status_text.strip() != "ready":
@@ -927,7 +1036,7 @@ class Screen:
             st_color = C_READY
 
         plan_str = "  │  PLAN MODE" if (self.plan_mode and left_st) else ("  PLAN MODE" if self.plan_mode else "")
-        right_st = f"mistral-medium  │  /help  "
+        right_st = f"{self.model_badge}  │  /help  "
         st_content = f"{left_st}{plan_str}"
         pad = max(1, max_line_w - vis_len(st_content) - len(right_st))
         full_status = f"{st_color}{st_content}{RESET}{' ' * pad}{C_DIM}{right_st}{RESET}"
@@ -970,7 +1079,7 @@ class Screen:
             )
         elif self.input_text.startswith("/"):
             matched = [c[0] for c in COMMANDS if c[0].startswith(self.input_text.lower())]
-            hint_text = "  ".join(matched[:5]) + " (Tab autocomplete)"
+            hint_text = "↑/↓ iterate • Enter complete"
             hint_pad  = max(0, max_line_w - len(hint_text))
             buf.append(
                 cup(border_bot_row, 1) + el() + BG_MAIN
@@ -980,6 +1089,97 @@ class Screen:
             )
         else:
             buf.append(cup(border_bot_row, 1) + el() + BG_MAIN + border)
+
+        # ── Bottom-Left Dropdown Overlay (above status / input bar) ───
+        if self._question_state:
+            qs = self._question_state
+            header = qs.get("header") or "Select Option"
+            q_idx = qs.get("index", 0)
+            questions_list = qs.get("questions", [])
+            curr_q = questions_list[q_idx] if q_idx < len(questions_list) else {}
+            q_text = curr_q.get("question", "")
+            opts = curr_q.get("options", [])
+            sel_idx = qs.get("selected_option", 0)
+
+            box_w = min(max_line_w - 4, 76)
+            content_w = max(10, box_w - 4)
+
+            drop_lines = []
+            total_q = len(questions_list)
+            step_str = f" [Step {q_idx + 1}/{total_q}]" if total_q > 1 else ""
+            title_text = f"┌─ {header}{step_str} "
+            drop_lines.append(C_BORDER + title_text + "─" * max(0, box_w - vis_len(title_text) - 1) + "┐" + RESET)
+            if q_text:
+                q_disp = fit_line(q_text, content_w)
+                q_pad = " " * max(0, content_w - vis_len(q_disp))
+                drop_lines.append(C_BORDER + "│ " + RESET + C_AI + q_disp + RESET + q_pad + C_BORDER + " │" + RESET)
+                drop_lines.append(C_BORDER + "├" + "─" * (box_w - 2) + "┤" + RESET)
+
+            for i, opt in enumerate(opts):
+                is_sel = (i == sel_idx)
+                lbl = opt.get("label", "")
+                desc = opt.get("description", "")
+                if is_sel:
+                    opt_str = f"❯ [{i + 1}] {lbl}"
+                    opt_disp = fit_line(opt_str, content_w)
+                    opt_pad = " " * max(0, content_w - vis_len(opt_disp))
+                    drop_lines.append(C_BORDER + "│ " + RESET + BOLD + C_TOOL_Y + opt_disp + RESET + opt_pad + C_BORDER + " │" + RESET)
+                    if desc:
+                        d_disp = fit_line(desc, max(1, content_w - 4))
+                        d_pad = " " * max(0, content_w - 4 - vis_len(d_disp))
+                        drop_lines.append(C_BORDER + "│     " + RESET + C_USER + d_disp + RESET + d_pad + C_BORDER + " │" + RESET)
+                else:
+                    opt_str = f"  [{i + 1}] {lbl}"
+                    opt_disp = fit_line(opt_str, content_w)
+                    opt_pad = " " * max(0, content_w - vis_len(opt_disp))
+                    drop_lines.append(C_BORDER + "│ " + RESET + C_DIM + opt_disp + RESET + opt_pad + C_BORDER + " │" + RESET)
+                    if desc:
+                        d_disp = fit_line(desc, max(1, content_w - 4))
+                        d_pad = " " * max(0, content_w - 4 - vis_len(d_disp))
+                        drop_lines.append(C_BORDER + "│     " + RESET + C_DIM + d_disp + RESET + d_pad + C_BORDER + " │" + RESET)
+
+            foot_text = "└─ [↑/↓] iterate • [Enter] confirm • [s] skip • [Esc] cancel "
+            drop_lines.append(C_BORDER + foot_text + "─" * max(0, box_w - vis_len(foot_text) - 1) + "┘" + RESET)
+
+            box_h = len(drop_lines)
+            start_row = max(1, status_row - box_h)
+            start_col = 2
+            for idx, d_line in enumerate(drop_lines):
+                if start_row + idx < status_row:
+                    buf.append(cup(start_row + idx, start_col) + BG_MAIN + d_line)
+
+        elif self.input_text.startswith("/"):
+            matched = [c for c in COMMANDS if c[0].startswith(self.input_text.lower())]
+            if matched:
+                box_w = min(max_line_w - 4, 76)
+                content_w = max(10, box_w - 4)
+                drop_lines = []
+                title_text = "┌─ Commands "
+                drop_lines.append(C_BORDER + title_text + "─" * max(0, box_w - vis_len(title_text) - 1) + "┐" + RESET)
+
+                sel = getattr(self, "suggestion_index", 0) % len(matched)
+                for i, (cmd_name, cmd_desc) in enumerate(matched[:8]):
+                    is_sel = (i == sel)
+                    if is_sel:
+                        cmd_str = f"❯ {cmd_name:<9} {cmd_desc}"
+                        c_disp = fit_line(cmd_str, content_w)
+                        c_pad = " " * max(0, content_w - vis_len(c_disp))
+                        drop_lines.append(C_BORDER + "│ " + RESET + BOLD + C_CYAN + c_disp + RESET + c_pad + C_BORDER + " │" + RESET)
+                    else:
+                        cmd_str = f"  {cmd_name:<9} {cmd_desc}"
+                        c_disp = fit_line(cmd_str, content_w)
+                        c_pad = " " * max(0, content_w - vis_len(c_disp))
+                        drop_lines.append(C_BORDER + "│ " + RESET + C_DIM + c_disp + RESET + c_pad + C_BORDER + " │" + RESET)
+
+                foot_text = "└─ [↑/↓] iterate • [Enter] complete "
+                drop_lines.append(C_BORDER + foot_text + "─" * max(0, box_w - vis_len(foot_text) - 1) + "┘" + RESET)
+
+                box_h = len(drop_lines)
+                start_row = max(1, status_row - box_h)
+                start_col = 2
+                for idx, d_line in enumerate(drop_lines):
+                    if start_row + idx < status_row:
+                        buf.append(cup(start_row + idx, start_col) + BG_MAIN + d_line)
 
         # Position cursor at target column and only then reveal it
         cursor_col = 3 + min(self.input_cursor, max_input)
@@ -1199,36 +1399,6 @@ class Screen:
 
             if getattr(turn, "interrupted", False):
                 lines.append(f"  {C_DIM}interrupted{RESET}")
-                lines.append("")
-
-            # Interactive Question State
-            if turn is self.cur_turn and self._question_state:
-                qs = self._question_state
-                q = qs["questions"][qs["index"]]
-                lines.append("  " + C_TOOL_Y + BOLD + "? " + q.get("header","") + RESET)
-                lines.append("  " + C_AI + q["question"] + RESET)
-                typed_custom = self.input_text.strip()
-                opts = q.get("options", [])
-                sel_idx = qs.get("selected_option", 0)
-                if typed_custom:
-                    for i, opt in enumerate(opts):
-                        if opt.get("custom"):
-                            sel_idx = i
-                            break
-                for i, opt in enumerate(opts):
-                    is_sel = (i == sel_idx)
-                    is_custom = opt.get("custom", False)
-                    cursor = f"{BOLD}{C_TOOL_Y}❯{RESET} " if is_sel else "  "
-                    num = f"[{i + 1}]"
-                    lbl = opt.get("label", "")
-                    desc = opt.get("description", "")
-                    if is_custom and typed_custom:
-                        desc = f'"{typed_custom}"'
-                    if is_sel:
-                        lines.append(f"    {cursor}{BOLD}{C_TOOL_Y}{num} {lbl}{RESET} — {C_USER}{desc}{RESET} {C_TOOL_Y}(selected){RESET}")
-                    else:
-                        lines.append(f"    {cursor}{C_DIM}{num}{RESET} {C_AI}{lbl}{RESET} — {C_DIM}{desc}{RESET}")
-                lines.append("  " + C_DIM + "↑/↓ select • 1-9 choose • or type custom answer below ↓" + RESET)
                 lines.append("")
 
             # Interactive Edit approval
@@ -1511,7 +1681,12 @@ def read_key(fd):
             m = re.match(rb"^\x1b\[<(\d+);(\d+);(\d+)([Mm])", seq)
             if m:
                 cb = int(m.group(1))
-                if cb == 64:
+                if cb & 64:
+                    if (cb & 3) == 0:
+                        return "WHEEL_UP"
+                    elif (cb & 3) == 1:
+                        return "WHEEL_DOWN"
+                elif cb == 64:
                     return "WHEEL_UP"
                 elif cb == 65:
                     return "WHEEL_DOWN"
@@ -1520,9 +1695,15 @@ def read_key(fd):
         # Standard X10/X11 mouse event: \x1b[M cb cx cy
         if seq.startswith(b"\x1b[M") and len(seq) >= 6:
             cb = seq[3]
-            if cb == 96:
+            cb_val = cb - 32 if cb >= 32 else cb
+            if cb_val & 64:
+                if (cb_val & 3) == 0:
+                    return "WHEEL_UP"
+                elif (cb_val & 3) == 1:
+                    return "WHEEL_DOWN"
+            elif cb in (96, 64):
                 return "WHEEL_UP"
-            elif cb == 97:
+            elif cb in (97, 65):
                 return "WHEEL_DOWN"
             return "MOUSE_EVENT"
 
@@ -1596,6 +1777,12 @@ class PriyaApp:
         self.history = []
         self.history_index = -1
         self.saved_input = ""
+        self.suggestion_index = 0
+
+        # Model configuration
+        self.active_model = "mistral-medium-latest"
+        self.model_effort = "medium"
+        self.model_badge = "mistral-medium"
 
     def start(self):
         self._start_worker()
@@ -1714,6 +1901,16 @@ class PriyaApp:
                                 "description": "Type your own custom answer",
                                 "custom": True,
                             })
+                        has_skip = any(
+                            o.get("label", "").lower() in ("skip", "skip (continue)") or o.get("skip")
+                            for o in opts
+                        )
+                        if not has_skip:
+                            opts.append({
+                                "label": "Skip",
+                                "description": "Skip (continue without answering)",
+                                "skip": True,
+                            })
                     self._question_state = {
                         "id": p["id"],
                         "questions": p["questions"],
@@ -1722,7 +1919,7 @@ class PriyaApp:
                         "selected_option": 0,
                     }
                     self.screen.set_question(self._question_state)
-                    self.screen.set_status("? Waiting for your answer", C_TOOL_Y)
+                    self.screen.set_status("? Waiting for your answer (press 's' to skip)", C_TOOL_Y)
                     self.screen.redraw()
                 except Exception:
                     pass
@@ -1816,9 +2013,11 @@ class PriyaApp:
             if s.input_text.startswith("/"):
                 matched = [c[0] for c in COMMANDS if c[0].startswith(s.input_text.lower())]
                 if matched:
+                    chosen = matched[self.suggestion_index % len(matched)]
                     with s._lock:
-                        s.input_text = matched[0]
+                        s.input_text = chosen
                         s.input_cursor = len(s.input_text)
+                        s._cache_dirty = True
                     s.redraw()
                     return
             s.toggle_tool_expand()
@@ -1881,36 +2080,53 @@ class PriyaApp:
                 s.redraw()
                 return
 
-            if key == "CTRL_P" or self.history_index != -1:
-                if self.history:
-                    if self.history_index == -1:
-                        self.saved_input = s.input_text
-                        self.history_index = len(self.history) - 1
-                    elif self.history_index > 0:
-                        self.history_index -= 1
+            if s.input_text.startswith("/"):
+                matched = [c for c in COMMANDS if c[0].startswith(s.input_text.lower())]
+                if matched:
+                    self.suggestion_index = (self.suggestion_index - 1) % len(matched)
+                    with s._lock:
+                        s.suggestion_index = self.suggestion_index
+                        s._cache_dirty = True
+                    s.redraw()
+                    return
 
-                    if 0 <= self.history_index < len(self.history):
-                        with s._lock:
-                            s.input_text = self.history[self.history_index]
-                            s.input_cursor = len(s.input_text)
-                            s.history_badge = f"history {self.history_index + 1}/{len(self.history)}"
-                            s._cache_dirty = True
-                        s.redraw()
-                        return
-
-            lines = s._get_lines()
-            if len(lines) > s._convo_h or s.scroll_offset > 0:
+            # If user has scrolled up, UP arrow scrolls conversation further up
+            if s.scroll_offset > 0:
                 s.scroll_up(3)
                 s.redraw()
                 return
-            elif self.history and not s.busy:
-                self.saved_input = s.input_text
-                self.history_index = len(self.history) - 1
-                with s._lock:
-                    s.input_text = self.history[self.history_index]
-                    s.input_cursor = len(s.input_text)
-                    s.history_badge = f"history {self.history_index + 1}/{len(self.history)}"
-                    s._cache_dirty = True
+
+            # If busy generating, UP arrow scrolls conversation
+            if self._busy or s.busy:
+                s.scroll_up(3)
+                s.redraw()
+                return
+
+            if self.history:
+                if self.history_index == -1:
+                    self.saved_input = s.input_text
+                    self.history_index = len(self.history) - 1
+                elif self.history_index > 0:
+                    self.history_index -= 1
+                elif self.history_index == 0:
+                    lines = s._get_lines()
+                    if len(lines) > s._convo_h:
+                        s.scroll_up(3)
+                        s.redraw()
+                        return
+
+                if 0 <= self.history_index < len(self.history):
+                    with s._lock:
+                        s.input_text = self.history[self.history_index]
+                        s.input_cursor = len(s.input_text)
+                        s.history_badge = f"history {self.history_index + 1}/{len(self.history)}"
+                        s._cache_dirty = True
+                    s.redraw()
+                    return
+
+            lines = s._get_lines()
+            if len(lines) > s._convo_h:
+                s.scroll_up(3)
                 s.redraw()
                 return
 
@@ -1922,6 +2138,28 @@ class PriyaApp:
                 with s._lock:
                     qs["selected_option"] = min(len(opts) - 1, qs.get("selected_option", 0) + 1)
                     s._cache_dirty = True
+                s.redraw()
+                return
+
+            if s.input_text.startswith("/"):
+                matched = [c for c in COMMANDS if c[0].startswith(s.input_text.lower())]
+                if matched:
+                    self.suggestion_index = (self.suggestion_index + 1) % len(matched)
+                    with s._lock:
+                        s.suggestion_index = self.suggestion_index
+                        s._cache_dirty = True
+                    s.redraw()
+                    return
+
+            # If user has scrolled up, DOWN arrow scrolls down towards latest lines
+            if s.scroll_offset > 0:
+                s.scroll_down(3)
+                s.redraw()
+                return
+
+            # If busy generating, DOWN arrow scrolls conversation
+            if self._busy or s.busy:
+                s.scroll_down(3)
                 s.redraw()
                 return
 
@@ -1943,10 +2181,6 @@ class PriyaApp:
                 s.redraw()
                 return
 
-            s.scroll_down(3)
-            s.redraw()
-            return
-
         if key == "ESC":
             if self._edit_state:
                 self._submit_edit_approval(False)
@@ -1954,8 +2188,21 @@ class PriyaApp:
             if self._question_state:
                 self._cancel_question()
                 return
+            if s.input_text.startswith("/"):
+                s.input_clear()
+                self.history_index = -1
+                self.suggestion_index = 0
+                with s._lock:
+                    s.suggestion_index = 0
+                    s._cache_dirty = True
+                s.redraw()
+                return
             if self._busy:
                 self._do_interrupt()
+                return
+            if s.scroll_offset > 0:
+                s.scroll_offset = 0
+                s.redraw()
                 return
             if s.input_text:
                 s.input_clear()
@@ -1966,6 +2213,10 @@ class PriyaApp:
         if key == "CTRL_U":
             s.input_clear()
             self.history_index = -1
+            self.suggestion_index = 0
+            with s._lock:
+                s.suggestion_index = 0
+                s._cache_dirty = True
             s.redraw()
             return
 
@@ -1991,10 +2242,31 @@ class PriyaApp:
 
         if key == "BACKSPACE":
             s.input_backspace()
+            self.suggestion_index = 0
+            with s._lock:
+                s.suggestion_index = 0
+                s._cache_dirty = True
             s.redraw()
             return
 
         if key == "ENTER":
+            if self._question_state:
+                self._do_submit()
+                return
+
+            if s.input_text.startswith("/"):
+                matched = [c for c in COMMANDS if c[0].startswith(s.input_text.lower())]
+                if matched:
+                    chosen = matched[self.suggestion_index % len(matched)][0]
+                    s.input_clear()
+                    self.history_index = -1
+                    self.suggestion_index = 0
+                    with s._lock:
+                        s.suggestion_index = 0
+                        s._cache_dirty = True
+                    self._execute_slash_command(chosen)
+                    return
+
             self._do_submit()
             return
 
@@ -2027,6 +2299,10 @@ class PriyaApp:
                     s.redraw()
                     return
 
+        if self._question_state and not s.input_text and key.lower() == "s":
+            self._skip_question()
+            return
+
         if self._edit_state and not s.input_text:
             if key in ("y", "Y"):
                 self._submit_edit_approval(True)
@@ -2037,8 +2313,49 @@ class PriyaApp:
 
         if len(key) == 1 and key.isprintable():
             s.input_insert(key)
+            self.suggestion_index = 0
+            with s._lock:
+                s.suggestion_index = 0
+                s._cache_dirty = True
             s.redraw()
             return
+
+    def _execute_slash_command(self, text):
+        cmd = text.split()[0].lower()
+        if cmd == "/help":
+            self._handle_cmd_help()
+            return True
+        elif cmd == "/clear":
+            self._handle_cmd_clear()
+            return True
+        elif cmd == "/status":
+            self._handle_cmd_status()
+            return True
+        elif cmd == "/diff":
+            self._handle_cmd_diff()
+            return True
+        elif cmd == "/tools":
+            self._handle_cmd_tools()
+            return True
+        elif cmd == "/models":
+            self._handle_cmd_models()
+            return True
+        elif cmd == "/model":
+            self._handle_cmd_model()
+            return True
+        elif cmd == "/history":
+            self._handle_cmd_history()
+            return True
+        elif cmd == "/compact":
+            self.screen.toggle_tool_expand()
+            mode = "compact" if self.screen.compact_mode else "expanded"
+            self.screen.set_status(f"tool logs set to {mode}", C_OK)
+            self.screen.redraw()
+            return True
+        elif cmd in ("/exit", "/quit", "q"):
+            self._running = False
+            return True
+        return False
 
     def _do_submit(self):
         if self._question_state is not None:
@@ -2055,7 +2372,14 @@ class PriyaApp:
                 self.screen.redraw()
                 return
             else:
-                ans = opts[sel_idx]["label"] if opts else ""
+                if 0 <= sel_idx < len(opts):
+                    opt = opts[sel_idx]
+                    if opt.get("skip") or opt.get("label", "").lower() == "skip":
+                        self._skip_question()
+                        return
+                    ans = opt["label"]
+                else:
+                    ans = ""
             self._submit_question_answer(ans)
             return
 
@@ -2083,37 +2407,9 @@ class PriyaApp:
         self.saved_input = ""
 
         # Slash Commands
-        cmd = text.split()[0].lower()
-        if cmd == "/help":
-            self._handle_cmd_help()
-            return
-        elif cmd == "/clear":
-            self._handle_cmd_clear()
-            return
-        elif cmd == "/status":
-            self._handle_cmd_status()
-            return
-        elif cmd == "/diff":
-            self._handle_cmd_diff()
-            return
-        elif cmd == "/tools":
-            self._handle_cmd_tools()
-            return
-        elif cmd == "/model":
-            self._handle_cmd_model()
-            return
-        elif cmd == "/history":
-            self._handle_cmd_history()
-            return
-        elif cmd == "/compact":
-            self.screen.toggle_tool_expand()
-            mode = "compact" if self.screen.compact_mode else "expanded"
-            self.screen.set_status(f"tool logs set to {mode}", C_OK)
-            self.screen.redraw()
-            return
-        elif cmd in ("/exit", "/quit", "q"):
-            self._running = False
-            return
+        if text.startswith("/"):
+            if self._execute_slash_command(text):
+                return
 
         # Normal prompt to worker
         self._busy = True
@@ -2138,6 +2434,7 @@ class PriyaApp:
 | `/clear` | Clear conversation history |
 | `/tools` | List all 14 tools & descriptions |
 | `/model` | Active model information |
+| `/models` | Switch model (Mistral / Gemini 3.8 Flash) |
 | `/history` | Recent prompt history |
 | `/compact` | Toggle tool logs compact mode |
 | `/exit` | Exit Priya |
@@ -2220,6 +2517,20 @@ class PriyaApp:
 | `ExitPlanMode` | Resume change execution |
 | `CronCreate` | Schedule session prompts |
 | `CronList` | List scheduled cron jobs |
+| `Monitor` | Inspect background processes, logs & PID status |
+| `PushNotification`| Send desktop or terminal alert notification |
+| `RemoteTrigger` | Trigger HTTP webhooks or remote endpoints |
+| `ReportFindings` | Save structured research and audit reports |
+| `ScheduleWakeup` | One-shot delayed timer / wakeup alert |
+| `SendMessage` | Steer agentjob or broadcast message |
+| `SendUserFile` | Export and stage workspace file for user |
+| `ShareOnboardingGuide`| Generate repository ONBOARDING.md guide |
+| `Skill` | Execute or list project automation skills |
+| `TaskOutput` | Attach outputs and artifacts to tasks |
+| `TodoWrite` | Manage markdown task checklist (TODO.md) |
+| `ToolSearch` | Discover and search available tools |
+| `WaitForMcpServers`| Wait for MCP server initializations |
+| `Workflow` | Execute multi-step sequential tool workflows |
 """
         turn.ai_lines.append(tools_md.strip())
         self.screen.end_turn()
@@ -2227,15 +2538,57 @@ class PriyaApp:
 
     def _handle_cmd_model(self):
         turn = self.screen.new_turn("/model", is_system=True)
+        effort_s = f"\n- **Thinking Effort**: `{self.model_effort}`" if self.active_model.startswith("gemini") else ""
         model_md = f"""
 ### Model Info
 
-- **Model**: {MODEL_NAME}
+- **Active Model**: `{self.active_model}`{effort_s}
+- **Status Badge**: `{self.model_badge}`
 - **Worker**: `live_cli.py` (asyncio event loop)
-- **Protocol**: Framing `<<TOOL_*>>`, `<<ASK_*>>`, `<<EDIT_*>>`
+- **Protocol**: Framing `<<TOOL_*>>`, `<<ASK_*>>`, `<<EDIT_*>>`, `<<SET_MODEL>>`
+
+Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
 """
         turn.ai_lines.append(model_md.strip())
         self.screen.end_turn()
+        self.screen.redraw()
+
+    def _handle_cmd_models(self):
+        cur_sel = 0
+        if self.active_model == "mistral-medium-latest":
+            cur_sel = 0
+        elif self.active_model.startswith("gemini"):
+            effort = getattr(self, "model_effort", "medium")
+            if effort == "low":
+                cur_sel = 2
+            elif effort == "high":
+                cur_sel = 3
+            else:
+                cur_sel = 1
+
+        qs = {
+            "id": "model_select_1",
+            "header": "Select Active Model & Config",
+            "questions": [{
+                "header": "Active Model",
+                "question": "Choose AI model and reasoning effort:",
+                "options": [
+                    {"label": "mistral-medium-latest", "description": "Mistral Large reasoning & tool execution (fast, no extra config)"},
+                    {"label": "Gemini 3.8 Flash (medium - Recommended)", "description": "Google GenAI 4,096 tokens thinking budget — Balanced reasoning"},
+                    {"label": "Gemini 3.8 Flash (low)", "description": "Google GenAI 1,024 tokens thinking budget — Fast, low latency"},
+                    {"label": "Gemini 3.8 Flash (high)", "description": "Google GenAI 16,384 tokens thinking budget — Deep extended reasoning"},
+                    {"label": "Skip", "description": "Keep current model unchanged", "skip": True},
+                ]
+            }],
+            "index": 0,
+            "answers": [],
+            "selected_option": cur_sel,
+            "is_model_picker": True,
+            "step": 1,
+        }
+        self._question_state = qs
+        self.screen.set_question(qs)
+        self.screen.set_status("Select model: ↑/↓ choose • Enter confirm • 's' or Esc cancel", C_TOOL_Y)
         self.screen.redraw()
 
     def _handle_cmd_history(self):
@@ -2265,7 +2618,11 @@ class PriyaApp:
         sel_idx = qs.get("selected_option", 0)
         opts = q.get("options", [])
         if 0 <= sel_idx < len(opts):
-            if opts[sel_idx].get("custom"):
+            opt = opts[sel_idx]
+            if opt.get("skip") or opt.get("label", "").lower() == "skip":
+                self._skip_question()
+                return
+            if opt.get("custom"):
                 text = self.screen.take_input().strip()
                 if not text:
                     self.screen.set_status("Please type your custom answer and press Enter", C_WARN)
@@ -2273,33 +2630,146 @@ class PriyaApp:
                     return
                 self._submit_question_answer(text)
                 return
-            ans = opts[sel_idx]["label"]
+            ans = opt["label"]
             self._submit_question_answer(ans)
 
     def _submit_question_answer(self, ans):
         qs = self._question_state
         if not qs:
             return
+
+        if qs.get("is_model_picker"):
+            ans_clean = ans.strip().lower()
+            if ans_clean == "skip":
+                self._skip_question()
+                return
+
+            if "mistral" in ans_clean:
+                self.active_model = "mistral-medium-latest"
+                self.model_effort = "none"
+                self.model_badge = "mistral-medium"
+                self.screen.set_model_badge(self.model_badge)
+                self._question_state = None
+                self.screen.set_question(None)
+                self.screen.set_status(f"✓ Active model: {self.active_model}", C_CYAN)
+                self._send_line("<<SET_MODEL>>" + json.dumps({"model": "mistral-medium-latest"}))
+                turn = self.screen.new_turn("/models", is_system=True)
+                turn.ai_lines.append("✓ Switched active model to **mistral-medium-latest**")
+                self.screen.end_turn()
+                self.screen.redraw()
+                return
+            elif "gemini" in ans_clean:
+                if "low" in ans_clean:
+                    effort = "low"
+                    budget = 1024
+                elif "high" in ans_clean:
+                    effort = "high"
+                    budget = 16384
+                else:
+                    effort = "medium"
+                    budget = 4096
+                self.active_model = "gemini-3.8-flash"
+                self.model_effort = effort
+                self.model_badge = f"gemini-3.8-flash ({effort})"
+                self.screen.set_model_badge(self.model_badge)
+                self._question_state = None
+                self.screen.set_question(None)
+                self.screen.set_status(f"✓ Active model: Gemini 3.8 Flash ({effort})", C_CYAN)
+                self._send_line("<<SET_MODEL>>" + json.dumps({
+                    "model": "gemini-3.8-flash",
+                    "effort": effort,
+                    "budget": budget
+                }))
+                turn = self.screen.new_turn("/models", is_system=True)
+                turn.ai_lines.append(f"✓ Switched active model to **Gemini 3.8 Flash** (effort: `{effort}`)")
+                self.screen.end_turn()
+                self.screen.redraw()
+                return
+            elif ans_clean in ("low", "medium", "high"):
+                effort = ans_clean
+                budget_map = {"low": 1024, "medium": 4096, "high": 16384}
+                budget = budget_map[effort]
+                self.active_model = "gemini-3.8-flash"
+                self.model_effort = effort
+                self.model_badge = f"gemini-3.8-flash ({effort})"
+                self.screen.set_model_badge(self.model_badge)
+                self._question_state = None
+                self.screen.set_question(None)
+                self.screen.set_status(f"✓ Active model: Gemini 3.8 Flash ({effort})", C_CYAN)
+                self._send_line("<<SET_MODEL>>" + json.dumps({
+                    "model": "gemini-3.8-flash",
+                    "effort": effort,
+                    "budget": budget
+                }))
+                turn = self.screen.new_turn("/models", is_system=True)
+                turn.ai_lines.append(f"✓ Switched active model to **Gemini 3.8 Flash** (effort: `{effort}`)")
+                self.screen.end_turn()
+                self.screen.redraw()
+                return
+
+        # Normal askUserQuestion handling
+        if ans.strip().lower() == "skip":
+            self._skip_question()
+            return
+
         qs["answers"].append(ans)
+        curr_q = qs["questions"][qs["index"]]
+        q_text = curr_q.get("question", "")
+
+        # Log selection into the active tool node so the choice is recorded in conversation
+        if self.screen.cur_turn:
+            for tid, node in list(self.screen.cur_turn.tool_nodes.items()):
+                if node.name == "askUserQuestion" and not node.done:
+                    self.screen.append_tool_log(tid, "stdout", f"? {q_text}\n✓ {ans}")
+
         qs["index"] += 1
         qs["selected_option"] = 0
         if qs["index"] < len(qs["questions"]):
             self.screen.set_question(qs)
+            self.screen.set_status(f"? Question {qs['index'] + 1}/{len(qs['questions'])}", C_TOOL_Y)
         else:
             payload = {"id": qs["id"], "answers": qs["answers"]}
             self._question_state = None
             self.screen.set_question(None)
+            self.screen.set_status(f"✓ Selected: {ans} — continuing…", C_CYAN)
             self._send_line("<<ASK_USER_ANSWER>>" + json.dumps(payload))
         self.screen.redraw()
 
     def _cancel_question(self):
         if not self._question_state:
             return
+        if self._question_state.get("is_model_picker"):
+            self._question_state = None
+            self.screen.set_question(None)
+            self.screen.set_status(f"✓ Active model kept: {self.active_model}", C_DIM)
+            self.screen.redraw()
+            return
         payload = {"id": self._question_state["id"], "cancelled": True}
         self._question_state = None
         self.screen.set_question(None)
+        self.screen.set_status("⊘ Question cancelled", C_DIM)
         self._send_line("<<ASK_USER_ANSWER>>" + json.dumps(payload))
-        self.screen.set_status("question cancelled", C_DIM)
+        self.screen.redraw()
+
+    def _skip_question(self):
+        if not self._question_state:
+            return
+        if self._question_state.get("is_model_picker"):
+            self._question_state = None
+            self.screen.set_question(None)
+            self.screen.set_status(f"✓ Active model kept: {self.active_model}", C_DIM)
+            self.screen.redraw()
+            return
+        qs = self._question_state
+        payload = {
+            "id": qs["id"],
+            "answers": qs.get("answers", []) + ["Skipped"] * (len(qs.get("questions", [])) - qs.get("index", 0)),
+            "skipped": True,
+        }
+        self._question_state = None
+        self.screen.set_question(None)
+        self.screen.set_status("↷ Question skipped", C_DIM)
+        self._send_line("<<ASK_USER_ANSWER>>" + json.dumps(payload))
         self.screen.redraw()
 
     def _submit_edit_approval(self, approved):
@@ -2325,8 +2795,9 @@ class PriyaApp:
     def _send_line(self, text):
         try:
             with self._stdin_lock:
-                self.proc.stdin.write(text + "\n")
-                self.proc.stdin.flush()
+                if self.proc and self.proc.stdin:
+                    self.proc.stdin.write(text + "\n")
+                    self.proc.stdin.flush()
         except (BrokenPipeError, OSError):
             self.screen.set_status("worker pipe broken", C_ERR)
 
