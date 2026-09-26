@@ -53,6 +53,14 @@ Priya operates on a dual-process architecture:
 - Agent swarm manager (`tools/swarm.py`): `spawn_agent`, `send_input`, `wait_agent`, `close_agent`, `resume_agent`, and `spawn_agents_on_csv`.
 - Full asynchronous inter-agent communication, process isolation, and concurrent dataset processing.
 
+### Milestone 7: SQLite Chat Persistence, `/delete` & Onboarding API Key Manager
+- Local SQLite database (`chat_db.py`) storing chats and messages at `~/.priya/chats.db`, isolated by project directory (`os.getcwd()`).
+- Automated message logging for user prompts and assistant completions with auto-titling from the first user prompt.
+- Interactive `/delete` command featuring bottom-left dropdown selection of past chats with metadata (timestamps, message counts, model, active session marker), with immediate SQLite deletion and automatic session reset if the active chat is deleted.
+- Environment & API key manager (`env_manager.py`) providing startup detection for `MISTRAL_API_KEY`, `GEMINI_API_KEY`, and project `.env`.
+- Step-by-step onboarding walkthrough with direct links for Mistral (`console.mistral.ai`) and Google AI Studio (`aistudio.google.com`).
+- On-demand `/onboarding` command to configure, save, and hot-reload API keys into `.env` and the running worker via line-framed `<<SET_KEYS>>` protocol.
+
 ---
 
 ## 3. CRITICAL INVARIANTS & ANTI-REGRESSION RULES

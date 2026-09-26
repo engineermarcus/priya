@@ -47,6 +47,14 @@ import pygments
 from pygments.lexers import get_lexer_by_name, guess_lexer
 from pygments.formatters import TerminalTrueColorFormatter
 
+from chat_db import ChatDB
+from env_manager import (
+    load_project_env,
+    save_api_key,
+    get_api_keys_status,
+    get_onboarding_instructions,
+)
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -161,6 +169,8 @@ COMMANDS = [
     ("/tools", "List all available Priya tools"),
     ("/models", "Switch active model (Mistral / Gemini 3.8 Flash)"),
     ("/model", "View active model information"),
+    ("/delete", "Pick and delete a chat from project history"),
+    ("/onboarding", "Configure or switch API keys (Mistral / Gemini)"),
     ("/history", "Browse command history"),
     ("/compact", "Toggle compact / expanded tool logs"),
     ("/exit", "Exit Priya"),
@@ -1784,6 +1794,13 @@ class PriyaApp:
         self.model_effort = "medium"
         self.model_badge = "mistral-medium"
 
+        # Database & Environment
+        self.project_dir = os.path.abspath(os.getcwd())
+        load_project_env(self.project_dir)
+        self.chat_db = ChatDB()
+        self.current_chat_id = self.chat_db.create_chat(self.project_dir, model=self.active_model)
+        self._pending_key_entry = None
+
     def start(self):
         self._start_worker()
         threading.Thread(target=self._spinner_loop, daemon=True).start()
@@ -1793,7 +1810,13 @@ class PriyaApp:
         except Exception:
             pass
         self.screen.set_status("", C_STATUS)
-        self.screen.redraw()
+
+        env_status = get_api_keys_status(self.project_dir)
+        if not env_status["has_any_key"]:
+            self._handle_cmd_onboarding(is_startup=True)
+        else:
+            self.screen.redraw()
+
         self._input_loop()
 
     def _start_worker(self):
@@ -1960,6 +1983,13 @@ class PriyaApp:
                 self._interrupted = False
                 self.screen.finish_active_tool()
                 self.screen.set_busy(False)
+                if self.screen.cur_turn and not self.screen.cur_turn.is_system:
+                    ai_text = "\n".join(self.screen.cur_turn.ai_lines).strip()
+                    if ai_text and getattr(self, "current_chat_id", None):
+                        try:
+                            self.chat_db.add_message(self.current_chat_id, "assistant", ai_text)
+                        except Exception:
+                            pass
                 self.screen.end_turn()
                 self.screen.set_status("", C_READY)
                 self.screen.redraw()
@@ -2343,6 +2373,12 @@ class PriyaApp:
         elif cmd == "/model":
             self._handle_cmd_model()
             return True
+        elif cmd == "/delete":
+            self._handle_cmd_delete()
+            return True
+        elif cmd == "/onboarding":
+            self._handle_cmd_onboarding()
+            return True
         elif cmd == "/history":
             self._handle_cmd_history()
             return True
@@ -2358,6 +2394,23 @@ class PriyaApp:
         return False
 
     def _do_submit(self):
+        if getattr(self, "_pending_key_entry", None) is not None:
+            key_name = self._pending_key_entry
+            self._pending_key_entry = None
+            val = self.screen.take_input().strip()
+            if not val:
+                self.screen.set_status("Key entry cancelled", C_DIM)
+                self.screen.redraw()
+                return
+            env_file = save_api_key(self.project_dir, key_name, val)
+            self._send_line("<<SET_KEYS>>" + json.dumps({key_name: val}))
+            turn = self.screen.new_turn(f"/onboarding ({key_name})", is_system=True)
+            turn.ai_lines.append(f"✓ Saved **{key_name}** to `{env_file}` and updated active session!")
+            self.screen.end_turn()
+            self.screen.set_status(f"✓ {key_name} saved", C_OK)
+            self.screen.redraw()
+            return
+
         if self._question_state is not None:
             text = self.screen.take_input().strip()
             qs = self._question_state
@@ -2412,6 +2465,11 @@ class PriyaApp:
                 return
 
         # Normal prompt to worker
+        if getattr(self, "current_chat_id", None):
+            try:
+                self.chat_db.add_message(self.current_chat_id, "user", text)
+            except Exception:
+                pass
         self._busy = True
         self._interrupted = False
         self.screen.new_turn(text)
@@ -2435,6 +2493,8 @@ class PriyaApp:
 | `/tools` | List all 14 tools & descriptions |
 | `/model` | Active model information |
 | `/models` | Switch model (Mistral / Gemini 3.8 Flash) |
+| `/delete` | Pick and delete a chat from project history |
+| `/onboarding` | Configure or switch API keys (Mistral / Gemini) |
 | `/history` | Recent prompt history |
 | `/compact` | Toggle tool logs compact mode |
 | `/exit` | Exit Priya |
@@ -2606,6 +2666,99 @@ Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
         self.screen.set_status("Select model: ↑/↓ choose • Enter confirm • 's' or Esc cancel", C_TOOL_Y)
         self.screen.redraw()
 
+    def _handle_cmd_delete(self):
+        chats = self.chat_db.get_chats(self.project_dir)
+        if not chats:
+            turn = self.screen.new_turn("/delete", is_system=True)
+            turn.ai_lines.append(f"> [!NOTE]\n> No saved chats found for project `{self.project_dir}`.")
+            self.screen.end_turn()
+            self.screen.redraw()
+            return
+
+        options = []
+        for c in chats:
+            c_time = datetime.fromtimestamp(c.get("created_at", time.time())).strftime("%b %d, %H:%M")
+            cnt = c.get("message_count", 0)
+            is_active = (c["id"] == self.current_chat_id)
+            tag = " (Active)" if is_active else ""
+            title = c.get("title", "Untitled Chat")
+            label = f"{title[:40]}{tag}"
+            desc = f"{c_time} • {cnt} msgs • {c.get('model', 'mistral')} • ID: {c['id'][-8:]}"
+            options.append({
+                "label": label,
+                "description": desc,
+                "chat_id": c["id"],
+                "chat_title": title,
+            })
+        options.append({
+            "label": "Cancel",
+            "description": "Keep all chats and exit menu",
+            "cancel": True,
+            "skip": True,
+        })
+
+        qs = {
+            "id": "chat_delete_picker",
+            "header": "Delete Stored Chat",
+            "questions": [{
+                "header": "Select Chat to Delete",
+                "question": f"Choose a chat from '{os.path.basename(self.project_dir)}' to permanently delete:",
+                "options": options,
+            }],
+            "index": 0,
+            "answers": [],
+            "selected_option": 0,
+            "is_delete_picker": True,
+        }
+        self._question_state = qs
+        self.screen.set_question(qs)
+        self.screen.set_status("Select chat to delete: ↑/↓ choose • Enter confirm • Esc cancel", C_TOOL_Y)
+        self.screen.redraw()
+
+    def _handle_cmd_onboarding(self, is_startup=False):
+        status = get_api_keys_status(self.project_dir)
+        instr = get_onboarding_instructions(status)
+        turn = self.screen.new_turn("Welcome to Priya" if is_startup else "/onboarding", is_system=True)
+        turn.ai_lines.append(instr.strip())
+        self.screen.end_turn()
+
+        options = [
+            {
+                "label": "Configure Mistral API Key",
+                "description": f"Enter or replace MISTRAL_API_KEY (Currently: {status['mistral_masked']})",
+                "key_target": "MISTRAL_API_KEY",
+            },
+            {
+                "label": "Configure Google Gemini API Key",
+                "description": f"Enter or replace GEMINI_API_KEY (Currently: {status['gemini_masked']})",
+                "key_target": "GEMINI_API_KEY",
+            },
+            {
+                "label": "Done / Continue",
+                "description": "Proceed to Priya chat prompt",
+                "cancel": True,
+                "skip": True,
+            }
+        ]
+
+        qs = {
+            "id": "onboarding_picker",
+            "header": "Priya API Key Setup",
+            "questions": [{
+                "header": "Configure API Key",
+                "question": "Select an API key to configure or update for this project:",
+                "options": options,
+            }],
+            "index": 0,
+            "answers": [],
+            "selected_option": 0,
+            "is_onboarding_picker": True,
+        }
+        self._question_state = qs
+        self.screen.set_question(qs)
+        self.screen.set_status("Select key to configure: ↑/↓ choose • Enter confirm • Esc dismiss", C_TOOL_Y)
+        self.screen.redraw()
+
     def _handle_cmd_history(self):
         turn = self.screen.new_turn("/history", is_system=True)
         if not self.history:
@@ -2722,11 +2875,67 @@ Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
                 "effort": effort,
                 "budget": budget
             }))
+            if getattr(self, "current_chat_id", None):
+                try:
+                    self.chat_db.update_chat_model(self.current_chat_id, model)
+                except Exception:
+                    pass
             turn = self.screen.new_turn("/models", is_system=True)
             turn.ai_lines.append(f"✓ Switched active model to **{model}**" + (f" (effort: `{effort}`)" if effort != "none" else ""))
             self.screen.end_turn()
             self.screen.redraw()
             return
+
+        if qs.get("is_delete_picker"):
+            q = qs["questions"][qs["index"]]
+            opts = q.get("options", [])
+            sel_idx = qs.get("selected_option", 0)
+            opt = opts[sel_idx] if 0 <= sel_idx < len(opts) else {}
+            if opt.get("cancel") or opt.get("skip") or ans.strip().lower() in ("cancel", "skip"):
+                self._question_state = None
+                self.screen.set_question(None)
+                self.screen.set_status("⊘ Chat deletion cancelled", C_DIM)
+                self.screen.redraw()
+                return
+            chat_id = opt.get("chat_id")
+            chat_title = opt.get("chat_title", opt.get("label", "Chat"))
+            self._question_state = None
+            self.screen.set_question(None)
+            if chat_id:
+                deleted = self.chat_db.delete_chat(chat_id)
+                turn = self.screen.new_turn("/delete", is_system=True)
+                if deleted:
+                    turn.ai_lines.append(f"✓ Permanently deleted chat: **{chat_title}** (`{chat_id}`)")
+                    if chat_id == self.current_chat_id:
+                        self.current_chat_id = self.chat_db.create_chat(self.project_dir, model=self.active_model)
+                        turn.ai_lines.append("✓ Started new empty chat session.")
+                    self.screen.set_status("✓ Chat deleted", C_OK)
+                else:
+                    turn.ai_lines.append(f"✗ Failed to delete chat `{chat_id}` (not found).")
+                    self.screen.set_status("Chat delete failed", C_ERR)
+                self.screen.end_turn()
+            self.screen.redraw()
+            return
+
+        if qs.get("is_onboarding_picker"):
+            q = qs["questions"][qs["index"]]
+            opts = q.get("options", [])
+            sel_idx = qs.get("selected_option", 0)
+            opt = opts[sel_idx] if 0 <= sel_idx < len(opts) else {}
+            if opt.get("cancel") or opt.get("skip") or ans.strip().lower() in ("cancel", "skip", "done / continue"):
+                self._question_state = None
+                self.screen.set_question(None)
+                self.screen.set_status("Onboarding closed", C_DIM)
+                self.screen.redraw()
+                return
+            key_target = opt.get("key_target")
+            if key_target:
+                self._question_state = None
+                self.screen.set_question(None)
+                self._pending_key_entry = key_target
+                self.screen.set_status(f"Enter or paste your {key_target} and press Enter:", C_TOOL_Y)
+                self.screen.redraw()
+                return
 
         # Normal askUserQuestion handling
         if ans.strip().lower() == "skip":
@@ -2765,6 +2974,18 @@ Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
             self.screen.set_status(f"✓ Active model kept: {self.active_model}", C_DIM)
             self.screen.redraw()
             return
+        if self._question_state.get("is_delete_picker"):
+            self._question_state = None
+            self.screen.set_question(None)
+            self.screen.set_status("⊘ Delete cancelled", C_DIM)
+            self.screen.redraw()
+            return
+        if self._question_state.get("is_onboarding_picker"):
+            self._question_state = None
+            self.screen.set_question(None)
+            self.screen.set_status("Onboarding dismissed", C_DIM)
+            self.screen.redraw()
+            return
         payload = {"id": self._question_state["id"], "cancelled": True}
         self._question_state = None
         self.screen.set_question(None)
@@ -2779,6 +3000,18 @@ Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
             self._question_state = None
             self.screen.set_question(None)
             self.screen.set_status(f"✓ Active model kept: {self.active_model}", C_DIM)
+            self.screen.redraw()
+            return
+        if self._question_state.get("is_delete_picker"):
+            self._question_state = None
+            self.screen.set_question(None)
+            self.screen.set_status("⊘ Delete cancelled", C_DIM)
+            self.screen.redraw()
+            return
+        if self._question_state.get("is_onboarding_picker"):
+            self._question_state = None
+            self.screen.set_question(None)
+            self.screen.set_status("Onboarding dismissed", C_DIM)
             self.screen.redraw()
             return
         qs = self._question_state

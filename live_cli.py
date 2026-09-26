@@ -49,6 +49,12 @@ ARTIFACT_BIN = os.path.join(DIR, "tools", "artifact.py")
 INTERRUPT_COMMAND = "<<PRIYA_INTERRUPT>>"
 CRON_MAX_LIFETIME = timedelta(days=3)
 
+try:
+    from env_manager import load_project_env
+    load_project_env(SESSION_DIR)
+except Exception:
+    pass
+
 
 @dataclass(frozen=True)
 class CronSchedule:
@@ -3104,6 +3110,17 @@ class TextLoop:
                     print(f"[live_cli] Model set to {self._active_model} (thinking budget: {self._gemini_thinking_budget})", file=sys.stderr)
                 except Exception as e:
                     print(f"[live_cli] Error parsing <<SET_MODEL>>: {e}", file=sys.stderr)
+                continue
+
+            if text.startswith("<<SET_KEYS>>"):
+                try:
+                    payload = json.loads(text[len("<<SET_KEYS>>"):])
+                    for k, v in payload.items():
+                        if v:
+                            os.environ[str(k)] = str(v)
+                    print(f"[live_cli] Updated environment keys: {list(payload.keys())}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[live_cli] Error parsing <<SET_KEYS>>: {e}", file=sys.stderr)
                 continue
 
             if text.startswith("<<ASK_USER_ANSWER>>"):
