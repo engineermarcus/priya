@@ -116,15 +116,24 @@ TOOL_COLORS = {
     "bash":                 C_TOOL,
     "artifact":             C_TOOL_B,
     "edit":                 C_TOOL_P,
+    "write":                C_TOOL_P,
     "read":                 C_CYAN,
     "grep":                 C_WARN,
     "glob":                 C_WARN,
     "lsp":                  C_TOOL_P,
+    "websearch":            C_CYAN,
+    "webfetch":             C_TOOL_B,
+    "taskcreate":           C_TOOL_Y,
+    "tasklist":             C_TOOL_Y,
+    "taskget":              C_TOOL_Y,
+    "taskupdate":           C_TOOL_Y,
+    "taskstop":             C_TOOL_Y,
     "agentjob":             C_HEAD,
     "croncreate":           C_WARN,
     "cronlist":             C_WARN,
     "crondelete":           C_WARN,
     "listmcpresourcestool": C_TOOL,
+    "readmcpresourcetool":  C_TOOL,
     "enterplanmode":        C_WARN,
     "exitplanmode":         C_WARN,
     "askuserquestion":      C_TOOL_Y,
@@ -236,6 +245,136 @@ def format_log_line(stream, line, is_diff=False):
         return C_DIM + line + RESET
     else:
         return C_STDOUT + line + RESET
+
+def format_path(p):
+    if not isinstance(p, str):
+        return p
+    home = os.path.expanduser("~")
+    if home and home in p:
+        return p.replace(home, "~")
+    return p
+
+def get_tool_summary(name, detail, result_text):
+    if not result_text:
+        return None
+    try:
+        r = json.loads(result_text) if isinstance(result_text, str) else result_text
+    except Exception:
+        return None
+    if not isinstance(r, dict):
+        return None
+
+    if r.get("error"):
+        err = str(r["error"]).split("\n")[0]
+        return f"Failed: {err}"
+
+    act = name.lower()
+
+    if act == "read":
+        content = r.get("content", "")
+        lines = len(content.splitlines()) if isinstance(content, str) else 0
+        return f"Read {lines} {'line' if lines == 1 else 'lines'}."
+
+    elif act == "edit":
+        if r.get("approved") is False:
+            return "Edit cancelled."
+        diff = r.get("diff", "")
+        if diff:
+            added = len([l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")])
+            removed = len([l for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")])
+            if added > 0 and removed == 0:
+                return f"Added {added} {'line' if added == 1 else 'lines'}."
+            elif removed > 0 and added == 0:
+                return f"Removed {removed} {'line' if removed == 1 else 'lines'}."
+            elif added > 0 and removed > 0:
+                return f"Added {added}, removed {removed} lines."
+            else:
+                return "Updated file."
+        return "Updated file."
+
+    elif act == "write":
+        lines = r.get("lines_written")
+        if lines is None and "content" in r:
+            lines = len(str(r["content"]).splitlines())
+        if lines is not None:
+            return f"Wrote {lines} {'line' if lines == 1 else 'lines'}."
+        return "File written."
+
+    elif act == "glob":
+        count = r.get("count", len(r.get("files", [])))
+        return f"Found {count} {'file' if count == 1 else 'files'}."
+
+    elif act == "grep":
+        count = r.get("count", len(r.get("matches", [])))
+        matches = r.get("matches", [])
+        files = len(set(m.get("path") for m in matches if isinstance(m, dict))) if matches else 0
+        if files > 1:
+            return f"Found {count} matches across {files} files."
+        return f"Found {count} {'match' if count == 1 else 'matches'}."
+
+    elif act == "websearch":
+        count = r.get("count", len(r.get("results", [])))
+        return f"Found {count} results."
+
+    elif act == "webfetch":
+        chars = r.get("length", len(r.get("content", "")))
+        code = r.get("status_code", 200)
+        return f"Fetched {chars:,} characters (HTTP {code})."
+
+    elif act == "taskcreate":
+        tid = r.get("task", {}).get("id") or "task"
+        return f"Created {tid}."
+
+    elif act == "taskupdate":
+        tid = r.get("task", {}).get("id") or "task"
+        st = r.get("task", {}).get("status")
+        return f"Updated {tid} ({st})." if st else f"Updated {tid}."
+
+    elif act == "taskstop":
+        return "Task cancelled."
+
+    elif act == "tasklist":
+        count = r.get("count", len(r.get("tasks", [])))
+        return f"Loaded {count} tasks."
+
+    elif act == "taskget":
+        tid = r.get("task", {}).get("id")
+        return f"Loaded {tid}."
+
+    elif act == "listmcpresourcestool":
+        count = r.get("count", len(r.get("resources", [])))
+        return f"Found {count} MCP resources."
+
+    elif act == "readmcpresourcetool":
+        return "Read MCP resource."
+
+    elif act == "enterplanmode":
+        return "Entered Plan Mode (read-only)."
+
+    elif act == "exitplanmode":
+        return "Exited Plan Mode."
+
+    elif act == "enterworktree":
+        wt = r.get("worktree", "")
+        return f"Entered worktree {format_path(wt)}."
+
+    elif act == "exitworktree":
+        return "Exited worktree."
+
+    elif act == "croncreate":
+        return "Scheduled prompt."
+
+    elif act == "cronlist":
+        count = len(r) if isinstance(r, list) else 0
+        return f"Active scheduled jobs: {count}."
+
+    elif act == "bash":
+        exit_code = r.get("exit_code")
+        if exit_code is not None and exit_code != 0:
+            return f"Command exited with code {exit_code}."
+        return None
+
+    return None
 
 # ── Code Syntax Highlighting ──────────────────────────────────────────────────
 
@@ -603,6 +742,7 @@ class Turn:
         self.thinking_chunks = []
         self.tool_nodes = {}
         self.tool_order = []
+        self.interrupted = False
 
 # ── Screen Renderer ───────────────────────────────────────────────────────────
 
@@ -639,7 +779,7 @@ class Screen:
         self._git_branch = None
         self._git_check = 0.0
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._write(smcup() + enable_mouse() + hide_cursor() + BG_MAIN + ed(2))
         self._update_size()
 
@@ -733,8 +873,6 @@ class Screen:
                 buf.append(fit_line(visible[i], max_line_w))
         # Status bar in real time
         status_row = convo_start + self._convo_h
-        git_str = f"  │  git: {self._git_branch}" if self._git_branch else ""
-        plan_str = "  │  PLAN MODE" if self.plan_mode else ""
         spinner_f = SPINNER[self.spinner_i % len(SPINNER)]
 
         if self.active_tool_name:
@@ -744,14 +882,24 @@ class Screen:
             desc_map = {
                 "bash": "bash working",
                 "read": "reading",
+                "write": "writing",
                 "edit": "editing",
                 "grep": "searching",
                 "glob": "finding files",
                 "lsp": "lsp query",
+                "websearch": "searching web",
+                "webfetch": "fetching page",
+                "taskcreate": "creating task",
+                "tasklist": "listing tasks",
+                "taskget": "getting task",
+                "taskupdate": "updating task",
+                "taskstop": "stopping task",
                 "agentjob": "agentjob running",
                 "artifact": "artifact preview",
                 "croncreate": "scheduling cron",
                 "cronlist": "listing cron",
+                "listmcpresourcestool": "listing mcp",
+                "readmcpresourcetool": "reading mcp",
                 "askuserquestion": "asking question",
             }
             action_label = desc_map.get(act, f"{self.active_tool_name} running")
@@ -768,18 +916,19 @@ class Screen:
                 snippet = truncate(self.active_thinking, 32)
                 left_st = f"  {spinner_f} thinking: {snippet} ({dur:.1f}s)"
             else:
-                left_st = f"  {spinner_f} thinking through task… ({dur:.1f}s)"
+                left_st = f"  {spinner_f} Generating… ({dur:.1f}s)"
             st_color = C_CYAN
 
-        elif self.status_text:
+        elif self.status_text and self.status_text.strip() != "ready":
             left_st = f"  {self.status_text}"
             st_color = self.status_color
         else:
-            left_st = f"  ready"
+            left_st = ""
             st_color = C_READY
 
+        plan_str = "  │  PLAN MODE" if (self.plan_mode and left_st) else ("  PLAN MODE" if self.plan_mode else "")
         right_st = f"mistral-medium  │  /help  "
-        st_content = f"{left_st}{git_str}{plan_str}"
+        st_content = f"{left_st}{plan_str}"
         pad = max(1, max_line_w - vis_len(st_content) - len(right_st))
         full_status = f"{st_color}{st_content}{RESET}{' ' * pad}{C_DIM}{right_st}{RESET}"
         buf.append(cup(status_row, 1) + el() + BG_STATUS + fit_line(full_status, max_line_w) + RESET)
@@ -845,11 +994,11 @@ class Screen:
         out = []
         tc = TOOL_COLORS.get(node.name.lower(), C_TOOL)
         spinner_f = SPINNER[self.spinner_i % len(SPINNER)]
-        clean_detail = node.detail
+        clean_detail = format_path(node.detail)
         if clean_detail and clean_detail.startswith("{") and clean_detail.endswith("}"):
             try:
                 d = json.loads(clean_detail)
-                vals = [str(v) for v in d.values() if isinstance(v, (str, int, float))]
+                vals = [format_path(str(v)) for v in d.values() if isinstance(v, (str, int, float))]
                 if vals:
                     clean_detail = " ".join(vals)
             except Exception:
@@ -857,23 +1006,30 @@ class Screen:
         detail_s = f"({clean_detail})" if clean_detail else ""
         elapsed = node.elapsed_str()
 
+        r = None
+        if node.result_text:
+            try:
+                r = json.loads(node.result_text)
+            except Exception:
+                pass
+
+        summary = get_tool_summary(node.name, node.detail, node.result_text)
+
         flat_logs = []
         for stream, log_text in node.logs:
             for line in log_text.split("\n"):
                 if line:
                     flat_logs.append((stream, line))
 
-        if not flat_logs and node.result_text and node.done:
-            try:
-                r = json.loads(node.result_text)
-                if isinstance(r, dict):
-                    text_out = r.get("stdout") or r.get("output") or r.get("error")
-                    if text_out and isinstance(text_out, str):
-                        for l in text_out.split("\n"):
-                            if l:
-                                flat_logs.append(("stdout", l))
-            except Exception:
-                pass
+        if not flat_logs and r and isinstance(r, dict) and node.done:
+            text_out = r.get("stdout") or r.get("output") or r.get("error")
+            if text_out and isinstance(text_out, str):
+                for l in text_out.split("\n"):
+                    if l:
+                        flat_logs.append(("stdout", l))
+
+        is_collapsed = self.compact_mode and not node.expanded
+        is_diff_cmd = bool(node and ("diff" in node.name.lower() or "diff" in node.detail.lower()))
 
         if not node.done:
             icon = f"{C_CYAN}{spinner_f}{RESET}"
@@ -883,39 +1039,70 @@ class Screen:
             status_s = f" {C_ERR}[failed ✗ {elapsed}]{RESET}"
         else:
             icon = f"{tc}●{RESET}"
-            status_s = f" {C_OK}[done ✓ {elapsed}]{RESET}" if not flat_logs else ""
+            status_s = ""
 
         header_line = f"  {icon} {BOLD}{tc}{node.name}{RESET}{C_DIM}{detail_s}{RESET}{status_s}"
         out.append(fit_line(header_line, w))
 
-        is_collapsed = self.compact_mode and not node.expanded
-        max_preview = 6
-        is_diff_cmd = bool(node and ("diff" in node.name.lower() or "diff" in node.detail.lower()))
+        if not node.done:
+            if flat_logs:
+                for l_idx, (stream, log_text) in enumerate(flat_logs[-4:]):
+                    prefix = f"  {C_DIM}⎿  {RESET}" if l_idx == 0 else "     "
+                    c_line = format_log_line(stream, log_text, is_diff=is_diff_cmd)
+                    out.append(fit_line(f"{prefix}{c_line}", w))
+            else:
+                out.append(f"  {C_DIM}⎿  {spinner_f} running…{RESET}")
 
-        if flat_logs:
-            if is_collapsed and len(flat_logs) > max_preview:
-                omitted = len(flat_logs) - max_preview
-                preview_logs = flat_logs[-max_preview:]
-                branch_hdr = f"  {C_DIM}⎿  <output +{omitted} lines>{RESET}"
-                out.append(fit_line(branch_hdr, w))
+        elif is_collapsed:
+            if summary:
+                hint = f" {C_DIM}(ctrl+o to expand){RESET}" if (node.name.lower() in ("edit", "read", "bash") and (flat_logs or (r and "diff" in r))) else ""
+                out.append(fit_line(f"  {C_DIM}⎿  {RESET}{C_DIM}{summary}{RESET}{hint}", w))
+            elif flat_logs:
+                max_preview = 6
+                if len(flat_logs) > max_preview:
+                    omitted = len(flat_logs) - max_preview
+                    preview_logs = flat_logs[-max_preview:]
+                    branch_hdr = f"  {C_DIM}⎿  <output +{omitted} lines>{RESET}"
+                    out.append(fit_line(branch_hdr, w))
+                    for l_idx, (stream, log_text) in enumerate(preview_logs):
+                        is_last = (l_idx == len(preview_logs) - 1)
+                        hint = f" {C_DIM}(ctrl+o to collapse){RESET}" if is_last else ""
+                        c_line = format_log_line(stream, log_text, is_diff=is_diff_cmd)
+                        out.append(fit_line(f"     {c_line}{hint}", w))
+                else:
+                    for l_idx, (stream, log_text) in enumerate(flat_logs):
+                        is_first = (l_idx == 0)
+                        prefix = f"  {C_DIM}⎿  {RESET}" if is_first else "     "
+                        c_line = format_log_line(stream, log_text, is_diff=is_diff_cmd)
+                        out.append(fit_line(f"{prefix}{c_line}", w))
+            else:
+                out.append(f"  {C_DIM}⎿  done.{RESET}")
 
-                for l_idx, (stream, log_text) in enumerate(preview_logs):
-                    is_last = (l_idx == len(preview_logs) - 1)
+        else:
+            # Expanded mode (Ctrl+O)
+            if node.name.lower() == "edit" and r and "diff" in r:
+                diff_lines = colorize_diff(r["diff"])
+                out.append(fit_line(f"  {C_DIM}⎿  {RESET}{C_DIM}{summary or 'Diff'}{RESET} {C_DIM}(ctrl+o to collapse){RESET}", w))
+                for dl in diff_lines[:40]:
+                    out.append(fit_line(f"     {dl}", w))
+                if len(diff_lines) > 40:
+                    out.append(fit_line(f"     {C_DIM}… [{len(diff_lines)-40} more diff lines]{RESET}", w))
+            elif node.name.lower() == "read" and r and "content" in r:
+                out.append(fit_line(f"  {C_DIM}⎿  {RESET}{C_DIM}{summary or 'Content'}{RESET} {C_DIM}(ctrl+o to collapse){RESET}", w))
+                c_lines = r["content"].splitlines()
+                for cl in c_lines[:25]:
+                    out.append(fit_line(f"     {C_DIM}{cl}{RESET}", w))
+                if len(c_lines) > 25:
+                    out.append(fit_line(f"     {C_DIM}… [{len(c_lines)-25} more lines hidden]{RESET}", w))
+            elif flat_logs:
+                for l_idx, (stream, log_text) in enumerate(flat_logs):
+                    prefix = f"  {C_DIM}⎿  {RESET}" if l_idx == 0 else "     "
+                    is_last = (l_idx == len(flat_logs) - 1)
                     hint = f" {C_DIM}(ctrl+o to collapse){RESET}" if is_last else ""
                     c_line = format_log_line(stream, log_text, is_diff=is_diff_cmd)
-                    out.append(fit_line(f"     {c_line}{hint}", w))
-            else:
-                show_collapse_hint = len(flat_logs) > max_preview
-                for l_idx, (stream, log_text) in enumerate(flat_logs):
-                    is_first = (l_idx == 0)
-                    is_last = (l_idx == len(flat_logs) - 1)
-                    prefix = f"  {C_DIM}⎿  {RESET}" if is_first else "     "
-                    hint = f" {C_DIM}(ctrl+o to collapse){RESET}" if (is_last and show_collapse_hint) else ""
-                    c_line = format_log_line(stream, log_text, is_diff=is_diff_cmd)
                     out.append(fit_line(f"{prefix}{c_line}{hint}", w))
-
-        if not node.done and not flat_logs:
-            out.append(f"  {C_DIM}⎿  {spinner_f} running…{RESET}")
+            elif summary:
+                out.append(fit_line(f"  {C_DIM}⎿  {RESET}{C_DIM}{summary}{RESET}", w))
 
         out.append("")
         return out
@@ -1010,24 +1197,38 @@ class Screen:
                                 lines.append("  " + C_AI + ll + RESET)
                     lines.append("")
 
+            if getattr(turn, "interrupted", False):
+                lines.append(f"  {C_DIM}interrupted{RESET}")
+                lines.append("")
+
             # Interactive Question State
             if turn is self.cur_turn and self._question_state:
                 qs = self._question_state
                 q = qs["questions"][qs["index"]]
                 lines.append("  " + C_TOOL_Y + BOLD + "? " + q.get("header","") + RESET)
                 lines.append("  " + C_AI + q["question"] + RESET)
+                typed_custom = self.input_text.strip()
+                opts = q.get("options", [])
                 sel_idx = qs.get("selected_option", 0)
-                for i, opt in enumerate(q.get("options", [])):
+                if typed_custom:
+                    for i, opt in enumerate(opts):
+                        if opt.get("custom"):
+                            sel_idx = i
+                            break
+                for i, opt in enumerate(opts):
                     is_sel = (i == sel_idx)
+                    is_custom = opt.get("custom", False)
                     cursor = f"{BOLD}{C_TOOL_Y}❯{RESET} " if is_sel else "  "
                     num = f"[{i + 1}]"
                     lbl = opt.get("label", "")
                     desc = opt.get("description", "")
+                    if is_custom and typed_custom:
+                        desc = f'"{typed_custom}"'
                     if is_sel:
                         lines.append(f"    {cursor}{BOLD}{C_TOOL_Y}{num} {lbl}{RESET} — {C_USER}{desc}{RESET} {C_TOOL_Y}(selected){RESET}")
                     else:
                         lines.append(f"    {cursor}{C_DIM}{num}{RESET} {C_AI}{lbl}{RESET} — {C_DIM}{desc}{RESET}")
-                lines.append("  " + C_DIM + "↑/↓ select • 1-9 choose • Enter confirm • Tab custom ↓" + RESET)
+                lines.append("  " + C_DIM + "↑/↓ select • 1-9 choose • or type custom answer below ↓" + RESET)
                 lines.append("")
 
             # Interactive Edit approval
@@ -1172,6 +1373,26 @@ class Screen:
             self.thinking = False
             self.active_tool_name = ""
             self.active_tool_detail = ""
+            self.active_thinking = ""
+            self._cache_dirty = True
+
+    def mark_interrupted(self):
+        with self._lock:
+            if self.cur_turn and not getattr(self.cur_turn, "interrupted", False):
+                self.cur_turn.interrupted = True
+                if self.cur_turn.blocks:
+                    for b in self.cur_turn.blocks:
+                        if not b.get("done"):
+                            b["done"] = True
+                            if not b.get("end_time"):
+                                b["end_time"] = time.time()
+            self.active_tool_name = ""
+            self.active_tool_detail = ""
+            self.cur_turn = None
+            self._question_state = None
+            self._edit_state = None
+            self.busy = False
+            self.thinking = False
             self.active_thinking = ""
             self._cache_dirty = True
 
@@ -1481,6 +1702,18 @@ class PriyaApp:
             if line.startswith("<<ASK_USER_QUESTION>>"):
                 try:
                     p = json.loads(line[len("<<ASK_USER_QUESTION>>"):])
+                    for q in p.get("questions", []):
+                        opts = q.get("options", [])
+                        has_other = any(
+                            o.get("label", "").lower() in ("other", "custom", "other…", "custom answer")
+                            for o in opts
+                        )
+                        if not has_other:
+                            opts.append({
+                                "label": "Other",
+                                "description": "Type your own custom answer",
+                                "custom": True,
+                            })
                     self._question_state = {
                         "id": p["id"],
                         "questions": p["questions"],
@@ -1531,7 +1764,7 @@ class PriyaApp:
                 self.screen.finish_active_tool()
                 self.screen.set_busy(False)
                 self.screen.end_turn()
-                self.screen.set_status("ready", C_READY)
+                self.screen.set_status("", C_READY)
                 self.screen.redraw()
                 continue
 
@@ -1559,6 +1792,9 @@ class PriyaApp:
         s = self.screen
 
         if key == "CTRL_C":
+            if self._busy:
+                self._do_interrupt()
+                return
             if s.input_text:
                 s.input_clear()
                 self.history_index = -1
@@ -1769,8 +2005,27 @@ class PriyaApp:
             opts = q.get("options", [])
             if 0 <= idx < len(opts):
                 qs["selected_option"] = idx
+                if opts[idx].get("custom"):
+                    with s._lock:
+                        s._cache_dirty = True
+                    s.set_status("Type your custom answer and press Enter", C_TOOL_Y)
+                    s.redraw()
+                    return
                 self._submit_question_choice()
                 return
+
+        if self._question_state and not s.input_text and key.lower() in ("o", "c"):
+            qs = self._question_state
+            q = qs["questions"][qs["index"]]
+            opts = q.get("options", [])
+            for idx, opt in enumerate(opts):
+                if opt.get("custom") or opt.get("label", "").lower() in ("other", "custom"):
+                    with s._lock:
+                        qs["selected_option"] = idx
+                        s._cache_dirty = True
+                    s.set_status("Type your custom answer and press Enter", C_TOOL_Y)
+                    s.redraw()
+                    return
 
         if self._edit_state and not s.input_text:
             if key in ("y", "Y"):
@@ -1786,21 +2041,26 @@ class PriyaApp:
             return
 
     def _do_submit(self):
-        text = self.screen.take_input().strip()
-
         if self._question_state is not None:
+            text = self.screen.take_input().strip()
             qs = self._question_state
             q = qs["questions"][qs["index"]]
             opts = q.get("options", [])
+            sel_idx = qs.get("selected_option", 0)
+            is_custom = (sel_idx < len(opts) and opts[sel_idx].get("custom"))
             if text:
                 ans = text
+            elif is_custom:
+                self.screen.set_status("Please type your custom answer and press Enter", C_WARN)
+                self.screen.redraw()
+                return
             else:
-                sel_idx = qs.get("selected_option", 0)
                 ans = opts[sel_idx]["label"] if opts else ""
             self._submit_question_answer(ans)
             return
 
         if self._edit_state is not None:
+            text = self.screen.take_input().strip()
             if not text:
                 self._submit_edit_approval(True)
             else:
@@ -1808,6 +2068,12 @@ class PriyaApp:
                 self._submit_edit_approval(approved)
             return
 
+        if self._busy:
+            self.screen.set_status("generating… press Esc to interrupt first", C_WARN)
+            self.screen.redraw()
+            return
+
+        text = self.screen.take_input().strip()
         if not text:
             return
 
@@ -1933,10 +2199,20 @@ class PriyaApp:
 | :--- | :--- |
 | `bash` | Run shell commands in foreground or background |
 | `Read` | Read exact file contents and line ranges |
+| `Write` | Create or overwrite files directly with full content |
 | `Edit` | Surgical search-and-replace with diff approval |
 | `Glob` | File pattern search |
 | `Grep` | Fast regex content search |
+| `WebSearch` | Live DuckDuckGo internet web search |
+| `WebFetch` | Fetch and extract text content from web URLs |
+| `TaskCreate` | Create structured session tasks and sub-goals |
+| `TaskList` | List session tasks and status |
+| `TaskUpdate` | Update status or details of session tasks |
+| `TaskGet` | Get detailed information for a specific task |
+| `TaskStop` | Cancel or stop an active task |
 | `LSP` | Definitions, diagnostics & hover from language server |
+| `ListMcpResourcesTool` | Discover configured MCP server resources |
+| `ReadMcpResourceTool` | Read resource contents from MCP servers |
 | `artifact` | Interactive HTML preview server |
 | `agentjob` | Background front-end implementation runner |
 | `askUserQuestion`| Interactive multiple-choice prompts |
@@ -1944,7 +2220,6 @@ class PriyaApp:
 | `ExitPlanMode` | Resume change execution |
 | `CronCreate` | Schedule session prompts |
 | `CronList` | List scheduled cron jobs |
-| `ListMcpResourcesTool` | Discover configured MCP server resources |
 """
         turn.ai_lines.append(tools_md.strip())
         self.screen.end_turn()
@@ -1989,8 +2264,17 @@ class PriyaApp:
         q = qs["questions"][qs["index"]]
         sel_idx = qs.get("selected_option", 0)
         opts = q.get("options", [])
-        ans = opts[sel_idx]["label"] if opts else ""
-        self._submit_question_answer(ans)
+        if 0 <= sel_idx < len(opts):
+            if opts[sel_idx].get("custom"):
+                text = self.screen.take_input().strip()
+                if not text:
+                    self.screen.set_status("Please type your custom answer and press Enter", C_WARN)
+                    self.screen.redraw()
+                    return
+                self._submit_question_answer(text)
+                return
+            ans = opts[sel_idx]["label"]
+            self._submit_question_answer(ans)
 
     def _submit_question_answer(self, ans):
         qs = self._question_state
@@ -2033,7 +2317,7 @@ class PriyaApp:
             return
         self._interrupted = True
         self._busy = False
-        self.screen.set_busy(False)
+        self.screen.mark_interrupted()
         self.screen.set_status("⊘ Interrupted", C_DIM)
         self._send_line("<<PRIYA_INTERRUPT>>")
         self.screen.redraw()

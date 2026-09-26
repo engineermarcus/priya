@@ -28,12 +28,16 @@ import difflib
 import hashlib
 import shlex
 import glob
+import re
+import shutil
 from tools.lsp import LspManager
 from tools.mcp import McpManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import requests
+import urllib.parse
+from bs4 import BeautifulSoup
 
 MODEL = "mistral-medium-latest"
 
@@ -194,7 +198,7 @@ TOOLS = [
         ["command"],
     ),
     _fn("askUserQuestion",
-        "Pause to ask the user one to four multiple-choice questions before continuing.",
+        "Interactive multiple-choice prompt. Call this tool whenever you want to ask the user a question, clarify ambiguous requirements, confirm next steps, or offer choices. Never write numbered question options in chat text; always invoke askUserQuestion instead.",
         {
             "questions": {
                 "type": "array",
@@ -202,18 +206,18 @@ TOOLS = [
                 "items": {
                     "type": "object",
                     "properties": {
-                        "header": _str("Short label for the question."),
-                        "question": _str("The decision the user should make."),
+                        "header": _str("Short category or title for the question (e.g. 'Next Step', 'File Target')."),
+                        "question": _str("The decision or question the user should answer."),
                         "options": {
                             "type": "array",
                             "description": "Two to four concise choices.",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "label": _str("Short option name."),
-                                    "description": _str("What choosing it means."),
+                                    "label": _str("Short option title."),
+                                    "description": _str("Optional details on what choosing it means."),
                                 },
-                                "required": ["label", "description"],
+                                "required": ["label"],
                             },
                         },
                     },
@@ -279,6 +283,72 @@ TOOLS = [
     ),
     _fn("ListMcpResourcesTool",
         "Discover the live catalog exposed by configured MCP servers.", {}, []),
+    _fn("ReadMcpResourceTool",
+        "Read the contents of a resource from a configured MCP server by URI.",
+        {
+            "uri": _str("URI of the resource to read, e.g. from ListMcpResourcesTool."),
+            "server": _str("Optional MCP server name."),
+        },
+        ["uri"],
+    ),
+    _fn("Write",
+        "Create a new file or completely overwrite an existing file with the provided UTF-8 content. "
+        "Creates any necessary parent directories automatically.",
+        {
+            "path": _str("Path to the file to create or overwrite."),
+            "content": _str("The full text content to write."),
+        },
+        ["path", "content"],
+    ),
+    _fn("WebSearch",
+        "Search the web using DuckDuckGo to find real-time information, documentation, and answers.",
+        {
+            "query": _str("The search query."),
+            "max_results": _int("Optional maximum results (default 8)."),
+        },
+        ["query"],
+    ),
+    _fn("WebFetch",
+        "Fetch and extract readable plain text content from a web URL.",
+        {
+            "url": _str("The HTTP or HTTPS URL to fetch."),
+            "max_length": _int("Optional maximum character length (default 16000)."),
+        },
+        ["url"],
+    ),
+    _fn("TaskCreate",
+        "Create a session-scoped task in Priya's task tracker for structured planning and progress.",
+        {
+            "subject": _str("Short subject or title of the task."),
+            "description": _str("Optional detailed description or sub-steps."),
+        },
+        ["subject"],
+    ),
+    _fn("TaskList",
+        "List all session-scoped tasks and their current statuses.",
+        {},
+        [],
+    ),
+    _fn("TaskGet",
+        "Get the full details of a session task by its ID.",
+        {"task_id": _str("ID of the task, e.g. task-1.")},
+        ["task_id"],
+    ),
+    _fn("TaskUpdate",
+        "Update the status, subject, or description of a session task.",
+        {
+            "task_id": _str("ID of the task to update."),
+            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"], "description": "New status for the task."},
+            "subject": _str("Optional updated subject."),
+            "description": _str("Optional updated description."),
+        },
+        ["task_id"],
+    ),
+    _fn("TaskStop",
+        "Cancel or stop an active session task.",
+        {"task_id": _str("ID of the task to cancel.")},
+        ["task_id"],
+    ),
     _fn("Edit",
         "Make a targeted replacement in an existing UTF-8 file. Requires prior Read. "
         "Shows a unified diff and waits for user approval before writing.",
@@ -317,6 +387,13 @@ Tool-use policy:
 - EnterPlanMode switches Priya into a read-only analytical state.
 - Edit is the preferred way to modify an existing file. Call Read first, then
   pass exact old_string and new_string.
+- Write creates or completely overwrites a file directly with full content.
+- WebSearch and WebFetch provide live internet searching and web page reading.
+- TaskCreate, TaskList, TaskGet, TaskUpdate, and TaskStop organize multi-step work into clear tracked milestones.
+- When asking the user a question, clarifying ambiguous intent, or presenting choices
+  and next steps (e.g. "Would you like me to: 1. ... 2. ... 3. ..."), DO NOT write numbered
+  questions or options in plain chat text. You MUST call the `askUserQuestion` tool instead.
+  Priya renders an interactive UI modal for the user to select from your options.
 - Report what actually happened, including relevant command/test results.
 
 Self-sufficiency:
@@ -564,6 +641,8 @@ class TextLoop:
         self._agentjob_watchers = {}
         self._completed_agentjobs = asyncio.Queue()
         self._interrupt_event = asyncio.Event()
+        self._tasks = {}
+        self._task_id_counter = 0
         # conversation history sent to Mistral on every turn
         self._messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
 
@@ -630,7 +709,9 @@ class TextLoop:
             return None
         allowed = {
             "EnterPlanMode", "ExitPlanMode", "EnterWorkTree", "ExitWorkTree",
-            "Read", "Glob", "Grep", "LSP", "ListMcpResourcesTool", "CronList", "askUserQuestion",
+            "Read", "Glob", "Grep", "LSP", "ListMcpResourcesTool", "ReadMcpResourceTool",
+            "CronList", "askUserQuestion", "WebSearch", "WebFetch",
+            "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskStop",
         }
         if tool_name in allowed:
             return None
@@ -751,17 +832,21 @@ class TextLoop:
             cleaned_options = []
             labels = set()
             for option in options:
-                if not isinstance(option, dict):
+                if isinstance(option, str):
+                    label = option.strip()
+                    desc = option.strip()
+                elif isinstance(option, dict):
+                    label = str(option.get("label") or option.get("name") or option.get("text") or "").strip()
+                    desc = str(option.get("description") or label).strip()
+                else:
                     return None, f"question {index} has an invalid option"
-                label = option.get("label")
-                description = option.get("description")
-                if not isinstance(label, str) or not label.strip() or not isinstance(description, str):
-                    return None, f"question {index} options need label and description"
-                normalized_label = label.strip()
+                if not label:
+                    return None, f"question {index} options need a non-empty label"
+                normalized_label = label
                 if normalized_label.casefold() in labels:
-                    return None, f"question {index} has duplicate option labels"
+                    normalized_label = f"{label} ({len(labels) + 1})"
                 labels.add(normalized_label.casefold())
-                cleaned_options.append({"label": normalized_label, "description": description.strip()})
+                cleaned_options.append({"label": normalized_label, "description": desc})
             header = raw.get("header", f"Question {index}")
             questions.append({
                 "header": header.strip() if isinstance(header, str) and header.strip() else f"Question {index}",
@@ -918,7 +1003,64 @@ class TextLoop:
             raise ValueError(f"Grep path does not exist: {resolved}")
         return resolved
 
+    def _run_grep_python(self, pattern, scope, case_sensitive, max_results):
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            regex = re.compile(pattern, flags)
+        except re.error:
+            try:
+                regex = re.compile(re.escape(pattern), flags)
+            except re.error as error:
+                return {"error": f"Invalid grep pattern: {error}"}
+
+        matches = []
+        truncated = False
+        ignore_dirs = {
+            ".git", ".svn", ".hg", "node_modules", "__pycache__",
+            ".venv", "venv", ".idea", ".vscode", ".priya", "dist",
+            "build", ".next", ".cache"
+        }
+
+        files_to_scan = []
+        if os.path.isfile(scope):
+            files_to_scan.append(scope)
+        elif os.path.isdir(scope):
+            for root, dirs, files in os.walk(scope):
+                dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
+                for file_name in files:
+                    files_to_scan.append(os.path.join(root, file_name))
+        else:
+            return {"error": f"Grep target does not exist: {scope}"}
+
+        for file_path in files_to_scan:
+            try:
+                with open(file_path, "rb") as bf:
+                    chunk = bf.read(1024)
+                    if b"\x00" in chunk:
+                        continue
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line_number, line in enumerate(f, start=1):
+                        if regex.search(line):
+                            resolved = self._resolve_tool_path(file_path, "Grep result")
+                            matches.append({
+                                "path": resolved,
+                                "line_number": line_number,
+                                "line": line.rstrip("\r\n")
+                            })
+                            if len(matches) > max_results:
+                                matches.pop()
+                                truncated = True
+                                break
+            except (OSError, UnicodeDecodeError):
+                continue
+            if truncated:
+                break
+
+        return {"matches": matches, "count": len(matches), "truncated": truncated, "scope": scope}
+
     def _run_grep(self, pattern, scope, case_sensitive, max_results):
+        if not shutil.which("rg"):
+            return self._run_grep_python(pattern, scope, case_sensitive, max_results)
         command = ["rg", "--json", "--no-messages"]
         if not case_sensitive:
             command.append("--ignore-case")
@@ -928,8 +1070,8 @@ class TextLoop:
         try:
             process = subprocess.Popen(command, cwd=self._current_workdir,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        except OSError as error:
-            return {"error": f"could not start Grep: {error}"}
+        except OSError:
+            return self._run_grep_python(pattern, scope, case_sensitive, max_results)
         try:
             for raw_event in process.stdout:
                 event = json.loads(raw_event)
@@ -987,6 +1129,191 @@ class TextLoop:
 
     async def list_mcp_resources(self, _args):
         return await asyncio.to_thread(self._mcp.list_resources)
+
+    async def read_mcp_resource(self, args):
+        uri = args.get("uri")
+        server_name = args.get("server")
+        if not isinstance(uri, str) or not uri.strip():
+            return {"error": "ReadMcpResourceTool requires a uri"}
+        return await asyncio.to_thread(self._mcp.read_resource, uri, server_name)
+
+    async def write_file(self, args):
+        blocked = self._tool_blocked_by_plan_mode("Write")
+        if blocked is not None:
+            return blocked
+        path_arg = args.get("path")
+        content = args.get("content")
+        if not isinstance(path_arg, str) or not path_arg.strip():
+            return {"error": "Write requires a non-empty path"}
+        if content is None:
+            return {"error": "Write requires content string"}
+        try:
+            resolved = self._resolve_tool_path(path_arg, "Write")
+            parent = os.path.dirname(resolved)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(resolved, "w", encoding="utf-8") as f:
+                f.write(content)
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            self._read_files[resolved] = digest
+            return {
+                "path": resolved,
+                "bytes_written": len(content.encode("utf-8")),
+                "lines_written": len(content.splitlines()),
+                "success": True,
+            }
+        except Exception as e:
+            return {"error": f"could not write {path_arg}: {e}"}
+
+    def _run_web_search(self, query, max_results=8):
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+        try:
+            resp = requests.post(
+                "https://html.duckduckgo.com/html/",
+                data={"q": query},
+                headers=headers,
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return {"error": f"Search engine returned HTTP {resp.status_code}", "results": []}
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            results = []
+            for item in soup.select(".result__body"):
+                title_elem = item.select_one(".result__title a")
+                snippet_elem = item.select_one(".result__snippet")
+                if not title_elem:
+                    continue
+                raw_url = title_elem.get("href", "")
+                parsed = urllib.parse.urlparse(raw_url)
+                qs = urllib.parse.parse_qs(parsed.query)
+                clean_url = qs.get("uddg", [raw_url])[0]
+                title = title_elem.get_text(strip=True)
+                snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
+                if clean_url and title:
+                    results.append({
+                        "title": title,
+                        "url": clean_url,
+                        "snippet": snippet,
+                    })
+                if len(results) >= max_results:
+                    break
+
+            return {
+                "query": query,
+                "results": results,
+                "count": len(results),
+            }
+        except Exception as e:
+            return {"error": f"Web search failed: {e}", "results": []}
+
+    async def web_search(self, args):
+        query = args.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "WebSearch requires a search query"}
+        max_results = int(args.get("max_results", 8))
+        return await asyncio.to_thread(self._run_web_search, query, max_results)
+
+    def _run_web_fetch(self, url, max_length=16000):
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        try:
+            resp = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+            content_type = resp.headers.get("Content-Type", "")
+            if "text/html" in content_type:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for s in soup(["script", "style", "nav", "footer", "header", "noscript", "aside", "svg"]):
+                    s.extract()
+                title = soup.title.string.strip() if soup.title and soup.title.string else ""
+                lines = [line.strip() for line in soup.get_text().splitlines() if line.strip()]
+                text = "\n".join(lines)
+            else:
+                title = ""
+                text = resp.text
+
+            truncated = False
+            if len(text) > max_length:
+                text = text[:max_length]
+                truncated = True
+
+            return {
+                "url": resp.url,
+                "title": title,
+                "status_code": resp.status_code,
+                "content": text,
+                "truncated": truncated,
+                "length": len(text),
+            }
+        except Exception as e:
+            return {"error": f"Failed to fetch {url}: {e}"}
+
+    async def web_fetch(self, args):
+        url = args.get("url")
+        if not isinstance(url, str) or not url.strip():
+            return {"error": "WebFetch requires a valid url"}
+        max_length = int(args.get("max_length", 16000))
+        return await asyncio.to_thread(self._run_web_fetch, url, max_length)
+
+    async def task_create(self, args):
+        subject = args.get("subject")
+        if not isinstance(subject, str) or not subject.strip():
+            return {"error": "TaskCreate requires a subject"}
+        self._task_id_counter += 1
+        tid = f"task-{self._task_id_counter}"
+        task = {
+            "id": tid,
+            "subject": subject.strip(),
+            "description": args.get("description", "").strip(),
+            "status": "pending",
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+        }
+        self._tasks[tid] = task
+        return {"task": task, "message": f"Created task {tid}: {subject.strip()}"}
+
+    async def task_list(self, _args):
+        return {
+            "tasks": list(self._tasks.values()),
+            "count": len(self._tasks),
+        }
+
+    async def task_get(self, args):
+        tid = args.get("task_id")
+        if not tid or tid not in self._tasks:
+            return {"error": f"Task '{tid}' not found"}
+        return {"task": self._tasks[tid]}
+
+    async def task_update(self, args):
+        tid = args.get("task_id")
+        if not tid or tid not in self._tasks:
+            return {"error": f"Task '{tid}' not found"}
+        task = self._tasks[tid]
+        if "status" in args:
+            st = args["status"]
+            if st not in ("pending", "in_progress", "completed", "cancelled"):
+                return {"error": f"Invalid status '{st}', must be pending|in_progress|completed|cancelled"}
+            task["status"] = st
+        if "subject" in args and str(args["subject"]).strip():
+            task["subject"] = str(args["subject"]).strip()
+        if "description" in args:
+            task["description"] = str(args["description"]).strip()
+        task["updated_at"] = datetime.now().isoformat()
+        return {"task": task, "message": f"Updated task {tid}"}
+
+    async def task_stop(self, args):
+        tid = args.get("task_id")
+        if not tid or tid not in self._tasks:
+            return {"error": f"Task '{tid}' not found"}
+        task = self._tasks[tid]
+        task["status"] = "cancelled"
+        task["updated_at"] = datetime.now().isoformat()
+        return {"task": task, "message": f"Stopped task {tid}"}
 
     # ── WorkTree / PlanMode ───────────────────────────────────────
 
@@ -1366,11 +1693,17 @@ class TextLoop:
                           or args_dict.get("query")
                           or args_dict.get("command")
                           or args_dict.get("task")
+                          or args_dict.get("subject")
+                          or args_dict.get("url")
+                          or args_dict.get("uri")
                           or args_dict.get("action"))
                 if not detail and args_dict:
                     vals = [str(v) for v in args_dict.values() if isinstance(v, (str, int, float, bool))]
                     detail = " ".join(vals)[:80] if vals else ""
                 detail = detail or ""
+                home = os.path.expanduser("~")
+                if home and home in detail:
+                    detail = detail.replace(home, "~")
                 self._tool_event_id += 1
                 tool_event_id = self._tool_event_id
 
@@ -1411,6 +1744,22 @@ class TextLoop:
                     result = await self.exit_worktree(args_dict)
                 elif name == "Read":
                     result = await self.read_file(args_dict)
+                elif name == "Write":
+                    result = await self.write_file(args_dict)
+                elif name == "WebSearch":
+                    result = await self.web_search(args_dict)
+                elif name == "WebFetch":
+                    result = await self.web_fetch(args_dict)
+                elif name == "TaskCreate":
+                    result = await self.task_create(args_dict)
+                elif name == "TaskList":
+                    result = await self.task_list(args_dict)
+                elif name == "TaskGet":
+                    result = await self.task_get(args_dict)
+                elif name == "TaskUpdate":
+                    result = await self.task_update(args_dict)
+                elif name == "TaskStop":
+                    result = await self.task_stop(args_dict)
                 elif name == "Glob":
                     result = await self.glob_files(args_dict)
                 elif name == "Grep":
@@ -1419,6 +1768,8 @@ class TextLoop:
                     result = await self.lsp_query(args_dict)
                 elif name == "ListMcpResourcesTool":
                     result = await self.list_mcp_resources(args_dict)
+                elif name == "ReadMcpResourceTool":
+                    result = await self.read_mcp_resource(args_dict)
                 elif name == "Edit":
                     result = await self.edit_file(args_dict)
                 else:

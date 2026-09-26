@@ -194,11 +194,54 @@ what later tools are allowed to do and where they operate.
 - `ExitWorkTree {}` → returns Priya to the directory from which it was started and
   clears prior Read approvals again.
 
+# IMPLEMENTED: WRITE
+
+`Write` creates a new file or completely replaces the contents of an existing file.
+It creates any required parent directories automatically and computes the file digest
+so subsequent `Edit` calls in the session can target it without requiring an explicit `Read`.
+
+- `Write {path, content}` → `{path, bytes_written, lines_written, success}`.
+- Blocked in Plan Mode.
+
+# IMPLEMENTED: WEBSEARCH
+
+`WebSearch` performs live DuckDuckGo web searches and returns structured search results
+including titles, clean target URLs, and snippets.
+
+- `WebSearch {query, max_results?}` → `{query, results: [{title, url, snippet}], count}`.
+- `max_results` defaults to 8. Available in Plan Mode.
+
+# IMPLEMENTED: WEBFETCH
+
+`WebFetch` downloads and parses public web pages, stripping scripts, styles, navigation,
+and headers/footers to return clean, readable markdown/text content.
+
+- `WebFetch {url, max_length?}` → `{url, title, status_code, content, truncated, length}`.
+- `max_length` defaults to 16,000 characters. Available in Plan Mode.
+
+# IMPLEMENTED: TASKCREATE, TASKLIST, TASKGET, TASKUPDATE, TASKSTOP
+
+Session-scoped task tracking and structured planning for complex multi-turn workflows.
+Tasks help maintain clarity and progress across steps.
+
+- `TaskCreate {subject, description?}` → creates task with status `"pending"`.
+- `TaskList {}` → returns all session tasks and their statuses.
+- `TaskGet {task_id}` → inspects a specific task.
+- `TaskUpdate {task_id, status?, subject?, description?}` → updates task status (`pending`, `in_progress`, `completed`, `cancelled`).
+- `TaskStop {task_id}` → sets status to `"cancelled"`.
+- Available in Plan Mode.
+
+# IMPLEMENTED: READMCPRESOURCETOOL
+
+`ReadMcpResourceTool` fetches resource contents from configured MCP servers by URI.
+
+- `ReadMcpResourceTool {uri, server?}` → `{server, uri, contents: [...]}`.
+- Available in Plan Mode.
+
 # COMING SOON
 
 - Monitor
 - PushNotification
-- ReadMcpResourceTool
 - RemoteTrigger
 - ReportFindings
 - ScheduleWakeup
@@ -206,19 +249,11 @@ what later tools are allowed to do and where they operate.
 - SendUserFile
 - ShareOnboardingGuide
 - Skill
-- TaskCreate
-- TaskGet
-- TaskList
 - TaskOutput
-- TaskStop
-- TaskUpdate
 - TodoWrite (disabled by default, superseded by Task*)
 - ToolSearch
 - WaitForMcpServers
-- WebFetch
-- WebSearch
 - Workflow
-- Write
 
 
 

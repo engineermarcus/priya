@@ -216,3 +216,35 @@ class McpManager:
             "servers": servers, "resources": resources, "resource_templates": templates,
             "count": len(resources), "template_count": len(templates),
         }
+
+    def read_resource(self, uri, server_name=None):
+        if not isinstance(uri, str) or not uri.strip():
+            return {"error": "ReadMcpResourceTool requires a non-empty uri"}
+        try:
+            definitions = self._definitions()
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            return {"error": f"invalid MCP server configuration: {error}"}
+
+        if server_name:
+            if server_name not in definitions:
+                return {"error": f"MCP server '{server_name}' not configured"}
+            try:
+                server = self._server(server_name, definitions[server_name])
+                ans = server.request("resources/read", {"uri": uri})
+                if "error" in ans:
+                    return {"error": ans["error"], "server": server_name, "uri": uri}
+                return {"server": server_name, "uri": uri, **ans.get("result", {})}
+            except Exception as e:
+                return {"error": f"failed to read from MCP server '{server_name}': {e}"}
+
+        # Query across configured servers if server name wasn't specified
+        for name, config in definitions.items():
+            try:
+                server = self._server(name, config)
+                ans = server.request("resources/read", {"uri": uri})
+                if "error" not in ans and "result" in ans:
+                    return {"server": name, "uri": uri, **ans.get("result", {})}
+            except Exception:
+                continue
+
+        return {"error": f"Resource '{uri}' not found on any active MCP server"}
